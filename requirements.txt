@@ -20,5 +20,6 @@ matplotlib
 seaborn
 plotly
 scipy
-sklearn
+scikit-learn
 statsmodels
+python-dotenv>=1.0.0

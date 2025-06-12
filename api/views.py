@@ -34,7 +34,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
-from api.models import User,Projects, SavedScript, SavedPlot
+from api.models import User,Projects, SavedScript, SavedPlot, SavedPivot
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
 
@@ -87,14 +87,25 @@ GOOGLE_SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
 ]
-SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(__file__), 'sanitifi-461410-e0eabc4f9cf6.json')
 
 def get_gsheet_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=GOOGLE_SCOPES)
-    sheets_service = build('sheets', 'v4', credentials=creds)
-    drive_service = build('drive', 'v3', credentials=creds)
-    return sheets_service, drive_service
+    # Get service account info from environment variable
+    service_account_info = os.getenv('GOOGLE_SERVICE_ACCOUNT_INFO')
+    if not service_account_info:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_INFO environment variable not set")
+    
+    try:
+        # Parse the JSON string from environment variable
+        service_account_dict = json.loads(service_account_info)
+        creds = service_account.Credentials.from_service_account_info(
+            service_account_dict, scopes=GOOGLE_SCOPES)
+        sheets_service = build('sheets', 'v4', credentials=creds)
+        drive_service = build('drive', 'v3', credentials=creds)
+        return sheets_service, drive_service
+    except json.JSONDecodeError:
+        raise ValueError("Invalid JSON in GOOGLE_SERVICE_ACCOUNT_INFO environment variable")
+    except Exception as e:
+        raise ValueError(f"Error initializing Google Sheets service: {str(e)}")
 
 def make_json_safe(obj):
     if isinstance(obj, dict):
@@ -624,6 +635,9 @@ class SheetInfo(APIView):
             else:
                 return Response({"error": "Unsupported file format"}, status=400)
 
+            # Replace infinite values with None
+            df = df.replace([np.inf, -np.inf], np.nan)
+            
             column_info = {}
 
             for column in df.columns:
@@ -632,22 +646,32 @@ class SheetInfo(APIView):
                 blank_count = (column_data == '').sum() if column_data.dtype == 'object' else 0
                 total_empty = null_count + blank_count
 
+                # Get unique values safely
+                unique_values = column_data.dropna().unique()
+                unique_values_list = make_json_safe(unique_values.tolist()[:100])  # limit to 100 unique elements
+
                 column_info[column] = {
                     "null_count": int(total_empty),
                     "data_type": str(column_data.dtype),
                     "unique_values": int(column_data.nunique()),
-                    "unique_elements": column_data.dropna().unique().tolist()[:100]  # limit to 100 unique elements
+                    "unique_elements": unique_values_list
                 }
 
                 # Check if numeric
                 try:
                     numeric_data = pd.to_numeric(column_data, errors='coerce')
                     if not numeric_data.isnull().all():
+                        # Handle infinite values in numeric calculations
+                        numeric_data = numeric_data.replace([np.inf, -np.inf], np.nan)
+                        min_val = numeric_data.min()
+                        max_val = numeric_data.max()
+                        mean_val = numeric_data.mean()
+                        
                         column_info[column].update({
                             "type": "numeric",
-                            "min": float(numeric_data.min()),
-                            "max": float(numeric_data.max()),
-                            "average": float(numeric_data.mean()),
+                            "min": make_json_safe(min_val),
+                            "max": make_json_safe(max_val),
+                            "average": make_json_safe(mean_val),
                             "unique_values": int(numeric_data.nunique())
                         })
                         continue
@@ -1222,7 +1246,7 @@ class DeleteProject(APIView):
             return Response({"error": "Project not found"}, status=404)
 
         # Define project folder path
-        project_path = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project_id}")
+        project_path = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
         project_path = os.path.abspath(os.path.normpath(project_path))
 
         print("Deleting project at:", project_path)
@@ -2804,18 +2828,27 @@ class DownloadEDAPPTX(APIView):
         # --- Add personalized plots if present ---
         if personalized_plots:
             for idx, plot in enumerate(personalized_plots):
-                chart_type = plot.get('chartType', 'bar').lower()
-                chart_data = plot.get('chartData', {})
+                chart_type = plot.get('plot_config', {}).get('chartType', 'bar').lower()
+                chart_data = plot.get('chart_data', {})
                 labels = chart_data.get('labels', [])
                 datasets = chart_data.get('datasets', [])
-                sheet_title = f'Personalized Plot {idx+1}'
+                
+                # Get chart title from plot config or use default
+                chart_title = plot.get('plot_config', {}).get('selectedY', f'Personalized Plot {idx+1}')
+                
                 slide = prs.slides.add_slide(prs.slide_layouts[5])
-                slide.shapes.title.text = sheet_title
+                slide.shapes.title.text = chart_title
+                
                 chart_data_obj = CategoryChartData()
                 chart_data_obj.categories = labels
+                
+                # Add each dataset as a series
                 for ds in datasets:
-                    chart_data_obj.add_series(ds.get('label', 'Data'), ds.get('data', []))
-                # Choose chart type
+                    series_name = ds.get('label', 'Data')
+                    series_data = ds.get('data', [])
+                    chart_data_obj.add_series(series_name, series_data)
+                
+                # Choose chart type based on plot_config
                 if chart_type == 'line':
                     chart_type_obj = XL_CHART_TYPE.LINE
                 elif chart_type == 'stacked':
@@ -2824,19 +2857,26 @@ class DownloadEDAPPTX(APIView):
                     chart_type_obj = XL_CHART_TYPE.COLUMN_STACKED_100
                 else:
                     chart_type_obj = XL_CHART_TYPE.COLUMN_CLUSTERED
+                
                 x_pos, y_pos, cx, cy = Inches(1), Inches(1.5), Inches(8), Inches(4)
                 chart = slide.shapes.add_chart(
                     chart_type_obj, x_pos, y_pos, cx, cy, chart_data_obj
                 ).chart
+                
+                # Configure chart appearance
                 chart.has_legend = True
                 chart.value_axis.has_major_gridlines = True
                 chart.category_axis.tick_labels.font.size = Pt(10)
                 chart.value_axis.tick_labels.font.size = Pt(10)
+                
+                # Add axis titles
                 chart.category_axis.has_title = True
                 chart.value_axis.has_title = True
-                chart.category_axis.axis_title.text_frame.text = 'Label'
-                chart.value_axis.axis_title.text_frame.text = 'Value'
-                chart.chart_title.text_frame.text = sheet_title
+                chart.category_axis.axis_title.text_frame.text = plot.get('plot_config', {}).get('selectedX', 'Label')
+                chart.value_axis.axis_title.text_frame.text = plot.get('plot_config', {}).get('selectedY', 'Value')
+                
+                # Set chart title
+                chart.chart_title.text_frame.text = chart_title
 
         # Save to a temporary file and return as response
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
@@ -3811,5 +3851,201 @@ class FetchPlots(APIView):
             return Response({
                 'error': f'Error fetching plots: {str(e)}'
             }, status=500)
+
+class ProjectDetails(APIView):
+    def post(self, request):
+        try:
+            # Extract project_id from request
+            project_id = request.data.get('project_id')
+            if not project_id:
+                return Response({"error": "project_id is required"}, status=400)
+
+            # Get project
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({"error": "Project not found"}, status=404)
+
+            # Base project folder path
+            project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
+            
+            # Initialize response data structure
+            project_details = {
+                "project_id": project.id,
+                "project_name": project.name,
+                "files": {
+                    "media": [],
+                    "kpi": []
+                }
+            }
+
+            # Process both media and kpi files
+            for file_type in ["media", "kpi"]:
+                file_folder = os.path.join(project_folder, file_type)
+                if not os.path.exists(file_folder):
+                    continue
+
+                # Get all files in the folder
+                for file_name in os.listdir(file_folder):
+                    file_path = os.path.join(file_folder, file_name)
+                    if os.path.isdir(file_path):  # Each file is a directory containing sheets
+                        file_info = {
+                            "name": file_name,
+                            "sheets": []
+                        }
+                        
+                        # Get all sheets (CSV files) in the file directory
+                        for sheet_file in os.listdir(file_path):
+                            if sheet_file.endswith('.csv'):
+                                sheet_path = os.path.join(file_path, sheet_file)
+                                sheet_info = {
+                                    "name": sheet_file,
+                                    "size": os.path.getsize(sheet_path),
+                                    "last_modified": os.path.getmtime(sheet_path)
+                                }
+                                
+                                # Read complete sheet data
+                                try:
+                                    df = pd.read_csv(sheet_path, dtype=str)
+                                    df = df.replace([np.nan, np.inf, -np.inf], None)
+                                    sheet_info["columns"] = df.columns.tolist()
+                                    sheet_info["data"] = make_json_safe(df.values.tolist())
+                                except Exception as e:
+                                    print(f"Error reading sheet {sheet_file}: {str(e)}")
+                                    sheet_info["error"] = "Could not read sheet data"
+                                
+                                file_info["sheets"].append(sheet_info)
+                        
+                        project_details["files"][file_type].append(file_info)
+
+            return Response(project_details, status=200)
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+
+class SaveReportPivot(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            pivot_name = request.data.get('pivot_name')
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            sheet_name = request.data.get('sheet_name')
+            pivot_config = request.data.get('pivot_config')
+            pivot_data = request.data.get('pivot_data')
+
+            # Validate required fields
+            if not all([user_id, project_id, pivot_name, file_type, file_name, sheet_name, pivot_config, pivot_data]):
+                missing_fields = []
+                if not user_id: missing_fields.append('user_id')
+                if not project_id: missing_fields.append('project_id')
+                if not pivot_name: missing_fields.append('pivot_name')
+                if not file_type: missing_fields.append('file_type')
+                if not file_name: missing_fields.append('file_name')
+                if not sheet_name: missing_fields.append('sheet_name')
+                if not pivot_config: missing_fields.append('pivot_config')
+                if not pivot_data: missing_fields.append('pivot_data')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            # Validate file_type
+            if file_type not in ['kpi', 'media']:
+                return Response({
+                    'error': 'Invalid file_type. Must be either "kpi" or "media"'
+                }, status=400)
+
+            # Get user and project
+            try:
+                user = User.objects.get(id=user_id)
+                project = Projects.objects.get(id=project_id, user=user)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Create or update saved pivot
+            saved_pivot, created = SavedPivot.objects.update_or_create(
+                user=user,
+                project=project,
+                pivot_name=pivot_name,
+                defaults={
+                    'file_type': file_type,
+                    'file_name': file_name,
+                    'sheet_name': sheet_name,
+                    'pivot_config': pivot_config,
+                    'pivot_data': pivot_data
+                }
+            )
+
+            return Response({
+                'message': 'Pivot table saved successfully',
+                'pivot_id': saved_pivot.id,
+                'created': created,
+                'updated_at': saved_pivot.updated_at
+            }, status=200)
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+
+class FetchReportPivot(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+
+            # Validate required fields
+            if not all([user_id, project_id]):
+                missing_fields = []
+                if not user_id: missing_fields.append('user_id')
+                if not project_id: missing_fields.append('project_id')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            # Get user and project
+            try:
+                user = User.objects.get(id=user_id)
+                project = Projects.objects.get(id=project_id, user=user)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Fetch all saved pivots for this user and project
+            saved_pivots = SavedPivot.objects.filter(
+                user=user,
+                project=project
+            ).order_by('-updated_at')
+
+            # Format response
+            pivots_data = [{
+                'id': pivot.id,
+                'pivot_name': pivot.pivot_name,
+                'file_type': pivot.file_type,
+                'file_name': pivot.file_name,
+                'sheet_name': pivot.sheet_name,
+                'pivot_config': pivot.pivot_config,
+                'pivot_data': pivot.pivot_data,
+                'created_at': pivot.created_at,
+                'updated_at': pivot.updated_at
+            } for pivot in saved_pivots]
+
+            return Response({
+                'pivots': pivots_data,
+                'total_pivots': saved_pivots.count()
+            }, status=200)
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
 
  

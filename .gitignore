@@ -1,2 +1,6 @@
 db.sqlite3
 media/
+# Environment variables
+.env
+.env.*
+!.env.example

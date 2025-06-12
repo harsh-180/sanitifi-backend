@@ -41,4 +41,5 @@ urlpatterns = [
     path('concatenate-sheets/', views.ConcatenateSheets.as_view(), name='concatenate_sheets'),
     path('save-plot/', views.SavePlot.as_view(), name='save_plot'),
     path('fetch-plots/', views.FetchPlots.as_view(), name='fetch_plots'),
+    path('project-details/', views.ProjectDetails.as_view(), name='project-details'),
 ]+ static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

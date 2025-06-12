@@ -95,3 +95,21 @@ class SavedPlot(models.Model):
 
     def __str__(self):
         return f"{self.plot_name} - {self.file_name} - {self.sheet_name} - {self.user.username}"
+
+class SavedPivot(models.Model):
+    user = models.ForeignKey('User', on_delete=models.CASCADE)
+    project = models.ForeignKey('Projects', on_delete=models.CASCADE)
+    pivot_name = models.CharField(max_length=255)
+    file_type = models.CharField(max_length=10)  # 'media' or 'kpi'
+    file_name = models.CharField(max_length=255)
+    sheet_name = models.CharField(max_length=255)
+    pivot_config = models.JSONField()  # Store rows, columns, values, filters
+    pivot_data = models.JSONField()  # Store the actual pivot table data
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('user', 'project', 'pivot_name')
+
+    def __str__(self):
+        return f"{self.pivot_name} - {self.project.name}"
