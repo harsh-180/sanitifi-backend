@@ -1,0 +1,24 @@
+﻿django-cors-headers
+Django
+# REST framework and JWT
+djangorestframework
+djangorestframework-simplejwt
+openpyxl
+pandas
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+python-pptx
+pyspark>=3.3.0
+duckdb>=0.8.1
+numpy
+pyarrow
+tqdm
+multiprocessing-logging
+matplotlib
+seaborn
+plotly
+scipy
+sklearn
+statsmodels

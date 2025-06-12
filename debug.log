@@ -1,0 +1,313 @@
+INFO 2025-04-07 14:35:23,619 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 15:01:48,069 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 15:09:11,353 autoreload C:\Users\ritik\Desktop\Dashboard-backend\dashboard\settings.py changed, reloading.
+INFO 2025-04-07 15:09:12,926 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 15:11:22,935 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 15:12:33,974 basehttp "OPTIONS /api/auth/signup/ HTTP/1.1" 200 0
+ERROR 2025-04-07 15:12:34,032 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 15:12:34,032 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+INFO 2025-04-07 15:15:32,796 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 15:15:34,158 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 15:15:38,958 basehttp "POST /api/auth/signup/ HTTP/1.1" 201 547
+INFO 2025-04-07 15:18:38,472 basehttp "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-04-07 15:18:38,475 basehttp "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-04-07 15:18:38,626 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:18:38,626 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:19:06,363 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:19:06,364 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:19:19,947 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:19:19,986 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:19:28,688 basehttp "OPTIONS /api/auth/signin/ HTTP/1.1" 200 0
+WARNING 2025-04-07 15:19:29,445 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 15:19:29,445 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+WARNING 2025-04-07 15:19:41,619 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 15:19:41,624 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+WARNING 2025-04-07 15:19:49,032 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 15:19:49,032 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 15:20:21,974 basehttp "GET /admin/ HTTP/1.1" 302 0
+INFO 2025-04-07 15:20:22,197 basehttp "GET /admin/login/?next=/admin/ HTTP/1.1" 200 4160
+INFO 2025-04-07 15:20:22,276 basehttp "GET /static/admin/css/dark_mode.css HTTP/1.1" 200 2804
+INFO 2025-04-07 15:20:22,277 basehttp "GET /static/admin/css/base.css HTTP/1.1" 200 22092
+INFO 2025-04-07 15:20:22,284 basehttp "GET /static/admin/css/login.css HTTP/1.1" 200 951
+INFO 2025-04-07 15:20:22,287 basehttp "GET /static/admin/css/nav_sidebar.css HTTP/1.1" 200 2810
+INFO 2025-04-07 15:20:22,288 basehttp "GET /static/admin/css/responsive.css HTTP/1.1" 200 17972
+INFO 2025-04-07 15:20:22,300 basehttp "GET /static/admin/js/theme.js HTTP/1.1" 200 1653
+INFO 2025-04-07 15:20:22,319 basehttp "GET /static/admin/js/nav_sidebar.js HTTP/1.1" 200 3063
+INFO 2025-04-07 15:20:30,532 basehttp "POST /admin/login/?next=/admin/ HTTP/1.1" 302 0
+INFO 2025-04-07 15:20:30,591 basehttp "GET /admin/ HTTP/1.1" 200 10438
+INFO 2025-04-07 15:20:30,642 basehttp "GET /static/admin/css/dashboard.css HTTP/1.1" 200 441
+INFO 2025-04-07 15:20:30,653 basehttp "GET /static/admin/img/icon-addlink.svg HTTP/1.1" 200 331
+INFO 2025-04-07 15:20:30,653 basehttp "GET /static/admin/img/icon-changelink.svg HTTP/1.1" 200 380
+INFO 2025-04-07 15:20:30,659 basehttp "GET /static/admin/img/icon-deletelink.svg HTTP/1.1" 200 392
+INFO 2025-04-07 15:20:42,024 basehttp "GET /admin/api/user/ HTTP/1.1" 200 12465
+INFO 2025-04-07 15:20:42,087 basehttp "GET /static/admin/css/changelists.css HTTP/1.1" 200 6878
+INFO 2025-04-07 15:20:42,091 basehttp "GET /static/admin/js/jquery.init.js HTTP/1.1" 200 347
+INFO 2025-04-07 15:20:42,108 basehttp "GET /static/admin/js/core.js HTTP/1.1" 200 6208
+INFO 2025-04-07 15:20:42,113 basehttp "GET /static/admin/js/admin/RelatedObjectLookups.js HTTP/1.1" 200 9097
+INFO 2025-04-07 15:20:42,119 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+INFO 2025-04-07 15:20:42,137 basehttp "GET /static/admin/js/urlify.js HTTP/1.1" 200 7887
+INFO 2025-04-07 15:20:42,137 basehttp "GET /static/admin/js/actions.js HTTP/1.1" 200 8076
+INFO 2025-04-07 15:20:42,152 basehttp "GET /static/admin/js/prepopulate.js HTTP/1.1" 200 1531
+INFO 2025-04-07 15:20:42,182 basehttp "GET /static/admin/js/vendor/jquery/jquery.js HTTP/1.1" 200 285314
+INFO 2025-04-07 15:20:42,210 basehttp "GET /static/admin/js/filters.js HTTP/1.1" 200 978
+INFO 2025-04-07 15:20:42,274 basehttp "GET /static/admin/js/vendor/xregexp/xregexp.js HTTP/1.1" 200 325171
+INFO 2025-04-07 15:20:42,308 basehttp "GET /static/admin/img/tooltag-add.svg HTTP/1.1" 200 331
+INFO 2025-04-07 15:21:19,341 basehttp "POST /admin/api/user/ HTTP/1.1" 200 8924
+INFO 2025-04-07 15:21:19,403 basehttp "GET /static/admin/js/cancel.js HTTP/1.1" 200 884
+INFO 2025-04-07 15:21:23,632 basehttp "POST /admin/api/user/ HTTP/1.1" 302 0
+INFO 2025-04-07 15:21:23,653 basehttp "GET /admin/api/user/ HTTP/1.1" 200 10785
+INFO 2025-04-07 15:21:23,697 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+INFO 2025-04-07 15:21:23,730 basehttp "GET /static/admin/img/icon-yes.svg HTTP/1.1" 200 436
+INFO 2025-04-07 15:21:27,394 basehttp "GET /admin/api/projects/ HTTP/1.1" 200 11066
+INFO 2025-04-07 15:21:27,427 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+INFO 2025-04-07 15:21:29,791 basehttp "GET /admin/auth/user/ HTTP/1.1" 200 12953
+INFO 2025-04-07 15:21:29,828 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+INFO 2025-04-07 15:21:29,836 basehttp "GET /static/admin/img/search.svg HTTP/1.1" 200 458
+INFO 2025-04-07 15:21:29,862 basehttp "GET /static/admin/img/icon-viewlink.svg HTTP/1.1" 200 581
+INFO 2025-04-07 15:21:29,865 basehttp "GET /static/admin/img/sorting-icons.svg HTTP/1.1" 200 1097
+INFO 2025-04-07 15:24:03,171 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:24:03,171 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:25:25,164 basehttp "POST /api/auth/signup/ HTTP/1.1" 201 551
+WARNING 2025-04-07 15:25:50,232 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 15:25:50,232 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 15:27:01,321 basehttp "GET /admin/ HTTP/1.1" 200 10338
+INFO 2025-04-07 15:27:10,720 basehttp "GET /admin/auth/user/ HTTP/1.1" 200 12953
+INFO 2025-04-07 15:27:10,770 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+INFO 2025-04-07 15:27:12,867 basehttp "GET /admin/api/user/ HTTP/1.1" 200 11025
+INFO 2025-04-07 15:27:12,899 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+WARNING 2025-04-07 15:27:35,743 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 15:27:35,744 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 15:31:33,652 basehttp "POST /admin/api/user/ HTTP/1.1" 200 8202
+INFO 2025-04-07 15:31:34,729 basehttp "POST /admin/api/user/ HTTP/1.1" 302 0
+INFO 2025-04-07 15:31:34,748 basehttp "GET /admin/api/user/ HTTP/1.1" 200 10784
+INFO 2025-04-07 15:31:34,789 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+INFO 2025-04-07 15:31:40,885 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:31:40,885 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:35:26,788 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:35:26,788 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:35:32,297 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:35:32,314 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:43:44,943 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:43:44,943 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:44:09,431 basehttp "POST /api/auth/signup/ HTTP/1.1" 201 548
+WARNING 2025-04-07 15:44:25,354 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 15:44:25,354 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 15:58:38,617 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 15:58:38,674 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+WARNING 2025-04-07 15:59:08,541 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 15:59:08,542 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 16:08:06,895 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:08:08,946 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:08:14,119 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:08:15,724 autoreload Watching for file changes with StatReloader
+WARNING 2025-04-07 16:08:21,982 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 16:08:21,984 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 16:08:47,301 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:08:48,969 autoreload Watching for file changes with StatReloader
+WARNING 2025-04-07 16:08:55,183 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 16:08:55,184 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 16:10:00,371 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:10:02,069 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:10:11,911 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:10:13,429 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:11:14,099 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\authentication.py changed, reloading.
+INFO 2025-04-07 16:11:15,517 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:11:23,031 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:11:24,779 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:11:35,449 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:11:36,897 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:11:43,959 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:11:45,667 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:11:47,696 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:11:49,085 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:11:51,753 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:11:53,232 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:11:56,362 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:11:57,682 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:11:59,679 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:12:00,969 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:12:07,736 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:12:09,118 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:12:19,332 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:12:20,780 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:12:55,430 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:12:56,976 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:14:08,632 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:14:10,153 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:16:21,289 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:16:22,820 autoreload Watching for file changes with StatReloader
+ERROR 2025-04-07 16:16:35,533 log Internal Server Error: /api/auth/signin/
+Traceback (most recent call last):
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\django\core\handlers\exception.py", line 55, in inner
+    response = get_response(request)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\django\core\handlers\base.py", line 197, in _get_response
+    response = wrapped_callback(request, *callback_args, **callback_kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\django\views\decorators\csrf.py", line 65, in _view_wrapper
+    return view_func(request, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\django\views\generic\base.py", line 104, in view
+    return self.dispatch(request, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\rest_framework\views.py", line 509, in dispatch
+    response = self.handle_exception(exc)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\rest_framework\views.py", line 469, in handle_exception
+    self.raise_uncaught_exception(exc)
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\rest_framework\views.py", line 480, in raise_uncaught_exception
+    raise exc
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\rest_framework\views.py", line 506, in dispatch
+    response = handler(request, *args, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ritik\Desktop\Dashboard-backend\api\views.py", line 874, in post
+    user = SessionJWTAuthentication(username=username, password=password)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ritik\AppData\Local\Programs\Python\Python312\Lib\site-packages\rest_framework_simplejwt\authentication.py", line 37, in __init__
+    super().__init__(*args, **kwargs)
+TypeError: object.__init__() takes exactly one argument (the instance to initialize)
+ERROR 2025-04-07 16:16:35,537 basehttp "POST /api/auth/signin/ HTTP/1.1" 500 99795
+INFO 2025-04-07 16:16:54,849 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:16:56,444 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:17:00,869 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:17:02,635 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:17:05,176 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:17:06,693 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:17:11,359 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:17:12,697 autoreload Watching for file changes with StatReloader
+WARNING 2025-04-07 16:20:47,369 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 16:20:47,374 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 16:23:51,745 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:23:53,196 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:24:44,152 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:24:54,868 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 16:24:54,868 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+WARNING 2025-04-07 16:25:05,709 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 16:25:05,709 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 16:26:18,186 basehttp "GET /admin/ HTTP/1.1" 200 10319
+INFO 2025-04-07 16:26:20,380 basehttp "GET /admin/auth/user/ HTTP/1.1" 200 12953
+INFO 2025-04-07 16:26:20,434 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+INFO 2025-04-07 16:26:22,227 basehttp "GET /admin/api/user/ HTTP/1.1" 200 11022
+INFO 2025-04-07 16:26:22,266 basehttp "GET /admin/jsi18n/ HTTP/1.1" 200 3342
+WARNING 2025-04-07 16:26:45,043 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 16:26:45,043 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 16:27:16,502 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:27:17,837 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:27:37,333 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:27:38,757 autoreload Watching for file changes with StatReloader
+WARNING 2025-04-07 16:27:44,858 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 16:27:44,858 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 16:28:51,691 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:29:01,708 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 16:29:01,736 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+WARNING 2025-04-07 16:29:18,026 log Unauthorized: /api/auth/signin/
+WARNING 2025-04-07 16:29:18,026 basehttp "POST /api/auth/signin/ HTTP/1.1" 401 31
+INFO 2025-04-07 16:30:18,931 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:30:20,727 autoreload Watching for file changes with StatReloader
+ERROR 2025-04-07 16:31:33,593 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:31:33,593 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+INFO 2025-04-07 16:32:36,607 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:32:38,034 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:33:12,421 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:33:13,971 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:33:38,545 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:33:39,924 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:34:18,407 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:34:19,876 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:34:25,169 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:34:26,608 autoreload Watching for file changes with StatReloader
+ERROR 2025-04-07 16:34:31,876 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:34:31,876 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:34:36,054 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:34:36,055 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:34:36,393 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:34:36,393 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:34:36,756 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:34:36,758 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+INFO 2025-04-07 16:34:52,058 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:34:53,569 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:35:08,294 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:35:09,702 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:35:22,630 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:35:24,243 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:35:33,343 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:35:37,774 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+INFO 2025-04-07 16:35:37,774 basehttp "POST /api/upload/ HTTP/1.1" 200 1064234
+ERROR 2025-04-07 16:36:00,757 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:00,757 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+INFO 2025-04-07 16:36:38,276 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:36:41,196 autoreload Watching for file changes with StatReloader
+ERROR 2025-04-07 16:36:46,620 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:46,624 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:47,399 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:47,399 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:47,848 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:47,851 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:48,206 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:48,208 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:48,472 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:48,474 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:48,733 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:48,733 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:48,983 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:48,983 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:49,208 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:49,208 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:49,420 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:49,420 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:49,638 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:49,640 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:49,816 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:49,818 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:50,018 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:50,023 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:50,201 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:50,201 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:50,377 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:50,380 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:50,554 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:50,556 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:50,738 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:50,740 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:50,919 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:50,923 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:51,119 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:51,119 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:51,314 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:51,320 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:51,512 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:51,512 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:51,694 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:51,695 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:52,069 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:52,069 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+ERROR 2025-04-07 16:36:52,258 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:36:52,260 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+INFO 2025-04-07 16:37:47,811 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-04-07 16:37:51,733 autoreload Watching for file changes with StatReloader
+ERROR 2025-04-07 16:38:42,348 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:38:42,356 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+INFO 2025-04-07 16:41:35,005 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:41:37,820 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:42:28,591 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:42:30,991 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:42:38,394 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:42:41,094 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:42:54,272 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:42:57,230 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:43:08,058 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:43:11,300 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:43:39,146 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:44:42,066 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:44:45,019 autoreload Watching for file changes with StatReloader
+ERROR 2025-04-07 16:44:51,725 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:44:51,727 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 82
+INFO 2025-04-07 16:45:49,320 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:45:52,198 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:50:18,929 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:50:21,977 autoreload Watching for file changes with StatReloader
+ERROR 2025-04-07 16:51:09,050 log Internal Server Error: /api/auth/signup/
+ERROR 2025-04-07 16:51:09,050 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
+INFO 2025-04-07 16:52:33,394 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
+INFO 2025-04-07 16:52:36,357 autoreload Watching for file changes with StatReloader
+INFO 2025-04-07 16:56:43,791 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
