@@ -113,3 +113,21 @@ class SavedPivot(models.Model):
 
     def __str__(self):
         return f"{self.pivot_name} - {self.project.name}"
+
+class SavedPivotPlot(models.Model):
+    user = models.ForeignKey('User', on_delete=models.CASCADE)
+    project = models.ForeignKey('Projects', on_delete=models.CASCADE)
+    pivot = models.ForeignKey('SavedPivot', on_delete=models.CASCADE)
+    plot_name = models.CharField(max_length=255, default='Default Pivot Plot')
+    plot_config = models.JSONField()  # Stores plot configuration
+    chart_data = models.JSONField()  # Stores chart data
+    chart_options = models.JSONField()  # Stores chart options
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+        unique_together = ('user', 'project', 'pivot', 'plot_name')
+
+    def __str__(self):
+        return f"{self.plot_name} - {self.pivot.pivot_name} - {self.user.username}"

@@ -34,7 +34,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
-from api.models import User,Projects, SavedScript, SavedPlot, SavedPivot
+from api.models import User,Projects, SavedScript, SavedPlot, SavedPivot, SavedPivotPlot
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
 
@@ -4048,4 +4048,657 @@ class FetchReportPivot(APIView):
         except Exception as e:
             return Response({'error': str(e)}, status=500)
 
- 
+class DeleteReportPivot(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            pivot_id = request.data.get('pivot_id')
+
+            # Validate required fields
+            if not all([user_id, project_id, pivot_id]):
+                missing_fields = []
+                if not user_id: missing_fields.append('user_id')
+                if not project_id: missing_fields.append('project_id')
+                if not pivot_id: missing_fields.append('pivot_id')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            # Get user and project
+            try:
+                user = User.objects.get(id=user_id)
+                project = Projects.objects.get(id=project_id, user=user)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Try to get and delete the pivot
+            try:
+                pivot = SavedPivot.objects.get(
+                    id=pivot_id,
+                    user=user,
+                    project=project
+                )
+                pivot.delete()
+                return Response({
+                    'message': 'Pivot table deleted successfully',
+                    'pivot_id': pivot_id
+                }, status=200)
+            except SavedPivot.DoesNotExist:
+                return Response({
+                    'error': 'Pivot table not found or you do not have permission to delete it'
+                }, status=404)
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class SavePivotPlot(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            pivot_id = request.data.get('pivot_id')
+            plot_name = request.data.get('plot_name', 'Default Pivot Plot')
+            plot_config = request.data.get('plot_config')
+            chart_data = request.data.get('chart_data')
+            chart_options = request.data.get('chart_options', {})
+
+            # Validate required fields
+            if not all([user_id, project_id, pivot_id, plot_config, chart_data]):
+                missing_fields = []
+                if not user_id: missing_fields.append('user_id')
+                if not project_id: missing_fields.append('project_id')
+                if not pivot_id: missing_fields.append('pivot_id')
+                if not plot_config: missing_fields.append('plot_config')
+                if not chart_data: missing_fields.append('chart_data')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            # Get user, project, and pivot
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+
+            try:
+                project = Projects.objects.get(id=project_id, user=user)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            try:
+                pivot = SavedPivot.objects.get(id=pivot_id, project=project, user=user)
+            except SavedPivot.DoesNotExist:
+                return Response({'error': 'Pivot table not found'}, status=404)
+
+            # Create or update the plot
+            saved_plot, created = SavedPivotPlot.objects.update_or_create(
+                user=user,
+                project=project,
+                pivot=pivot,
+                plot_name=plot_name,
+                defaults={
+                    'plot_config': plot_config,
+                    'chart_data': chart_data,
+                    'chart_options': chart_options
+                }
+            )
+
+            return Response({
+                'message': 'Plot saved successfully',
+                'plot_id': saved_plot.id,
+                'plot_name': saved_plot.plot_name,
+                'created_at': saved_plot.created_at,
+                'updated_at': saved_plot.updated_at,
+                'is_new': created
+            }, status=201 if created else 200)
+
+        except Exception as e:
+            return Response({
+                'error': f'Error saving plot: {str(e)}'
+            }, status=500)
+
+class DeletePivotPlot(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            pivot_id = request.data.get('pivot_id')
+            plot_id = request.data.get('plot_id')  # Optional: if provided, delete specific plot
+
+            # Validate required fields
+            if not all([user_id, project_id, pivot_id]):
+                missing_fields = []
+                if not user_id: missing_fields.append('user_id')
+                if not project_id: missing_fields.append('project_id')
+                if not pivot_id: missing_fields.append('pivot_id')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            # Get user and project
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+
+            try:
+                project = Projects.objects.get(id=project_id, user=user)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            try:
+                pivot = SavedPivot.objects.get(id=pivot_id, project=project, user=user)
+            except SavedPivot.DoesNotExist:
+                return Response({'error': 'Pivot table not found'}, status=404)
+
+            # Delete specific plot if plot_id is provided, otherwise delete all plots for the pivot
+            if plot_id:
+                try:
+                    plot = SavedPivotPlot.objects.get(
+                        id=plot_id,
+                        user=user,
+                        project=project,
+                        pivot=pivot
+                    )
+                    plot.delete()
+                    return Response({
+                        'message': f'Plot {plot_id} deleted successfully'
+                    }, status=200)
+                except SavedPivotPlot.DoesNotExist:
+                    return Response({
+                        'error': 'Plot not found or you don\'t have permission to delete it'
+                    }, status=404)
+            else:
+                # Delete all plots for this pivot
+                deleted_count, _ = SavedPivotPlot.objects.filter(
+                    user=user,
+                    project=project,
+                    pivot=pivot
+                ).delete()
+                
+                return Response({
+                    'message': f'Successfully deleted {deleted_count} plot(s)'
+                }, status=200)
+
+        except Exception as e:
+            return Response({
+                'error': f'Error deleting plot(s): {str(e)}'
+            }, status=500)
+
+class FetchPivotPlots(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            pivot_id = request.data.get('pivot_id')
+
+            # Validate required fields
+            if not all([user_id, project_id, pivot_id]):
+                missing_fields = []
+                if not user_id: missing_fields.append('user_id')
+                if not project_id: missing_fields.append('project_id')
+                if not pivot_id: missing_fields.append('pivot_id')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            # Get user and project
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+
+            try:
+                project = Projects.objects.get(id=project_id, user=user)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            try:
+                pivot = SavedPivot.objects.get(id=pivot_id, project=project, user=user)
+            except SavedPivot.DoesNotExist:
+                return Response({'error': 'Pivot table not found'}, status=404)
+
+            # Fetch all plots for this pivot
+            plots = SavedPivotPlot.objects.filter(
+                user=user,
+                project=project,
+                pivot=pivot
+            ).order_by('-updated_at')
+
+            # Prepare the response data
+            plots_data = []
+            for plot in plots:
+                plot_data = {
+                    'plot_id': plot.id,
+                    'plot_name': plot.plot_name,
+                    'plot_config': plot.plot_config,
+                    'chart_data': plot.chart_data,
+                    'chart_options': plot.chart_options,
+                    'created_at': plot.created_at,
+                    'updated_at': plot.updated_at,
+                    'pivot_info': {
+                        'pivot_id': pivot.id,
+                        'pivot_name': pivot.pivot_name,
+                        'file_type': pivot.file_type,
+                        'file_name': pivot.file_name,
+                        'sheet_name': pivot.sheet_name
+                    }
+                }
+                plots_data.append(plot_data)
+
+            return Response({
+                'message': 'Plots fetched successfully',
+                'plots': plots_data,
+                'total_plots': len(plots_data)
+            }, status=200)
+
+        except Exception as e:
+            return Response({
+                'error': f'Error fetching plots: {str(e)}'
+            }, status=500)
+
+class DownloadPivotPPT(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        user_id = request.data.get('user_id')
+        project_id = request.data.get('project_id')
+        if not user_id or not project_id:
+            return Response({'error': 'user_id and project_id are required'}, status=400)
+
+        # Fetch all pivots for this user and project
+        try:
+            user = User.objects.get(id=user_id)
+            project = Projects.objects.get(id=project_id, user=user)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+        except Projects.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=404)
+
+        pivots = SavedPivot.objects.filter(user=user, project=project).order_by('created_at')
+        if not pivots.exists():
+            return Response({'error': 'No pivots found for this user and project'}, status=404)
+
+        prs = Presentation()
+        blank_slide_layout = prs.slide_layouts[6]  # blank
+
+        # First slide: Title
+        title_slide = prs.slides.add_slide(prs.slide_layouts[5])
+        title_shape = title_slide.shapes.title
+        title_shape.text = "Generated by Sanitify"
+        # Set background color
+        fill = title_slide.background.fill
+        fill.solid()
+        fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
+        # Add logo
+        logo_path = os.path.join(os.path.dirname(__file__), 'skewb-logomark 3.png')
+        if os.path.exists(logo_path):
+            left = Inches(7.5)
+            top = Inches(0.1)
+            width = Inches(1.2)
+            title_slide.shapes.add_picture(logo_path, left, top, width=width)
+        # Set title color
+        for shape in title_slide.shapes:
+            if shape.has_text_frame:
+                for paragraph in shape.text_frame.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.bold = True
+                        run.font.size = Pt(44)
+                        run.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
+
+        # For each pivot, add a slide with its name and all its plots
+        for pivot in pivots:
+            # Pivot slide
+            slide = prs.slides.add_slide(blank_slide_layout)
+            # Set background color
+            fill = slide.background.fill
+            fill.solid()
+            fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
+            # Add pivot name as heading
+            left = Inches(0.5)
+            top = Inches(0.2)
+            width = Inches(9)
+            height = Inches(1)
+            title_box = slide.shapes.add_textbox(left, top, width, height)
+            tf = title_box.text_frame
+            p = tf.add_paragraph()
+            p.text = f"Pivot: {pivot.pivot_name}"
+            p.font.size = Pt(32)
+            p.font.bold = True
+            p.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
+            # Add logo
+            if os.path.exists(logo_path):
+                slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.1), width=Inches(1))
+
+            # Fetch all plots for this pivot
+            plots = SavedPivotPlot.objects.filter(user=user, project=project, pivot=pivot).order_by('created_at')
+            for plot in plots:
+                # Plot slide
+                plot_slide = prs.slides.add_slide(blank_slide_layout)
+                fill = plot_slide.background.fill
+                fill.solid()
+                fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
+                # Add plot name as heading
+                left = Inches(0.5)
+                top = Inches(0.2)
+                width = Inches(9)
+                height = Inches(1)
+                title_box = plot_slide.shapes.add_textbox(left, top, width, height)
+                tf = title_box.text_frame
+                p = tf.add_paragraph()
+                p.text = plot.plot_name or "Plot"
+                p.font.size = Pt(28)
+                p.font.bold = True
+                p.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
+                # Add logo
+                if os.path.exists(logo_path):
+                    plot_slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.1), width=Inches(1))
+                # Render plot image from chart_data (matplotlib)
+                chart_data = plot.chart_data
+                plot_config = plot.plot_config or {}
+                try:
+                    fig, ax = plt.subplots(figsize=(12, 7))
+                    labels = chart_data.get('labels', [])
+                    datasets = chart_data.get('datasets', [])
+                    chart_type = (plot_config.get('chartType') or 'bar').lower()
+                    for ds in datasets:
+                        data = ds.get('data', [])
+                        label = ds.get('label', '')
+                        if chart_type == 'bar':
+                            ax.bar(labels, data, label=label)
+                        elif chart_type == 'line':
+                            ax.plot(labels, data, label=label)
+                        elif chart_type == 'pie':
+                            ax.pie(data, labels=labels, autopct='%1.1f%%')
+                        # Add more chart types as needed
+                    ax.set_title(plot.plot_name or "Plot", color="#d6ff41", fontsize=20)
+                    ax.tick_params(axis='x', colors='#d6ff41')
+                    ax.tick_params(axis='y', colors='#d6ff41')
+                    ax.spines['bottom'].set_color('#d6ff41')
+                    ax.spines['left'].set_color('#d6ff41')
+                    ax.spines['top'].set_color('#d6ff41')
+                    ax.spines['right'].set_color('#d6ff41')
+                    ax.yaxis.label.set_color('#d6ff41')
+                    ax.xaxis.label.set_color('#d6ff41')
+                    ax.title.set_color('#d6ff41')
+                    if chart_type != 'pie':
+                        ax.legend()
+                    fig.patch.set_facecolor('#1c2427')
+                    buf = BytesIO()
+                    plt.tight_layout()
+                    plt.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor())
+                    plt.close(fig)
+                    buf.seek(0)
+                    # Add image to slide, enlarged
+                    img_left = Inches(0.5)
+                    img_top = Inches(1.2)
+                    img_width = Inches(9)
+                    img_height = Inches(5.5)
+                    plot_slide.shapes.add_picture(buf, img_left, img_top, width=img_width, height=img_height)
+                except Exception as e:
+                    # If plot rendering fails, add error text
+                    err_box = plot_slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
+                    err_tf = err_box.text_frame
+                    err_p = err_tf.add_paragraph()
+                    err_p.text = f"Error rendering plot: {e}"
+                    err_p.font.size = Pt(18)
+                    err_p.font.color.rgb = RGBColor(0xff, 0x41, 0x41)
+
+        # Save to a temporary file and return as response
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
+            prs.save(tmp.name)
+            tmp.seek(0)
+            response = HttpResponse(tmp.read(), content_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
+            response['Content-Disposition'] = 'attachment; filename="pivot_report.pptx"'
+            return response
+
+
+import json
+import os
+import tempfile
+from io import BytesIO
+
+import matplotlib.pyplot as plt
+from matplotlib import style
+
+from django.http import HttpResponse
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.parsers import JSONParser
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_from_string
+
+from api.models import User, Projects, SavedPivot, SavedPivotPlot
+
+
+class DownloadPivotExcel(APIView):
+    parser_classes = [JSONParser]
+
+    def is_merged_column(self, column_letter, merged_ranges):
+        for merged_range in merged_ranges:
+            start_cell = merged_range.min_col
+            end_cell = merged_range.max_col
+            for col in range(start_cell, end_cell + 1):
+                if get_column_letter(col) == column_letter:
+                    return True
+        return False
+
+
+    def post(self, request):
+        try:
+            user_id = int(request.data.get('user_id'))
+            project_id = int(request.data.get('project_id'))
+        except (TypeError, ValueError):
+            return Response({'error': 'user_id and project_id must be integers'}, status=400)
+
+        if not user_id or not project_id:
+            return Response({'error': 'user_id and project_id are required'}, status=400)
+
+        try:
+            user = User.objects.get(id=user_id)
+            project = Projects.objects.get(id=project_id, user=user)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+        except Projects.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=404)
+
+        pivots = SavedPivot.objects.filter(user=user, project=project).order_by('created_at')
+        if not pivots.exists():
+            return Response({'error': 'No pivots found for this user and project'}, status=404)
+
+        wb = Workbook()
+        ws_summary = wb.active
+        ws_summary.title = "Report Summary"
+
+        # Define styles
+        header_font = Font(name='Calibri', bold=True, size=12, color='FFFFFFFF')
+        header_fill = PatternFill(start_color='FF4F81BD', end_color='FF4F81BD', fill_type='solid')
+        cell_fill = PatternFill(start_color='FFDCE6F1', end_color='FFDCE6F1', fill_type='solid')
+        border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                        top=Side(style='thin'), bottom=Side(style='thin'))
+        center_aligned = Alignment(horizontal='center', vertical='center')
+
+        ws_summary.append(['Project Pivot Report Summary'])
+        ws_summary.merge_cells('A1:F1')
+        summary_title = ws_summary['A1']
+        summary_title.font = Font(name='Calibri', bold=True, size=16, color='FF4F81BD')
+        summary_title.alignment = center_aligned
+
+        headers = ['Pivot Name', 'Sheet Name', 'File Name', 'File Type', 'Created At', 'Updated At']
+        ws_summary.append(headers)
+
+        for col in range(1, len(headers) + 1):
+            cell = ws_summary.cell(row=2, column=col)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = border
+            cell.alignment = center_aligned
+
+        for pivot in pivots:
+            ws_summary.append([
+                pivot.pivot_name,
+                pivot.sheet_name,
+                pivot.file_name,
+                pivot.file_type,
+                pivot.created_at.strftime('%Y-%m-%d %H:%M'),
+                pivot.updated_at.strftime('%Y-%m-%d %H:%M')
+            ])
+
+        for col in ws_summary.columns:
+            column_letter = get_column_letter(col[0].column)
+            if self.is_merged_column(column_letter, ws_summary.merged_cells.ranges):
+                continue
+            max_length = max((len(str(cell.value)) for cell in col if cell.value), default=0)
+            ws_summary.column_dimensions[column_letter].width = (max_length + 2) * 1.2
+
+        for pivot in pivots:
+            sheet_title = (pivot.pivot_name[:27] + '..') if pivot.pivot_name and len(pivot.pivot_name) > 27 else pivot.pivot_name or f"Pivot_{pivot.id}"
+            ws_pivot = wb.create_sheet(title=sheet_title)
+
+            ws_pivot.append([f"Pivot: {pivot.pivot_name}"])
+            ws_pivot.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
+            title_cell = ws_pivot.cell(row=1, column=1)
+            title_cell.font = Font(name='Calibri', bold=True, size=14, color='FF4F81BD')
+            title_cell.alignment = center_aligned
+
+            try:
+                pivot_data = json.loads(pivot.pivot_data) if isinstance(pivot.pivot_data, str) else pivot.pivot_data
+            except json.JSONDecodeError:
+                pivot_data = {}
+
+            if isinstance(pivot_data, dict) and 'columns' in pivot_data and 'data' in pivot_data:
+                columns = pivot_data['columns']
+                data = pivot_data['data']
+
+                ws_pivot.append(columns)
+                for col_num, column_title in enumerate(columns, 1):
+                    cell = ws_pivot.cell(row=2, column=col_num)
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.border = border
+                    cell.alignment = center_aligned
+
+                for row_num, row in enumerate(data, 3):
+                    for col_num, cell_value in enumerate(row, 1):
+                        cell = ws_pivot.cell(row=row_num, column=col_num)
+                        cell_value = '' if cell_value is None else (str(cell_value) if isinstance(cell_value, (dict, list, bytes)) else cell_value)
+                        cell.value = cell_value
+                        cell.border = border
+                        if row_num % 2 == 1:
+                            cell.fill = cell_fill
+                        cell.alignment = Alignment(horizontal='left', vertical='center')
+
+                for col in ws_pivot.columns:
+                    column_letter = get_column_letter(col[0].column)
+                    if self.is_merged_column(column_letter, ws_pivot.merged_cells.ranges):
+                        continue
+                    max_length = max((len(str(cell.value)) for cell in col if cell.value), default=0)
+                    ws_pivot.column_dimensions[column_letter].width = (max_length + 2) * 1.2
+
+                plots = SavedPivotPlot.objects.filter(user=user, project=project, pivot=pivot).order_by('created_at')
+                plot_col = len(columns) + 3
+                plot_row = 2
+
+                for plot in plots:
+                    chart_data = plot.chart_data or {}
+                    plot_config = plot.plot_config or {}
+                    plot_name = plot.plot_name or "Plot"
+                    labels = chart_data.get('labels') or []
+                    datasets = chart_data.get('datasets') or []
+
+                    ws_pivot.cell(row=plot_row, column=plot_col, value=plot_name)
+                    ws_pivot.merge_cells(start_row=plot_row, start_column=plot_col, end_row=plot_row, end_column=plot_col + 5)
+                    title_cell = ws_pivot.cell(row=plot_row, column=plot_col)
+                    title_cell.font = Font(name='Calibri', bold=True, size=12, color='FF4F81BD')
+                    title_cell.alignment = center_aligned
+                    plot_row += 1
+
+                    if not labels or not datasets:
+                        ws_pivot.cell(row=plot_row, column=plot_col, value="Invalid plot data")
+                        continue
+
+                    try:
+                        fig, ax = plt.subplots(figsize=(8, 4))
+                        style.use('seaborn-v0_8')
+                        fig.patch.set_facecolor('#FFFFFF')
+                        ax.set_facecolor('#F5F5F5')
+                        chart_type = plot_config.get('chartType', 'bar').lower()
+
+                        if chart_type == 'bar':
+                            width = 0.35
+                            for i, ds in enumerate(datasets):
+                                data = ds.get('data', [])
+                                label = ds.get('label', '')
+                                positions = [x + i * width for x in range(len(labels))]
+                                ax.bar(positions, data, width, label=label)
+                            ax.set_xticks([x + width / 2 for x in range(len(labels))])
+                            ax.set_xticklabels(labels)
+
+                        elif chart_type == 'line':
+                            for ds in datasets:
+                                data = ds.get('data', [])
+                                label = ds.get('label', '')
+                                ax.plot(labels, data, marker='o', label=label)
+
+                        elif chart_type == 'pie':
+                            data = datasets[0].get('data', []) if datasets else []
+                            ax.pie(data, labels=labels, autopct='%1.1f%%', shadow=True)
+
+                        ax.set_title(plot_name, fontsize=12, pad=20)
+                        if chart_type != 'pie':
+                            ax.legend()
+
+                        buf = BytesIO()
+                        plt.tight_layout()
+                        plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+                        plt.close(fig)
+                        buf.seek(0)
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as img_tmp:
+                            img_tmp.write(buf.read())
+                            img_tmp.flush()
+                            img = XLImage(img_tmp.name)
+                            img.anchor = f'{get_column_letter(plot_col)}{plot_row}'
+                            ws_pivot.add_image(img)
+
+                        os.unlink(img_tmp.name)
+                        plot_row += 20
+
+                    except Exception as e:
+                        ws_pivot.cell(row=plot_row, column=plot_col, value=f"Error rendering plot: {str(e)}")
+                        plot_row += 2
+
+            else:
+                ws_pivot.append(["No data available for this pivot"])
+
+        if len(wb.worksheets) > 1 and wb.worksheets[0].title == 'Sheet':
+            wb.remove(wb.worksheets[0])
+
+        filename = f"{project.name.replace(' ', '_')}_pivot_report.xlsx"
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+            wb.save(tmp.name)
+            tmp.seek(0)
+            response = HttpResponse(tmp.read(),
+                                    content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+            return response
+

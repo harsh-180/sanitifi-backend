@@ -23,3 +23,4 @@ scipy
 scikit-learn
 statsmodels
 python-dotenv>=1.0.0
+findspark
