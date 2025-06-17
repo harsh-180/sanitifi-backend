@@ -28,6 +28,7 @@ from pptx.dml.color import RGBColor
 import openpyxl
 import pandas as pd
 import uuid
+import time
 from io import BytesIO
 from datetime import datetime  # Added datetime import
 from rest_framework.response import Response
@@ -896,8 +897,6 @@ class FileUploadView(APIView):
         file_name = request.data.get('file_name')
         project_id = request.data.get('project_id')
 
-        file_name = os.path.basename(file_name)
-
         # Validate required fields
         if not file_name or not project_id or not file_type:
             return Response({'error': 'Missing required fields'}, status=400)
@@ -912,12 +911,42 @@ class FileUploadView(APIView):
         project_folder = f"user_{project.user.id}/project_{project.id}"
         last_name_kpi = [os.path.basename(file) for file in project.kpi_file] if project.kpi_file else []
         last_name_media = [os.path.basename(file) for file in project.media_file] if project.media_file else []
+        last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
+
+        # Handle file name based on file type
+        if file_type == 'concatenated':
+            # For concatenated files, if file_name is just the CSV filename (like "Concatenated_Sheet.csv"),
+            # we need to find the corresponding timestamp folder
+            if file_name == "Concatenated_Sheet.csv" or file_name.endswith('.csv'):
+                # Find the timestamp folder that contains this CSV file
+                concatenated_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated")
+                if os.path.exists(concatenated_folder):
+                    for timestamp_folder in os.listdir(concatenated_folder):
+                        csv_path = os.path.join(concatenated_folder, timestamp_folder, file_name)
+                        if os.path.exists(csv_path):
+                            file_name = timestamp_folder
+                            break
+                    else:
+                        return Response({'error': 'Concatenated file not found'}, status=404)
+                else:
+                    return Response({'error': 'Concatenated folder not found'}, status=404)
+            else:
+                # If file_name contains '/', split and take the first part (timestamp folder)
+                if '/' in file_name:
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+        else:
+            # For kpi and media files, use basename as before
+            file_name = os.path.basename(file_name)
 
         # Build path based on file type
         if file_name in last_name_kpi and file_type == 'kpi':
             base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "kpi", file_name)
         elif file_name in last_name_media and file_type == 'media':
             base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "media", file_name)
+        elif file_name in last_name_concatenated and file_type == 'concatenated':
+            base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated", file_name)
         else:
             return Response({'error': 'File not associated with the project'}, status=400)
 
@@ -1095,7 +1124,7 @@ class UploadProject(APIView):
         if spark_needed:
             spark = get_spark_session()
 
-        def process_excel_file(file, file_type):
+        def process_file(file, file_type):
             if file_type == 'kpi':
                 last_obj = Projects.objects.order_by('-kpi_id').first()
                 id_field = 'kpi_id'
@@ -1118,73 +1147,94 @@ class UploadProject(APIView):
                     f.write(chunk)
 
             file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            file_extension = os.path.splitext(file.name)[1].lower()
 
-            if file_size_mb < 50:
-                with pd.ExcelFile(temp_path) as xls:
-                    for sheet_name in xls.sheet_names:
-                        df = xls.parse(sheet_name, dtype=str)
-                        sheet_path = os.path.join(file_folder, f"{sheet_name}.csv")
-                        df.to_csv(sheet_path, index=False)
-                        commit_msg = f"uploaded - {user.id}/{project.id}/{base_subdir}/{file_id}/{file_basename}/{sheet_name}"
-                        subprocess.run(["git", "add", sheet_path], cwd=project_folder)
-                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-            else:
-                if spark is None:
-                    raise Exception("Spark session was not initialized for large file upload.")
-                try:
-                    xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                    sheet_names = xls.sheet_names
-                except Exception as e:
-                    print(f"❌ Failed to extract sheet names: {e}")
-                    raise
-                def convert_sheet(sheet_name):
-                    output_path = os.path.join(file_folder, f"{sheet_name}.csv")
-                    commit_msg = f"uploaded - {user.id}/{project.id}/{base_subdir}/{file_id}/{file_basename}/{sheet_name}"
+            # Handle CSV files directly without conversion
+            if file_extension == '.csv':
+                # For CSV files, just copy them directly without conversion
+                csv_path = os.path.join(file_folder, file.name)
+                if temp_path != csv_path:
+                    import shutil
+                    shutil.copy2(temp_path, csv_path)
+                    os.remove(temp_path)
+                
+                commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{file.name}"
+                subprocess.run(["git", "add", csv_path], cwd=project_folder)
+                subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                
+            # Handle Excel files with conversion to CSV
+            elif file_extension in ['.xlsx', '.xls']:
+                if file_size_mb < 50:
+                    with pd.ExcelFile(temp_path) as xls:
+                        for sheet_name in xls.sheet_names:
+                            df = xls.parse(sheet_name, dtype=str)
+                            sheet_path = os.path.join(file_folder, f"{sheet_name}.csv")
+                            df.to_csv(sheet_path, index=False)
+                            commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
+                            subprocess.run(["git", "add", sheet_path], cwd=project_folder)
+                            subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                else:
+                    if spark is None:
+                        raise Exception("Spark session was not initialized for large file update.")
                     try:
-                        df = spark.read \
-                            .format("com.crealytics.spark.excel") \
-                            .option("dataAddress", f"'{sheet_name}'!A1") \
-                            .option("header", "true") \
-                            .option("inferSchema", "false") \
-                            .option("maxRowsInMemory", 10000) \
-                            .option("maxColumns", 10000) \
-                            .option("treatEmptyValuesAsNulls", "true") \
-                            .option("workbookPassword", None) \
-                            .load(temp_path)
-                        df.toPandas().to_csv(output_path, index=False)
-                        subprocess.run(["git", "add", output_path], cwd=project_folder)
-                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                        xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                        sheet_names = xls.sheet_names
                     except Exception as e:
-                        if "RecordFormatException" in str(e):
-                            import warnings
-                            warnings.filterwarnings("ignore", category=UserWarning)
-                            try:
-                                xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                                df = xls.parse(sheet_name, dtype=str)
-                                df.to_csv(output_path, index=False)
-                                subprocess.run(["git", "add", output_path], cwd=project_folder)
-                                subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                                print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
-                            except Exception as pe:
-                                print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
-                        else:
-                            print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
-                            raise
-                with ThreadPoolExecutor(max_workers=min(4, len(sheet_names))) as executor:
-                    futures = [executor.submit(convert_sheet, sheet) for sheet in sheet_names]
-                    for f in futures:
-                        f.result()
+                        print(f"❌ Failed to extract sheet names: {e}")
+                        raise
+                    def convert_sheet(sheet_name):
+                        output_path = os.path.join(file_folder, f"{sheet_name}.csv")
+                        commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
+                        try:
+                            df = spark.read \
+                                .format("com.crealytics.spark.excel") \
+                                .option("dataAddress", f"'{sheet_name}'!A1") \
+                                .option("header", "true") \
+                                .option("inferSchema", "false") \
+                                .option("maxRowsInMemory", 10000) \
+                                .option("maxColumns", 10000) \
+                                .option("treatEmptyValuesAsNulls", "true") \
+                                .option("workbookPassword", None) \
+                                .load(temp_path)
+                            df.toPandas().to_csv(output_path, index=False)
+                            subprocess.run(["git", "add", output_path], cwd=project_folder)
+                            subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                        except Exception as e:
+                            if "RecordFormatException" in str(e):
+                                import warnings
+                                warnings.filterwarnings("ignore", category=UserWarning)
+                                try:
+                                    xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                                    df = xls.parse(sheet_name, dtype=str)
+                                    df.to_csv(output_path, index=False)
+                                    subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                    print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
+                                except Exception as pe:
+                                    print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
+                            else:
+                                print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
+                                raise
+                    with ThreadPoolExecutor(max_workers=min(4, len(sheet_names))) as executor:
+                        futures = [executor.submit(convert_sheet, sheet) for sheet in sheet_names]
+                        for f in futures:
+                            f.result()
+            else:
+                # Unsupported file type
+                os.remove(temp_path)
+                raise Exception(f"Unsupported file type: {file_extension}. Only .csv, .xlsx, and .xls files are supported.")
+            
             updated_list.append(file_basename)
             setattr(project, id_field, file_id)
 
         updated_kpi_files = []
         for file in kpi_files:
-            process_excel_file(file, 'kpi')
+            process_file(file, 'kpi')
             updated_kpi_files.append(os.path.splitext(file.name)[0])
 
         updated_media_files = []
         for file in media_files:
-            process_excel_file(file, 'media')
+            process_file(file, 'media')
             updated_media_files.append(os.path.splitext(file.name)[0])
 
         project.save()
@@ -1217,6 +1267,23 @@ class UserProjectsView(APIView):
             # Ensure kpi_file and media_file are lists
             kpi_files = project.kpi_file if isinstance(project.kpi_file, list) else []
             media_files = project.media_file if isinstance(project.media_file, list) else []
+            
+            # Get concatenated files
+            concatenated_files = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
+
+            # Process concatenated files to get actual CSV filenames
+            concatenated_file_data = []
+            for timestamp_folder in concatenated_files:
+                concatenated_folder_path = os.path.join(settings.MEDIA_ROOT, f"user_{user.id}/project_{project.id}/concatenated/{timestamp_folder}")
+                if os.path.exists(concatenated_folder_path):
+                    # Look for CSV files in the timestamp folder
+                    for file in os.listdir(concatenated_folder_path):
+                        if file.endswith('.csv'):
+                            concatenated_file_data.append({
+                                'id': len(concatenated_file_data) + 1,
+                                'path': f"user_{user.id}/project_{project.id}/concatenated/{timestamp_folder}/{file}",
+                                'name': f"{timestamp_folder}/{file}"
+                            })
 
             project_data.append({
                 'id': project.id,
@@ -1226,6 +1293,7 @@ class UserProjectsView(APIView):
                              for idx, file_name in enumerate(kpi_files)],
                     'media': [{'id': idx + 1, 'path': f"user_{user.id}/project_{project.id}/media/{file_name}", 'name': file_name} 
                               for idx, file_name in enumerate(media_files)],
+                    'concatenated': concatenated_file_data
                 }
             })
 
@@ -1299,14 +1367,11 @@ class UpdateProject(APIView):
         except Projects.DoesNotExist:
             return Response({'error': 'Project not found or access denied'}, status=404)
 
-        if not kpi_files and not media_files:
-            return Response({'error': 'No files provided for update'}, status=400)
-
-        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user_id}/project_{project_id}")
+        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
         os.makedirs(project_folder, exist_ok=True)
 
         try:
-            user = User.objects.get(id=user_id)
+            user = User.objects.get(id=project.user.id)
         except User.DoesNotExist:
             return Response({'error': 'User not found'}, status=404)
 
@@ -1334,7 +1399,7 @@ class UpdateProject(APIView):
         if spark_needed:
             spark = get_spark_session()
 
-        def process_excel_file(file, file_type):
+        def process_file(file, file_type):
             if file_type == 'kpi':
                 last_obj = Projects.objects.order_by('-kpi_id').first()
                 id_field = 'kpi_id'
@@ -1357,73 +1422,94 @@ class UpdateProject(APIView):
                     f.write(chunk)
 
             file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            file_extension = os.path.splitext(file.name)[1].lower()
 
-            if file_size_mb < 50:
-                with pd.ExcelFile(temp_path) as xls:
-                    for sheet_name in xls.sheet_names:
-                        df = xls.parse(sheet_name, dtype=str)
-                        sheet_path = os.path.join(file_folder, f"{sheet_name}.csv")
-                        df.to_csv(sheet_path, index=False)
-                        commit_msg = f"updated - {user_id}/{project_id}/{base_subdir}/{file_basename}/{sheet_name}"
-                        subprocess.run(["git", "add", sheet_path], cwd=project_folder)
-                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-            else:
-                if spark is None:
-                    raise Exception("Spark session was not initialized for large file update.")
-                try:
-                    xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                    sheet_names = xls.sheet_names
-                except Exception as e:
-                    print(f"❌ Failed to extract sheet names: {e}")
-                    raise
-                def convert_sheet(sheet_name):
-                    output_path = os.path.join(file_folder, f"{sheet_name}.csv")
-                    commit_msg = f"updated - {user_id}/{project_id}/{base_subdir}/{file_basename}/{sheet_name}"
+            # Handle CSV files directly without conversion
+            if file_extension == '.csv':
+                # For CSV files, just copy them directly without conversion
+                csv_path = os.path.join(file_folder, file.name)
+                if temp_path != csv_path:
+                    import shutil
+                    shutil.copy2(temp_path, csv_path)
+                    os.remove(temp_path)
+                
+                commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{file.name}"
+                subprocess.run(["git", "add", csv_path], cwd=project_folder)
+                subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                
+            # Handle Excel files with conversion to CSV
+            elif file_extension in ['.xlsx', '.xls']:
+                if file_size_mb < 50:
+                    with pd.ExcelFile(temp_path) as xls:
+                        for sheet_name in xls.sheet_names:
+                            df = xls.parse(sheet_name, dtype=str)
+                            sheet_path = os.path.join(file_folder, f"{sheet_name}.csv")
+                            df.to_csv(sheet_path, index=False)
+                            commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
+                            subprocess.run(["git", "add", sheet_path], cwd=project_folder)
+                            subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                else:
+                    if spark is None:
+                        raise Exception("Spark session was not initialized for large file update.")
                     try:
-                        df = spark.read \
-                            .format("com.crealytics.spark.excel") \
-                            .option("dataAddress", f"'{sheet_name}'!A1") \
-                            .option("header", "true") \
-                            .option("inferSchema", "false") \
-                            .option("maxRowsInMemory", 10000) \
-                            .option("maxColumns", 10000) \
-                            .option("treatEmptyValuesAsNulls", "true") \
-                            .option("workbookPassword", None) \
-                            .load(temp_path)
-                        df.toPandas().to_csv(output_path, index=False)
-                        subprocess.run(["git", "add", output_path], cwd=project_folder)
-                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                        xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                        sheet_names = xls.sheet_names
                     except Exception as e:
-                        if "RecordFormatException" in str(e):
-                            import warnings
-                            warnings.filterwarnings("ignore", category=UserWarning)
-                            try:
-                                xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                                df = xls.parse(sheet_name, dtype=str)
-                                df.to_csv(output_path, index=False)
-                                subprocess.run(["git", "add", output_path], cwd=project_folder)
-                                subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                                print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
-                            except Exception as pe:
-                                print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
-                        else:
-                            print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
-                            raise
-                with ThreadPoolExecutor(max_workers=min(4, len(sheet_names))) as executor:
-                    futures = [executor.submit(convert_sheet, sheet) for sheet in sheet_names]
-                    for f in futures:
-                        f.result()
+                        print(f"❌ Failed to extract sheet names: {e}")
+                        raise
+                    def convert_sheet(sheet_name):
+                        output_path = os.path.join(file_folder, f"{sheet_name}.csv")
+                        commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
+                        try:
+                            df = spark.read \
+                                .format("com.crealytics.spark.excel") \
+                                .option("dataAddress", f"'{sheet_name}'!A1") \
+                                .option("header", "true") \
+                                .option("inferSchema", "false") \
+                                .option("maxRowsInMemory", 10000) \
+                                .option("maxColumns", 10000) \
+                                .option("treatEmptyValuesAsNulls", "true") \
+                                .option("workbookPassword", None) \
+                                .load(temp_path)
+                            df.toPandas().to_csv(output_path, index=False)
+                            subprocess.run(["git", "add", output_path], cwd=project_folder)
+                            subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                        except Exception as e:
+                            if "RecordFormatException" in str(e):
+                                import warnings
+                                warnings.filterwarnings("ignore", category=UserWarning)
+                                try:
+                                    xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                                    df = xls.parse(sheet_name, dtype=str)
+                                    df.to_csv(output_path, index=False)
+                                    subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                    print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
+                                except Exception as pe:
+                                    print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
+                            else:
+                                print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
+                                raise
+                    with ThreadPoolExecutor(max_workers=min(4, len(sheet_names))) as executor:
+                        futures = [executor.submit(convert_sheet, sheet) for sheet in sheet_names]
+                        for f in futures:
+                            f.result()
+            else:
+                # Unsupported file type
+                os.remove(temp_path)
+                raise Exception(f"Unsupported file type: {file_extension}. Only .csv, .xlsx, and .xls files are supported.")
+            
             updated_list.append(file_basename)
             setattr(project, id_field, file_id)
 
         updated_kpi_files = []
         for file in kpi_files:
-            process_excel_file(file, 'kpi')
+            process_file(file, 'kpi')
             updated_kpi_files.append(os.path.splitext(file.name)[0])
 
         updated_media_files = []
         for file in media_files:
-            process_excel_file(file, 'media')
+            process_file(file, 'media')
             updated_media_files.append(os.path.splitext(file.name)[0])
 
         project.save()
@@ -4701,4 +4787,373 @@ class DownloadPivotExcel(APIView):
                                     content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
             response['Content-Disposition'] = f'attachment; filename="{filename}"'
             return response
+
+
+class ConcatenateProjectSheets(APIView):
+    """
+    API endpoint to concatenate specific sheets from different files within a project.
+    """
+    def post(self, request):
+        project_id = request.data.get('project_id')
+        sheet_selections = request.data.get('sheet_selections', {})
+        user_id = request.data.get('user_id')
+        update_database = request.data.get('update_database', False)  # Optional flag to update DB
+
+        if not all([project_id, sheet_selections, user_id]):
+            return Response({
+                'success': False,
+                'message': 'Missing required parameters: project_id, sheet_selections, user_id'
+            }, status=400)
+
+        try:
+            project = Projects.objects.get(id=project_id, user_id=user_id)
+        except Projects.DoesNotExist:
+            return Response({
+                'success': False,
+                'message': 'Project not found or access denied'
+            }, status=404)
+
+        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user_id}/project_{project_id}")
+        
+        if not os.path.exists(project_folder):
+            return Response({
+                'success': False,
+                'message': 'Project folder not found'
+            }, status=404)
+
+        try:
+            # Get all available files in the project
+            all_files = {}
+            
+            # Get KPI files
+            for kpi_file in project.kpi_file:
+                kpi_path = os.path.join(project_folder, 'kpi', kpi_file)
+                if os.path.exists(kpi_path):
+                    all_files[kpi_file] = ('kpi', kpi_path)
+            
+            # Get media files
+            for media_file in project.media_file:
+                media_path = os.path.join(project_folder, 'media', media_file)
+                if os.path.exists(media_path):
+                    all_files[media_file] = ('media', media_path)
+
+            # Scan file system for files not in database
+            kpi_folder = os.path.join(project_folder, 'kpi')
+            media_folder = os.path.join(project_folder, 'media')
+            
+            # Check KPI folder
+            if os.path.exists(kpi_folder):
+                for file_name in os.listdir(kpi_folder):
+                    if file_name not in all_files:
+                        file_path = os.path.join(kpi_folder, file_name)
+                        if os.path.isfile(file_path) or os.path.isdir(file_path):
+                            all_files[file_name] = ('kpi', file_path)
+            
+            # Check media folder
+            if os.path.exists(media_folder):
+                for file_name in os.listdir(media_folder):
+                    if file_name not in all_files:
+                        file_path = os.path.join(media_folder, file_name)
+                        if os.path.isfile(file_path) or os.path.isdir(file_path):
+                            all_files[file_name] = ('media', file_path)
+
+            # Update database if requested
+            if update_database:
+                kpi_files_to_add = []
+                media_files_to_add = []
+                
+                for file_name, (file_type, file_path) in all_files.items():
+                    if file_type == 'kpi' and file_name not in project.kpi_file:
+                        kpi_files_to_add.append(file_name)
+                    elif file_type == 'media' and file_name not in project.media_file:
+                        media_files_to_add.append(file_name)
+                
+                if kpi_files_to_add:
+                    project.kpi_file.extend(kpi_files_to_add)
+                if media_files_to_add:
+                    project.media_file.extend(media_files_to_add)
+                
+                if kpi_files_to_add or media_files_to_add:
+                    project.save()
+
+            # Validate sheet selections
+            valid_sheets = {}
+            debug_info = {
+                'available_files': list(all_files.keys()),
+                'requested_files': list(sheet_selections.keys()),
+                'file_details': {}
+            }
+            
+            for file_id, sheet_names in sheet_selections.items():
+                if file_id not in all_files:
+                    debug_info['file_details'][file_id] = 'File not found in project'
+                    continue
+                
+                file_type, file_path = all_files[file_id]
+                available_sheets = []
+                
+                # Check if it's a CSV file
+                if os.path.isfile(file_path) and file_path.endswith('.csv'):
+                    available_sheets = [f"{file_id}_data"]
+                # Check if it's a directory with CSV files (Excel converted)
+                elif os.path.isdir(file_path):
+                    csv_files = [f for f in os.listdir(file_path) if f.endswith('.csv')]
+                    available_sheets = [f"{file_id}_{os.path.splitext(csv_file)[0]}" for csv_file in csv_files]
+                
+                debug_info['file_details'][file_id] = {
+                    'file_type': file_type,
+                    'file_path': file_path,
+                    'available_sheets': available_sheets,
+                    'requested_sheets': sheet_names
+                }
+                
+                # Filter requested sheets that actually exist
+                valid_sheet_names = [sheet for sheet in sheet_names if sheet in available_sheets]
+                if valid_sheet_names:
+                    valid_sheets[file_id] = (file_type, file_path, valid_sheet_names)
+
+            if not valid_sheets:
+                return Response({
+                    'success': False,
+                    'message': 'No valid sheets found for concatenation',
+                    'debug_info': debug_info
+                }, status=400)
+
+            # Read and concatenate sheets
+            concatenated_dfs = []
+            all_columns = set()
+            sheet_names_list = []  # To collect sheet names for naming
+
+            for file_id, (file_type, file_path, sheet_names) in valid_sheets.items():
+                for sheet_name in sheet_names:
+                    try:
+                        # Extract actual sheet name from the combined name
+                        if sheet_name.endswith('_data'):
+                            # It's a CSV file
+                            df = pd.read_csv(file_path, dtype=str)
+                            actual_sheet_name = file_id  # Use file name as sheet name
+                        else:
+                            # It's a sheet from Excel file
+                            actual_sheet_name = sheet_name.replace(f"{file_id}_", "")
+                            csv_path = os.path.join(file_path, f"{actual_sheet_name}.csv")
+                            if os.path.exists(csv_path):
+                                df = pd.read_csv(csv_path, dtype=str)
+                            else:
+                                continue
+                        
+                        # Add sheet name to list for naming
+                        sheet_names_list.append(actual_sheet_name)
+                        
+                        # Clean the dataframe to handle inf, -inf, and NaN values
+                        df = df.replace([np.inf, -np.inf], 'infinity')
+                        df = df.fillna('')
+                        
+                        # Add source information
+                        df['source_file'] = file_id
+                        df['source_sheet'] = sheet_name
+                        
+                        concatenated_dfs.append(df)
+                        all_columns.update(df.columns.tolist())
+                        
+                    except Exception as e:
+                        print(f"Error reading sheet {sheet_name} from {file_id}: {e}")
+                        continue
+
+            if not concatenated_dfs:
+                return Response({
+                    'success': False,
+                    'message': 'No valid data found in selected sheets'
+                }, status=400)
+
+            # Align columns across all dataframes
+            aligned_dfs = []
+            for df in concatenated_dfs:
+                # Add missing columns with NaN values
+                for col in all_columns:
+                    if col not in df.columns:
+                        df[col] = ''
+                # Reorder columns to match
+                df = df[list(all_columns)]
+                aligned_dfs.append(df)
+
+            # Concatenate all dataframes
+            final_df = pd.concat(aligned_dfs, ignore_index=True)
+
+            # Create concatenated sheets file
+            concatenated_sheets_id = f"concatenated_sheets_{int(time.time())}"
+            concatenated_folder = os.path.join(project_folder, 'concatenated', concatenated_sheets_id)
+            os.makedirs(concatenated_folder, exist_ok=True)
+
+            # Create CSV filename based on concatenated sheet names
+            csv_filename = '+'.join(sheet_names_list) + '.csv'
+            csv_path = os.path.join(concatenated_folder, csv_filename)
+            final_df.to_csv(csv_path, index=False)
+
+            # Prepare sheet data for response
+            sheets_data = {
+                csv_filename: {
+                    "columns": final_df.columns.tolist(),
+                    "data": make_json_safe(final_df.values.tolist()[:100])  # Limit to first 100 rows and make JSON safe
+                }
+            }
+
+            # Commit to git
+            commit_msg = f"concatenated_sheets - {user_id}/{project_id}/concatenated/{concatenated_sheets_id}/{csv_filename}"
+            subprocess.run(["git", "add", csv_path], cwd=project_folder)
+            subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+
+            # Update project with concatenated sheets file
+            if not hasattr(project, 'concatenated_file'):
+                project.concatenated_file = []
+            project.concatenated_file.append(concatenated_sheets_id)
+            project.save()
+
+            return Response({
+                'success': True,
+                'message': 'Sheets concatenated successfully',
+                'concatenated_sheets': {
+                    'id': concatenated_sheets_id,
+                    'name': f"{concatenated_sheets_id}.xlsx",
+                    'type': 'concatenated',
+                    'sheets_data': sheets_data
+                },
+                'debug_info': debug_info
+            }, status=200)
+
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'Error during sheet concatenation: {str(e)}'
+            }, status=500)
+
+
+class GetProjectFiles(APIView):
+    """
+    API endpoint to get all available files in a project for debugging.
+    """
+    def post(self, request):
+        project_id = request.data.get('project_id')
+        user_id = request.data.get('user_id')
+        update_database = request.data.get('update_database', False)  # Optional flag to update DB
+
+        if not all([project_id, user_id]):
+            return Response({
+                'success': False,
+                'message': 'Missing required parameters: project_id, user_id'
+            }, status=400)
+
+        try:
+            project = Projects.objects.get(id=project_id, user_id=user_id)
+        except Projects.DoesNotExist:
+            return Response({
+                'success': False,
+                'message': 'Project not found or access denied'
+            }, status=404)
+
+        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user_id}/project_{project_id}")
+        
+        if not os.path.exists(project_folder):
+            return Response({
+                'success': False,
+                'message': 'Project folder not found'
+            }, status=404)
+
+        try:
+            # Get all available files in the project
+            all_files = []
+            database_files = set()
+            filesystem_files = set()
+            
+            # Get files from database
+            for kpi_file in project.kpi_file:
+                kpi_path = os.path.join(project_folder, 'kpi', kpi_file)
+                if os.path.exists(kpi_path):
+                    all_files.append({
+                        'type': 'kpi',
+                        'name': kpi_file,
+                        'path': kpi_path,
+                        'index': len(all_files),
+                        'source': 'database'
+                    })
+                    database_files.add(kpi_file)
+            
+            for media_file in project.media_file:
+                media_path = os.path.join(project_folder, 'media', media_file)
+                if os.path.exists(media_path):
+                    all_files.append({
+                        'type': 'media',
+                        'name': media_file,
+                        'path': media_path,
+                        'index': len(all_files),
+                        'source': 'database'
+                    })
+                    database_files.add(media_file)
+
+            # Scan file system for additional files
+            kpi_folder = os.path.join(project_folder, 'kpi')
+            media_folder = os.path.join(project_folder, 'media')
+            
+            missing_files = []
+            
+            # Check KPI folder
+            if os.path.exists(kpi_folder):
+                for file_name in os.listdir(kpi_folder):
+                    file_path = os.path.join(kpi_folder, file_name)
+                    if os.path.isdir(file_path) and file_name not in database_files:
+                        all_files.append({
+                            'type': 'kpi',
+                            'name': file_name,
+                            'path': file_path,
+                            'index': len(all_files),
+                            'source': 'filesystem'
+                        })
+                        filesystem_files.add(file_name)
+                        missing_files.append(('kpi', file_name))
+            
+            # Check media folder
+            if os.path.exists(media_folder):
+                for file_name in os.listdir(media_folder):
+                    file_path = os.path.join(media_folder, file_name)
+                    if os.path.isdir(file_path) and file_name not in database_files:
+                        all_files.append({
+                            'type': 'media',
+                            'name': file_name,
+                            'path': file_path,
+                            'index': len(all_files),
+                            'source': 'filesystem'
+                        })
+                        filesystem_files.add(file_name)
+                        missing_files.append(('media', file_name))
+
+            # Update database if requested and there are missing files
+            if update_database and missing_files:
+                for file_type, file_name in missing_files:
+                    if file_type == 'kpi':
+                        if not hasattr(project, 'kpi_file') or project.kpi_file is None:
+                            project.kpi_file = []
+                        project.kpi_file.append(file_name)
+                    elif file_type == 'media':
+                        if not hasattr(project, 'media_file') or project.media_file is None:
+                            project.media_file = []
+                        project.media_file.append(file_name)
+                
+                project.save()
+
+            return Response({
+                'success': True,
+                'project_id': project_id,
+                'user_id': user_id,
+                'files': all_files,
+                'total_files': len(all_files),
+                'database_files': len(database_files),
+                'filesystem_files': len(filesystem_files),
+                'missing_files': [f[1] for f in missing_files],
+                'database_updated': update_database and bool(missing_files)
+            }, status=200)
+
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'Error getting project files: {str(e)}'
+            }, status=500)
 

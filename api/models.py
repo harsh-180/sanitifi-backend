@@ -33,6 +33,9 @@ class Projects(models.Model):
     media_id = models.IntegerField(unique=True, null=True, blank=True)
     media_file = models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
 
+    # Field to store concatenated file references
+    concatenated_file = models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
+
     # Mapping: (file_type, file_name, sheet_name) -> google_sheet_id
     google_sheet_ids = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
 

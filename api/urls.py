@@ -50,4 +50,6 @@ urlpatterns = [
     path('fetch-pivot-plots/', views.FetchPivotPlots.as_view(), name='fetch_pivot_plots'),
     path('download-pivot-ppt/', views.DownloadPivotPPT.as_view(), name='download_pivot_ppt'),
     path('download-pivot-excel/', views.DownloadPivotExcel.as_view(), name='download_pivot_excel'),
+    path('concatenate-project-sheets/', views.ConcatenateProjectSheets.as_view(), name='concatenate_project_sheets'),
+    path('get-project-files/', views.GetProjectFiles.as_view(), name='get_project_files'),
 ]+ static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
