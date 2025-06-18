@@ -53,6 +53,7 @@ urlpatterns = [
     # path('download-report-template/', views.DownloadReportTemplate.as_view(), name='download_report_template'),
     path('concatenate-project-sheets/', views.ConcatenateProjectSheets.as_view(), name='concatenate_project_sheets'),
     path('get-project-files/', views.GetProjectFiles.as_view(), name='get_project_files'),
+    path('sheets/', views.GetSheets.as_view(), name='get_sheets'),
     
     # Project Sharing URLs
     path('share-project/', views.ShareProject.as_view(), name='share_project'),

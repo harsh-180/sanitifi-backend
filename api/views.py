@@ -1028,37 +1028,38 @@ class FileUploadView(APIView):
             file_exists = True
         elif file_name in last_name_media and file_type == 'media':
             file_exists = True
+        elif file_type == 'concatenated':
+            # For concatenated files, check if any folder contains this CSV file
+            concatenated_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated")
+            if os.path.exists(concatenated_folder):
+                for folder_name in os.listdir(concatenated_folder):
+                    folder_path = os.path.join(concatenated_folder, folder_name)
+                    if os.path.isdir(folder_path):
+                        # Check if this folder contains the CSV file
+                        for csv_file in os.listdir(folder_path):
+                            if csv_file == file_name or csv_file.endswith('.csv'):
+                                file_exists = True
+                                # Update file_name to the folder name for further processing
+                                file_name = folder_name
+                                break
+                        if file_exists:
+                            break
         elif file_name in last_name_concatenated and file_type == 'concatenated':
             file_exists = True
         
         if not file_exists:
             return Response({
-                'error': f'File "{file_name}" of type "{file_type}" not found in project. Available files: KPI={last_name_kpi}, Media={last_name_media}'
+                'error': f'File "{file_name}" of type "{file_type}" not found in project. Available files: KPI={last_name_kpi}, Media={last_name_media}, Concatenated={last_name_concatenated}'
             }, status=404)
 
         # Handle file name based on file type
         if file_type == 'concatenated':
-            # For concatenated files, if file_name is just the CSV filename (like "Concatenated_Sheet.csv"),
-            # we need to find the corresponding timestamp folder
-            if file_name == "Concatenated_Sheet.csv" or file_name.endswith('.csv'):
-                # Find the timestamp folder that contains this CSV file
-                concatenated_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated")
-                if os.path.exists(concatenated_folder):
-                    for timestamp_folder in os.listdir(concatenated_folder):
-                        csv_path = os.path.join(concatenated_folder, timestamp_folder, file_name)
-                        if os.path.exists(csv_path):
-                            file_name = timestamp_folder
-                            break
-                    else:
-                        return Response({'error': 'Concatenated file not found'}, status=404)
-                else:
-                    return Response({'error': 'Concatenated folder not found'}, status=404)
+            # For concatenated files, use the folder name as the file name
+            if '/' in file_name:
+                # If file_name includes the CSV name, extract just the folder name
+                file_name = file_name.split('/')[0]
             else:
-                # If file_name contains '/', split and take the first part (timestamp folder)
-                if '/' in file_name:
-                    file_name = file_name.split('/')[0]
-                else:
-                    file_name = os.path.basename(file_name)
+                file_name = os.path.basename(file_name)
         else:
             # For kpi and media files, use basename as before
             file_name = os.path.basename(file_name)
@@ -1079,6 +1080,9 @@ class FileUploadView(APIView):
             base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "kpi", file_name)
         elif file_name in last_name_media and file_type == 'media':
             base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "media", file_name)
+        elif file_type == 'concatenated':
+            # For concatenated files, use the folder name directly (which was updated during validation)
+            base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated", file_name)
         elif file_name in last_name_concatenated and file_type == 'concatenated':
             base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated", file_name)
         else:
@@ -3424,7 +3428,8 @@ class ProjectDetails(APIView):
                 },
                 "files": {
                     "media": [],
-                    "kpi": []
+                    "kpi": [],
+                    "concatenated": []
                 }
             }
             
@@ -4135,7 +4140,7 @@ class ConcatenateProjectSheets(APIView):
             # Read and concatenate sheets
             concatenated_dfs = []
             all_columns = set()
-            sheet_names_list = []  # To collect sheet names for naming
+            sheet_names_list = []
 
             for file_id, (file_type, file_path, sheet_names) in valid_sheets.items():
                 for sheet_name in sheet_names:
@@ -4192,13 +4197,31 @@ class ConcatenateProjectSheets(APIView):
             # Concatenate all dataframes
             final_df = pd.concat(aligned_dfs, ignore_index=True)
 
-            # Create concatenated sheets file
-            concatenated_sheets_id = f"concatenated_sheets_{int(time.time())}"
-            concatenated_folder = os.path.join(project_folder, 'concatenated', concatenated_sheets_id)
+            # Create a shorter, safer concatenated file name
+            import hashlib
+            import time
+            
+            # Create a shorter name from the first few characters of each sheet
+            short_names = []
+            for sheet_name in sheet_names_list:
+                # Take first 10 characters, remove special characters
+                short_name = ''.join(c for c in sheet_name[:10] if c.isalnum() or c in ' -_')
+                short_names.append(short_name)
+            
+            # Create concatenated name with timestamp to ensure uniqueness
+            timestamp = int(time.time())
+            concatenated_name = f"concatenated_{timestamp}"
+            
+            # Create folder for the concatenated file
+            concatenated_folder = os.path.join(project_folder, 'concatenated', concatenated_name)
             os.makedirs(concatenated_folder, exist_ok=True)
 
-            # Create CSV filename based on concatenated sheet names
-            csv_filename = '+'.join(sheet_names_list) + '.csv'
+            # Save the CSV file with a descriptive name
+            csv_filename = f"{'+'.join(short_names)}.csv"
+            # Ensure the filename is not too long
+            if len(csv_filename) > 200:
+                csv_filename = f"concatenated_{timestamp}.csv"
+            
             csv_path = os.path.join(concatenated_folder, csv_filename)
             final_df.to_csv(csv_path, index=False)
 
@@ -4211,22 +4234,22 @@ class ConcatenateProjectSheets(APIView):
             }
 
             # Commit to git
-            commit_msg = f"concatenated_sheets - {user_id}/{project_id}/concatenated/{concatenated_sheets_id}/{csv_filename}"
+            commit_msg = f"concatenated - {user_id}/{project_id}/concatenated/{concatenated_name}/{csv_filename}"
             subprocess.run(["git", "add", csv_path], cwd=project_folder)
             subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
 
-            # Update project with concatenated sheets file
+            # Update project with concatenated file
             if not hasattr(project, 'concatenated_file'):
                 project.concatenated_file = []
-            project.concatenated_file.append(concatenated_sheets_id)
+            if concatenated_name not in project.concatenated_file:
+                project.concatenated_file.append(concatenated_name)
             project.save()
 
             return Response({
                 'success': True,
                 'message': 'Sheets concatenated successfully',
-                'concatenated_sheets': {
-                    'id': concatenated_sheets_id,
-                    'name': f"{concatenated_sheets_id}.xlsx",
+                'concatenated_file': {
+                    'name': concatenated_name,
                     'type': 'concatenated',
                     'sheets_data': sheets_data
                 },
@@ -4424,10 +4447,10 @@ class ShareProject(APIView):
                         'message': 'file_type and file_name are required for file-specific sharing'
                     }, status=400)
                 
-                if file_type not in ['kpi', 'media']:
+                if file_type not in ['kpi', 'media', 'concatenated']:
                     return Response({
                         'success': False,
-                        'message': 'file_type must be either "kpi" or "media"'
+                        'message': 'file_type must be either "kpi", "media", or "concatenated"'
                     }, status=400)
             
             # Get users
@@ -4466,22 +4489,53 @@ class ShareProject(APIView):
             # For file-specific sharing, validate file exists
             if share_type == 'file':
                 project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
-                file_path = os.path.join(project_folder, file_type, file_name)
                 
-                if not os.path.exists(file_path):
-                    return Response({
-                        'success': False,
-                        'message': f'File {file_name} not found in {file_type} folder'
-                    }, status=404)
-                
-                # If sheet_name is provided, validate it exists
-                if sheet_name:
-                    sheet_path = os.path.join(file_path, sheet_name)
-                    if not os.path.exists(sheet_path):
+                if file_type == 'concatenated':
+                    # For concatenated files, check if any folder contains this CSV file
+                    concatenated_folder = os.path.join(project_folder, "concatenated")
+                    if os.path.exists(concatenated_folder):
+                        file_found = False
+                        for folder_name in os.listdir(concatenated_folder):
+                            folder_path = os.path.join(concatenated_folder, folder_name)
+                            if os.path.isdir(folder_path):
+                                # Check if this folder contains the CSV file
+                                for csv_file in os.listdir(folder_path):
+                                    if csv_file == file_name or csv_file.endswith('.csv'):
+                                        file_found = True
+                                        # Update file_name to the folder name for storage
+                                        file_name = folder_name
+                                        break
+                            if file_found:
+                                break
+                        
+                        if not file_found:
+                            return Response({
+                                'success': False,
+                                'message': f'Concatenated file {file_name} not found in project'
+                            }, status=404)
+                    else:
                         return Response({
                             'success': False,
-                            'message': f'Sheet {sheet_name} not found in file {file_name}'
+                            'message': 'Concatenated folder not found in project'
                         }, status=404)
+                else:
+                    # For kpi and media files, check the regular path
+                    file_path = os.path.join(project_folder, file_type, file_name)
+                    
+                    if not os.path.exists(file_path):
+                        return Response({
+                            'success': False,
+                            'message': f'File {file_name} not found in {file_type} folder'
+                        }, status=404)
+                    
+                    # If sheet_name is provided, validate it exists
+                    if sheet_name:
+                        sheet_path = os.path.join(file_path, sheet_name)
+                        if not os.path.exists(sheet_path):
+                            return Response({
+                                'success': False,
+                                'message': f'Sheet {sheet_name} not found in file {file_name}'
+                            }, status=404)
             
             # Check if share already exists
             share_filter = {
@@ -4746,7 +4800,8 @@ class GetSharedProjectDetails(APIView):
                 },
                 "files": {
                     "media": [],
-                    "kpi": []
+                    "kpi": [],
+                    "concatenated": []
                 }
             }
             
@@ -4761,7 +4816,7 @@ class GetSharedProjectDetails(APIView):
             # Get file details based on share type
             if share.share_type == 'project':
                 # For project-level sharing, show all files
-                for file_type in ["media", "kpi"]:
+                for file_type in ["media", "kpi", "concatenated"]:
                     file_folder = os.path.join(project_folder, file_type)
                     if not os.path.exists(file_folder):
                         continue
@@ -5449,4 +5504,193 @@ class GetProjectSharedAccess(APIView):
 
 #         except Exception as e:
 #             return Response({'error': str(e)}, status=500)
+
+
+class GetSheets(APIView):
+    """
+    API endpoint to get sheets from a specific file in a project.
+    """
+    def post(self, request):
+        try:
+            # Extract data from request
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            file_id = request.data.get('file_id')
+            project_id = request.data.get('project_id')
+            user_id = request.data.get('user_id')
+            permission_level = request.data.get('permission_level')
+
+            # Validate required fields
+            if not all([file_type, file_name, project_id, user_id]):
+                missing_fields = []
+                if not file_type: missing_fields.append('file_type')
+                if not file_name: missing_fields.append('file_name')
+                if not project_id: missing_fields.append('project_id')
+                if not user_id: missing_fields.append('user_id')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            # Get user
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+
+            # Get project
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Check if user has access to this project/file
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name
+            )
+            
+            if not has_access:
+                return Response({
+                    'error': 'Access denied. You don\'t have permission to access this project/file.'
+                }, status=403)
+
+            # Handle file name based on file type - CLEAN UP FIRST
+            original_file_name = file_name
+            if file_type == 'concatenated':
+                # For concatenated files, use the folder name as the file name
+                if '/' in file_name:
+                    # If file_name includes the CSV name, extract just the folder name
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+            else:
+                # For kpi and media files, extract just the file name from the path
+                # Handle both forward and backward slashes
+                if '/' in file_name or '\\' in file_name:
+                    # Split by both forward and backward slashes and take the last part
+                    file_name = file_name.replace('\\', '/').split('/')[-1]
+                else:
+                    file_name = os.path.basename(file_name)
+
+            # Define folder structure
+            project_folder = f"user_{project.user.id}/project_{project.id}"
+            last_name_kpi = [os.path.basename(file) for file in project.kpi_file] if project.kpi_file else []
+            last_name_media = [os.path.basename(file) for file in project.media_file] if project.media_file else []
+            last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
+
+            # Validate that the file exists in the project
+            file_exists = False
+            if file_name in last_name_kpi and file_type == 'kpi':
+                file_exists = True
+            elif file_name in last_name_media and file_type == 'media':
+                file_exists = True
+            elif file_type == 'concatenated':
+                # For concatenated files, check if any folder contains this CSV file
+                concatenated_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated")
+                if os.path.exists(concatenated_folder):
+                    for folder_name in os.listdir(concatenated_folder):
+                        folder_path = os.path.join(concatenated_folder, folder_name)
+                        if os.path.isdir(folder_path):
+                            # Check if this folder contains the CSV file
+                            for csv_file in os.listdir(folder_path):
+                                if csv_file == file_name or csv_file.endswith('.csv'):
+                                    file_exists = True
+                                    # Update file_name to the folder name for further processing
+                                    file_name = folder_name
+                                    break
+                        if file_exists:
+                            break
+            elif file_name in last_name_concatenated and file_type == 'concatenated':
+                file_exists = True
+            
+            if not file_exists:
+                return Response({
+                    'error': f'File "{file_name}" of type "{file_type}" not found in project. Available files: KPI={last_name_kpi}, Media={last_name_media}, Concatenated={last_name_concatenated}'
+                }, status=404)
+
+            # Build path based on file type
+            if file_name in last_name_kpi and file_type == 'kpi':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "kpi", file_name)
+            elif file_name in last_name_media and file_type == 'media':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "media", file_name)
+            elif file_type == 'concatenated':
+                # For concatenated files, use the folder name directly (which was updated during validation)
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated", file_name)
+            elif file_name in last_name_concatenated and file_type == 'concatenated':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated", file_name)
+            else:
+                return Response({'error': 'File not associated with the project'}, status=400)
+
+            base_folder = os.path.normpath(base_folder)
+
+            if not os.path.exists(base_folder):
+                return Response({'error': 'Folder not found'}, status=404)
+
+            # Collect all CSV files inside the folder
+            csv_files = []
+            for root, dirs, files in os.walk(base_folder):
+                for file in files:
+                    if file.endswith('.csv'):
+                        csv_files.append(os.path.join(root, file))
+
+            if not csv_files:
+                return Response({'error': 'No CSV files found inside the folder'}, status=404)
+
+            # Read and process each CSV file
+            sheets_data = {}
+            for csv_file in csv_files:
+                try:
+                    # Get relative path from base folder
+                    relative_path = os.path.relpath(csv_file, base_folder)
+                    sheet_name = os.path.splitext(relative_path)[0]  # Remove .csv extension
+                    
+                    # Read CSV file
+                    try:
+                        df = pd.read_csv(csv_file, encoding='utf-8')
+                    except UnicodeDecodeError:
+                        df = pd.read_csv(csv_file, encoding='latin1')
+                    
+                    # Replace infinite values with None
+                    df = df.replace([np.inf, -np.inf], np.nan)
+                    
+                    # Convert DataFrame to JSON-safe format
+                    safe_df = df.copy()
+                    for col in safe_df.columns:
+                        safe_df[col] = safe_df[col].astype(str)
+                    
+                    sheets_data[sheet_name] = {
+                        'columns': safe_df.columns.tolist(),
+                        'data': safe_df.values.tolist(),
+                        'file_path': csv_file,
+                        'size': os.path.getsize(csv_file),
+                        'last_modified': os.path.getmtime(csv_file)
+                    }
+                    
+                except Exception as e:
+                    print(f"Error reading CSV file {csv_file}: {str(e)}")
+                    continue
+
+            if not sheets_data:
+                return Response({'error': 'No valid sheets found in the file'}, status=404)
+
+            return Response({
+                'success': True,
+                'file_info': {
+                    'file_type': file_type,
+                    'file_name': file_name,
+                    'file_id': file_id,
+                    'project_id': project_id,
+                    'total_sheets': len(sheets_data),
+                    'sheets': list(sheets_data.keys())
+                },
+                'sheets_data': sheets_data,
+                'access_info': {
+                    'permission_level': permission_level,
+                    'is_owner': share_object is None
+                }
+            }, status=200)
+
+        except Exception as e:
+            return Response({
+                'error': f'An unexpected error occurred: {str(e)}'
+            }, status=500)
 
