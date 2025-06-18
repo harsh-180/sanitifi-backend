@@ -23,6 +23,7 @@ from pyspark.sql.utils import AnalysisException
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData, XyChartData
 from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.text import PP_ALIGN
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 import openpyxl
@@ -31,11 +32,12 @@ import uuid
 import time
 from io import BytesIO
 from datetime import datetime  # Added datetime import
+from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
-from api.models import User,Projects, SavedScript, SavedPlot, SavedPivot, SavedPivotPlot
+from api.models import User,Projects, SavedScript, SavedPlot, SavedPivot, SavedPivotPlot, ProjectShare
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
 
@@ -125,6 +127,66 @@ def make_json_safe(obj):
     else:
         return obj
     
+def check_project_access(user_id, project_id, file_type=None, file_name=None, sheet_name=None):
+    """
+    Utility function to check if a user has access to a project or specific file.
+    
+    Args:
+        user_id: ID of the user requesting access
+        project_id: ID of the project
+        file_type: Optional file type ('kpi' or 'media') for file-specific access
+        file_name: Optional file name for file-specific access
+        sheet_name: Optional sheet name for file-specific access
+    
+    Returns:
+        tuple: (has_access, share_object, permission_level)
+        - has_access: Boolean indicating if user has access
+        - share_object: ProjectShare object if access exists, None otherwise
+        - permission_level: Permission level if access exists, None otherwise
+    """
+    try:
+        user = User.objects.get(id=user_id)
+        project = Projects.objects.get(id=project_id)
+        
+        # Check if user is the project owner
+        if project.user.id == int(user_id):
+            return True, None, 'admin'
+        
+        # Check for shared access
+        share_filter = {
+            'project_id': project_id,
+            'shared_with': user,
+            'is_active': True
+        }
+        
+        if file_type and file_name and sheet_name:
+            # File-specific access with sheet name
+            share_filter.update({
+                'share_type': 'file',
+                'file_type': file_type,
+                'file_name': file_name,
+                'sheet_name': sheet_name
+            })
+        elif file_type and file_name:
+            # File-specific access without sheet name
+            share_filter.update({
+                'share_type': 'file',
+                'file_type': file_type,
+                'file_name': file_name
+            })
+        else:
+            # Project-level access
+            share_filter['share_type'] = 'project'
+        
+        try:
+            share = ProjectShare.objects.get(**share_filter)
+            return True, share, share.permission_level
+        except ProjectShare.DoesNotExist:
+            return False, None, None
+            
+    except (User.DoesNotExist, Projects.DoesNotExist):
+        return False, None, None
+
 @method_decorator(csrf_exempt, name='dispatch')
 
 class MergeFile(APIView):
@@ -896,10 +958,57 @@ class FileUploadView(APIView):
         file_type = request.data.get('file_type')
         file_name = request.data.get('file_name')
         project_id = request.data.get('project_id')
+        user_id = request.data.get('user_id')  # For direct project access
+        share_id = request.data.get('share_id')  # For shared project access
+        permission_level = request.data.get('permission_level')
+        is_shared = request.data.get('is_shared', False)  # Boolean flag for shared access
 
         # Validate required fields
         if not file_name or not project_id or not file_type:
             return Response({'error': 'Missing required fields'}, status=400)
+
+        # Handle shared project access
+        if is_shared:
+            if not share_id:
+                return Response({'error': 'share_id is required for shared projects'}, status=400)
+            
+            # Get the share
+            try:
+                share = ProjectShare.objects.get(id=share_id, is_active=True)
+            except ProjectShare.DoesNotExist:
+                return Response({'error': 'Share not found or revoked'}, status=404)
+            
+            # Validate project matches
+            if share.project_id != int(project_id):
+                return Response({'error': 'Project ID mismatch'}, status=400)
+            
+            user_id = share.shared_with.id
+            permission_level = share.permission_level
+            
+            # Additional validation for file-specific shares
+            if share.share_type == 'file':
+                # For file-specific shares, validate the file matches
+                if share.file_type != file_type or share.file_name != file_name:
+                    return Response({
+                        'error': f'Access denied. This share only allows access to {share.file_type}/{share.file_name}'
+                    }, status=403)
+            
+            # For shared access, use the file_type from the request (not from share)
+            # This allows accessing any file within the shared scope
+        else:
+            # For direct project access, user_id is required
+            if not user_id:
+                return Response({'error': 'user_id is required for direct project access'}, status=400)
+            
+            # Check if user has access to this project/file
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name
+            )
+            
+            if not has_access:
+                return Response({
+                    'error': 'Access denied. You don\'t have permission to access this project/file.'
+                }, status=403)
 
         # Ensure project exists
         try:
@@ -912,6 +1021,20 @@ class FileUploadView(APIView):
         last_name_kpi = [os.path.basename(file) for file in project.kpi_file] if project.kpi_file else []
         last_name_media = [os.path.basename(file) for file in project.media_file] if project.media_file else []
         last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
+
+        # Validate that the file exists in the project
+        file_exists = False
+        if file_name in last_name_kpi and file_type == 'kpi':
+            file_exists = True
+        elif file_name in last_name_media and file_type == 'media':
+            file_exists = True
+        elif file_name in last_name_concatenated and file_type == 'concatenated':
+            file_exists = True
+        
+        if not file_exists:
+            return Response({
+                'error': f'File "{file_name}" of type "{file_type}" not found in project. Available files: KPI={last_name_kpi}, Media={last_name_media}'
+            }, status=404)
 
         # Handle file name based on file type
         if file_type == 'concatenated':
@@ -941,6 +1064,17 @@ class FileUploadView(APIView):
             file_name = os.path.basename(file_name)
 
         # Build path based on file type
+        # If file_type is None (project-level share), determine it from file_name
+        if file_type is None:
+            if file_name in last_name_kpi:
+                file_type = 'kpi'
+            elif file_name in last_name_media:
+                file_type = 'media'
+            elif file_name in last_name_concatenated:
+                file_type = 'concatenated'
+            else:
+                return Response({'error': 'File not associated with the project'}, status=400)
+        
         if file_name in last_name_kpi and file_type == 'kpi':
             base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "kpi", file_name)
         elif file_name in last_name_media and file_type == 'media':
@@ -1023,7 +1157,8 @@ class FileUploadView(APIView):
 
             return Response({
                 'message': 'CSV file(s) data retrieved successfully',
-                'sheets_data': sheets_data
+                'sheets_data': sheets_data,
+                'permission_level': permission_level
             }, status=200)
 
         except Exception as e:
@@ -1874,708 +2009,6 @@ class UndoRedoSheet(APIView):
         commit_msg = f"{action.capitalize()} action on {sheet_name} by {user.username}"
         subprocess.run(["git", "add", "."], cwd=project_folder)
         subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-
-
-class EnhancedEDAAnalysis(APIView):
-    def post(self, request):
-        try:
-            file_type = request.data.get('file_type')
-            file_name = request.data.get('file_name')
-            project_id = request.data.get('project_id')
-            sheet_name = request.data.get('sheet_name')
-            analysis_types = request.data.get('analysis_types', ['all'])
-            target_column = request.data.get('target_column')
-            categorical_columns = request.data.get('categorical_columns', [])
-            numerical_columns = request.data.get('numerical_columns', [])
-            datetime_columns = request.data.get('datetime_columns', [])
-
-            file_name = os.path.basename(file_name)
-
-            if not all([file_type, file_name, project_id, sheet_name]):
-                return Response({"error": "Missing required fields"}, status=400)
-
-            try:
-                project = Projects.objects.get(id=project_id)
-                file_path = os.path.join(
-                    settings.MEDIA_ROOT,
-                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
-                )
-                file_path = os.path.normpath(file_path)
-
-                if not os.path.exists(file_path):
-                    return Response({"error": "File not found"}, status=404)
-
-                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                if file_size_mb > 50:
-                    spark = get_spark_session()
-                    df = spark.read.option("header", True).csv(file_path)
-                    total_rows = df.count()
-                    total_columns = len(df.columns)
-                    duplicate_rows = total_rows - df.dropDuplicates().count()
-                    column_types = {}
-                    for col_name, dtype in df.dtypes:
-                        if dtype in ['int', 'double', 'float', 'bigint']:
-                            column_types[col_name] = 'numerical'
-                        elif dtype in ['date', 'timestamp']:
-                            column_types[col_name] = 'datetime'
-                        else:
-                            column_types[col_name] = 'categorical'
-                    missing_values = {}
-                    for col_name in df.columns:
-                        missing_count = df.filter(df[col_name].isNull() | (df[col_name] == "")).count()
-                        missing_values[col_name] = {
-                            "missing_count": int(missing_count),
-                            "missing_percentage": float(missing_count / total_rows * 100) if total_rows else 0
-                        }
-                    numerical_stats = {}
-                    num_cols = [col for col, typ in column_types.items() if typ == 'numerical']
-                    for col in num_cols:
-                        stats = df.selectExpr(
-                            f"mean({col}) as mean",
-                            f"percentile({col}, 0.5) as median",
-                            f"stddev({col}) as std",
-                            f"min({col}) as min",
-                            f"max({col}) as max"
-                        ).toPandas().to_dict(orient='records')[0]
-                        numerical_stats[col] = {k: float(v) if v is not None else None for k, v in stats.items()}
-                    categorical_stats = {}
-                    cat_cols = [col for col, typ in column_types.items() if typ == 'categorical']
-                    for col in cat_cols:
-                        value_counts = df.groupBy(col).count().orderBy('count', ascending=False).limit(10).toPandas()
-                        categorical_stats[col] = {
-                            "unique_values": int(df.select(col).distinct().count()),
-                            "top_categories": {str(row[col]): int(row['count']) for _, row in value_counts.iterrows()}
-                        }
-                    correlation = {}
-                    if len(num_cols) > 1:
-                        for i, col1 in enumerate(num_cols):
-                            correlation[col1] = {}
-                            for col2 in num_cols[i+1:]:
-                                corr_val = df.stat.corr(col1, col2)
-                                correlation[col1][col2] = corr_val
-                    eda_results = {
-                        "basic_info": {
-                            "total_rows": total_rows,
-                            "total_columns": total_columns,
-                            "duplicate_rows": duplicate_rows,
-                            "column_types": column_types
-                        },
-                        "missing_values": missing_values,
-                        "numerical_stats": numerical_stats,
-                        "categorical_stats": categorical_stats,
-                        "correlation": correlation
-                    }
-                    spark.stop()
-                else:
-                    df = pd.read_csv(file_path)
-                    eda_results = {
-                        "basic_info": {
-                            "total_rows": len(df),
-                            "total_columns": len(df.columns),
-                            "memory_usage": df.memory_usage(deep=True).sum(),
-                            "duplicate_rows": df.duplicated().sum(),
-                            "column_types": {
-                                col: (
-                                    "numerical" if pd.api.types.is_numeric_dtype(df[col])
-                                    else "datetime" if pd.api.types.is_datetime64_any_dtype(df[col])
-                                    else "categorical"
-                                )
-                                for col in df.columns
-                            }
-                        },
-                        "missing_values": self.analyze_missing_values(df),
-                        "numerical_stats": self.analyze_numerical_data(df),
-                        "categorical_stats": self.analyze_categorical_data(df),
-                        "correlation": self.analyze_correlations(df),
-                    }
-                return Response({"eda_results": eda_results}, status=200)
-            except Projects.DoesNotExist:
-                return Response({"error": "Project not found"}, status=404)
-        except Exception as e:
-            return Response({"error": f"Error during EDA: {str(e)}"}, status=500)
-
-    def preprocess_numerical_data(self, df, numerical_columns):
-        """Preprocess numerical columns to handle infinity and non-numeric values."""
-        if not numerical_columns:
-            numerical_columns = df.select_dtypes(include=['int64', 'float64']).columns
-        
-        for col in numerical_columns:
-            if col in df.columns:
-                # Convert to numeric, coerce errors to NaN
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-                # Replace infinity values with NaN
-                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-        return df
-
-    def clean_dataframe(self, df):
-        """Clean the dataframe before analysis."""
-        # Store original column count
-        original_columns = len(df.columns)
-        
-        # Replace infinite values with NaN
-        df = df.replace([np.inf, -np.inf], np.nan)
-        
-        # Replace common missing value indicators
-        missing_values = [
-            'NA', 'N/A', 'NAN', 'NULL', 'NONE', '', 
-            '#N/A', '#N/A N/A', '#NA', '-1.#IND', 
-            '-1.#QNAN', '-NaN', '-nan', '1.#IND',
-            '1.#QNAN', '<NA>', 'NIL', 'N.D.', 'N.D',
-            'NOT AVAILABLE', 'NOT APPLICABLE', 'MISSING',
-            'UNKNOWN', '?', '..', 'VALUE ERROR', 'value error', 'VALUEERROR', 'valueerror'
-        ]
-        normalized_missing = set(v.replace(' ', '').upper() for v in missing_values)
-        # For numeric columns, replace error strings with 0
-        for col in df.columns:
-            if df[col].dtype in ['int64', 'float64'] or pd.api.types.is_numeric_dtype(df[col]):
-                df[col] = df[col].apply(
-                    lambda x: 'NA' if isinstance(x, str) and x.strip().replace(' ', '').upper() in normalized_missing else x
-                )
-                # Do not convert to numeric, keep as 'NA' string for missing/error
-            elif df[col].dtype == 'object':
-                df[col] = df[col].apply(
-                    lambda x: 'NA' if isinstance(x, str) and x.strip().replace(' ', '').upper() in normalized_missing else x
-                )
-        # Verify column count hasn't changed
-        if len(df.columns) != original_columns:
-            print(f"Warning: Column count changed during cleaning. Original: {original_columns}, Current: {len(df.columns)}")
-        
-        return df
-    def get_summary_stats(self, df):
-        if df is None or df.empty:
-            return {
-                "dataset_info": {
-                    "total_rows": 0,
-                    "total_columns": 0,
-                    "memory_usage_mb": 0,
-                    "duplicate_rows": 0
-                },
-                "column_types": {
-                    "numerical": [],
-                    "categorical": [],
-                    "datetime": [],
-                    "boolean": []
-                }
-            }
-
-        # Get actual column count before any type filtering
-        total_columns = len(df.columns)
-        return {
-            "dataset_info": {
-                "total_rows": len(df),
-                "total_columns": total_columns,
-                "memory_usage_mb": round(df.memory_usage(deep=True).sum() / (1024 * 1024), 2),
-                "duplicate_rows": int(df.duplicated().sum())
-            },
-            "column_types": {
-                "numerical": df.select_dtypes(include=['int64', 'float64']).columns.tolist(),
-                "categorical": df.select_dtypes(include=['object']).columns.tolist(),
-                "datetime": df.select_dtypes(include=['datetime64']).columns.tolist(),
-                "boolean": df.select_dtypes(include=['bool']).columns.tolist()
-            }
-        }
-
-    def analyze_data_quality(self, df):
-        quality_metrics = {}
-        for column in df.columns:
-            missing_count = df[column].isnull().sum()
-            total_rows = len(df)
-            
-            quality_metrics[column] = {
-                "missing_values": {
-                    "count": int(missing_count),
-                    "percentage": round((missing_count / total_rows) * 100, 2)
-                },
-                "unique_values": int(df[column].nunique()),
-                "completeness": round(((total_rows - missing_count) / total_rows) * 100, 2)
-            }
-
-            # Add data type specific metrics
-            if df[column].dtype in ['int64', 'float64']:
-                quality_metrics[column]["zeros_count"] = int((df[column] == 0).sum())
-                quality_metrics[column]["negative_values"] = int((df[column] < 0).sum())
-            elif df[column].dtype == 'object':
-                quality_metrics[column]["empty_strings"] = int((df[column] == '').sum())
-                quality_metrics[column]["whitespace_only"] = int(df[column].str.isspace().sum())
-
-        return quality_metrics
-
-    def analyze_numerical_data(self, df, numerical_columns=None):
-        if not numerical_columns:
-            numerical_columns = df.select_dtypes(include=['int64', 'float64']).columns
-
-        results = {}
-        max_bins = 100  # Cap the number of bins to prevent memory errors
-        for col in numerical_columns:
-            if col in df.columns:
-                # Only analyze if at least 80% of non-null values are numeric after conversion
-                converted = pd.to_numeric(df[col], errors='coerce')
-                num_numeric = converted.notnull().sum()
-                num_total = df[col].notnull().sum()
-                if num_total == 0 or num_numeric / num_total < 0.8:
-                    continue  # skip columns that are mostly non-numeric
-                data = converted.dropna()
-                if len(data) > 0:
-                    unique_vals = data.nunique()
-                    bins = min(max_bins, unique_vals) if unique_vals > 1 else 1
-                    # Only compute histogram if unique values are not excessive
-                    if unique_vals <= 10000:
-                        hist_values, hist_bins = np.histogram(data, bins=bins)
-                        histogram = {
-                            "bins": hist_bins.tolist(),
-                            "counts": hist_values.tolist()
-                        }
-                    else:
-                        histogram = None
-                    results[col] = {
-                        "mean": float(data.mean()),
-                        "median": float(data.median()),
-                        "std": float(data.std()),
-                        "variance": float(data.var()),
-                        "min": float(data.min()),
-                        "max": float(data.max()),
-                        "skewness": float(data.skew()),
-                        "kurtosis": float(data.kurtosis()),
-                        "histogram": histogram
-                    }
-        return results
-
-    def analyze_categorical_data(self, df, categorical_columns=None):
-        if not categorical_columns:
-            categorical_columns = df.select_dtypes(include=['object']).columns
-
-        results = {}
-        for col in categorical_columns:
-            if col in df.columns:
-                value_counts = df[col].value_counts()
-                results[col] = {
-                    "unique_values": int(df[col].nunique()),
-                    "mode": str(df[col].mode().iloc[0]) if not df[col].mode().empty else None,
-                    "frequency": {
-                        "top_10_categories": {
-                            str(k): int(v) for k, v in value_counts.head(10).items()
-                        },
-                        "distribution": {
-                            str(k): float(v / len(df) * 100) for k, v in value_counts.items()
-                        }
-                    },
-                    "entropy": float(-(value_counts / len(df) * np.log2(value_counts / len(df))).sum()),
-                    "value_counts": {str(k): int(v) for k, v in value_counts.head(10).items()}
-                }
-        return results
-
-    def analyze_correlations(self, df, numerical_columns=None):
-        if not numerical_columns:
-            numerical_columns = df.select_dtypes(include=['int64', 'float64']).columns
-        
-        if len(numerical_columns) > 1:
-            df_clean = df[numerical_columns].replace([np.inf, -np.inf], np.nan)
-            correlation_matrix = df_clean.corr()
-            
-            # Convert to the format expected by frontend
-            correlations = {}
-            for col1 in correlation_matrix.columns:
-                correlations[col1] = {}
-                for col2 in correlation_matrix.columns:
-                    if col1 != col2:
-                        correlations[col1][col2] = float(correlation_matrix.loc[col1, col2])
-            return correlations
-        return {}
-
-    def analyze_temporal_data(self, df, datetime_columns=None):
-        results = {}
-        for col in datetime_columns:
-            if col in df.columns:
-                try:
-                    dates = pd.to_datetime(df[col])
-                    results[col] = {
-                        "range": {
-                            "start": dates.min().strftime('%Y-%m-%d %H:%M:%S'),
-                            "end": dates.max().strftime('%Y-%m-%d %H:%M:%S'),
-                            "span_days": int((dates.max() - dates.min()).days)
-                        },
-                        "patterns": {
-                            "yearly": dates.dt.year.value_counts().to_dict(),
-                            "monthly": dates.dt.month.value_counts().to_dict(),
-                            "weekly": dates.dt.isocalendar().week.value_counts().to_dict(),
-                            "daily": dates.dt.day.value_counts().to_dict(),
-                            "weekday": dates.dt.dayofweek.value_counts().to_dict()
-                        },
-                        "seasonality": {
-                            "quarter": dates.dt.quarter.value_counts().to_dict(),
-                            "month_name": dates.dt.month_name().value_counts().to_dict()
-                        }
-                    }
-                except Exception:
-                    continue
-        return results
-
-    def get_data_quality_viz(self, df):
-        missing_data = df.isnull().sum()
-        return {
-            "missing_values": {
-                "type": "bar",
-                "data": {
-                    "labels": missing_data.index.tolist(),
-                    "values": missing_data.values.tolist()
-                },
-                "layout": {
-                    "title": "Missing Values by Column",
-                    "xaxis": "Columns",
-                    "yaxis": "Count"
-                }
-            }
-        }
-
-    def get_numerical_viz(self, df, numerical_columns):
-        viz_data = {}
-        max_bins = 100  # Cap the number of bins to prevent memory errors
-        for col in numerical_columns:
-            if col in df.columns:
-                # Ensure data is numeric before visualization
-                data = pd.to_numeric(df[col], errors='coerce').dropna()
-                if len(data) > 0:
-                    unique_vals = data.nunique()
-                    bins = min(max_bins, unique_vals) if unique_vals > 1 else 1
-                    if unique_vals <= 10000:
-                        hist_values, hist_bins = np.histogram(data, bins=bins)
-                        histogram = {
-                            "values": data.tolist(),
-                            "bins": hist_bins.tolist()
-                        }
-                    else:
-                        histogram = None
-                    viz_data[col] = {
-                        "histogram": {
-                            "type": "histogram",
-                            "data": histogram if histogram else {},
-                            "layout": {
-                                "title": f"Distribution of {col}",
-                                "xaxis": col,
-                                "yaxis": "Frequency"
-                            }
-                        },
-                        "box_plot": {
-                            "type": "box",
-                            "data": {
-                                "values": data.tolist()
-                            },
-                            "layout": {
-                                "title": f"Box Plot of {col}"
-                            }
-                        }
-                    }
-        return viz_data
-
-    def get_categorical_viz(self, df, categorical_columns):
-        viz_data = {}
-        for col in categorical_columns:
-            if col in df.columns:
-                value_counts = df[col].value_counts()
-                viz_data[col] = {
-                    "pie_chart": {
-                        "type": "pie",
-                        "data": {
-                            "labels": value_counts.index.tolist(),
-                            "values": value_counts.values.tolist()
-                        },
-                        "layout": {
-                            "title": f"Distribution of {col}"
-                        }
-                    },
-                    "bar_chart": {
-                        "type": "bar",
-                        "data": {
-                            "labels": value_counts.index.tolist(),
-                            "values": value_counts.values.tolist()
-                        },
-                        "layout": {
-                            "title": f"Frequency of {col}",
-                            "xaxis": col,
-                            "yaxis": "Count"
-                        }
-                    }
-                }
-        return viz_data
-
-    def get_correlation_viz(self, df, numerical_columns):
-        if not numerical_columns or len(numerical_columns) < 2:
-            return {}
-
-        correlation_matrix = df[numerical_columns].corr()
-        return {
-            "heatmap": {
-                "type": "heatmap",
-                "data": {
-                    "x": correlation_matrix.columns.tolist(),
-                    "y": correlation_matrix.columns.tolist(),
-                    "z": correlation_matrix.values.tolist()
-                },
-                "layout": {
-                    "title": "Correlation Matrix",
-                    "xaxis": "Variables",
-                    "yaxis": "Variables"
-                }
-            }
-        }
-
-    def get_temporal_viz(self, df, datetime_columns):
-        viz_data = {}
-        for col in datetime_columns:
-            if col in df.columns:
-                try:
-                    dates = pd.to_datetime(df[col])
-                    time_series = dates.value_counts().sort_index()
-                    viz_data[col] = {
-                        "time_series": {
-                            "type": "line",
-                            "data": {
-                                "x": time_series.index.strftime('%Y-%m-%d').tolist(),
-                                "y": time_series.values.tolist()
-                            },
-                            "layout": {
-                                "title": f"Time Series Analysis of {col}",
-                                "xaxis": "Date",
-                                "yaxis": "Count"
-                            }
-                        }
-                    }
-                except Exception:
-                    continue
-        return viz_data
-
-    def analyze_target_variable(self, df, target_column):
-        if target_column not in df.columns:
-            return {"error": "Target column not found in dataset"}
-
-        target_data = df[target_column]
-        result = {
-            "analysis": {},
-            "visualizations": {}
-        }
-
-        if pd.api.types.is_numeric_dtype(target_data):
-            result["analysis"] = self.analyze_numerical_data(df[[target_column]])[target_column]
-            result["visualizations"] = self.get_numerical_viz(df[[target_column]], [target_column])
-        else:
-            result["analysis"] = self.analyze_categorical_data(df[[target_column]])[target_column]
-            result["visualizations"] = self.get_categorical_viz(df[[target_column]], [target_column])
-
-        return result
-    def post(self, request):
-        try:
-            # Extract payload data
-            file_type = request.data.get('file_type')
-            file_name = request.data.get('file_name')
-            project_id = request.data.get('project_id')
-            sheet_name = request.data.get('sheet_name')
-            analysis_types = request.data.get('analysis_types', ['all'])
-            target_column = request.data.get('target_column')
-            categorical_columns = request.data.get('categorical_columns', [])
-            numerical_columns = request.data.get('numerical_columns', [])
-            datetime_columns = request.data.get('datetime_columns', [])
-
-            # Clean up file_name
-            file_name = os.path.basename(file_name)
-
-            if not all([file_type, file_name, project_id, sheet_name]):
-                return Response({"error": "Missing required fields"}, status=400)
-
-            # Get project and construct file path
-            try:
-                project = Projects.objects.get(id=project_id)
-                file_path = os.path.join(
-                    settings.MEDIA_ROOT,
-                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
-                )
-                file_path = os.path.normpath(file_path)
-
-                if not os.path.exists(file_path):
-                    return Response({"error": "File not found"}, status=404)
-
-                # Read the file
-                df = pd.read_csv(file_path) if file_path.endswith('.csv') else pd.read_excel(file_path)
-
-                # Modified EDA results structure
-                eda_results = {
-                    "basic_info": {
-                        "total_rows": len(df),
-                        "total_columns": len(df.columns),
-                        "memory_usage": df.memory_usage(deep=True).sum(),
-                        "duplicate_rows": df.duplicated().sum(),
-                        "column_types": {}
-                    },
-                    "missing_values": self.analyze_missing_values(df),
-                    "numerical_stats": self.analyze_numerical_data(df, numerical_columns),
-                    "categorical_stats": self.analyze_categorical_data(df, categorical_columns),
-                    "correlation": self.analyze_correlations(df, numerical_columns)
-                }
-                for column in df.columns:
-                    if pd.api.types.is_numeric_dtype(df[column]):
-                        eda_results["basic_info"]["column_types"][column] = "numerical"
-                    elif pd.api.types.is_datetime64_any_dtype(df[column]):
-                        eda_results["basic_info"]["column_types"][column] = "datetime"
-                    else:
-                        try:
-                            pd.to_datetime(df[column])
-                            eda_results["basic_info"]["column_types"][column] = "datetime"
-                        except:
-                            eda_results["basic_info"]["column_types"][column] = "categorical"
-
-                eda_results = make_json_safe(eda_results)
-                return Response({
-                    "message": "EDA completed successfully",
-                    "eda_results": eda_results
-                }, status=200)
-
-            except Projects.DoesNotExist:
-                return Response({"error": "Project not found"}, status=404)
-
-        except Exception as e:
-            return Response({"error": f"Error during EDA: {str(e)}"}, status=500)
-
-    def analyze_missing_values(self, df):
-        missing_info = df.isnull().sum()
-        return {
-            column: {
-                "missing_count": int(count),
-                "missing_percentage": float(count / len(df) * 100)
-            }
-            for column, count in missing_info.items() if count > 0
-        }
-
-    def analyze_numerical_columns(self, df, numerical_columns=None):
-        if not numerical_columns:
-            numerical_columns = df.select_dtypes(include=['int64', 'float64']).columns
-
-        results = {}
-        for col in numerical_columns:
-            if col in df.columns:
-                data = df[col].dropna()
-                data = data.replace([np.inf, -np.inf], np.nan)
-                try:
-                    results[col] = {
-                        "mean": self.safe_float(data.mean()),
-                        "median": self.safe_float(data.median()),
-                        "std": self.safe_float(data.std()),
-                        "min": self.safe_float(data.min()),
-                        "max": self.safe_float(data.max()),
-                        "quartiles": {
-                            "25": self.safe_float(data.quantile(0.25)),
-                            "50": self.safe_float(data.quantile(0.50)),
-                            "75": self.safe_float(data.quantile(0.75))
-                        },
-                        "skewness": self.safe_float(data.skew()),
-                        "kurtosis": self.safe_float(data.kurtosis())
-                    }
-                except Exception:
-                    results[col] = {
-                        "error": "Could not compute statistics due to invalid values"
-                    }
-        return results
-    
-    def safe_float(self, value):
-    # Early return for obvious non-convertible cases
-        if value is None or pd.isna(value) or np.isinf(value):
-            return None
-        
-        # Handle string values
-        if isinstance(value, str):
-            value = value.strip().upper()
-            
-            # List of strings that should be considered as missing/NaN
-            missing_strings = [
-                'NA', 'N/A', 'NAN', 'NULL', 'NONE', '',
-                '#N/A', '#N/A N/A', '#NA', '-1.#IND',
-                '-1.#QNAN', '-NaN', '-nan', '1.#IND',
-                '1.#QNAN', '<NA>', 'NIL', 'N.D.', 'N.D',
-                'NOT AVAILABLE', 'NOT APPLICABLE', 'MISSING',
-                'UNKNOWN', '?', '..', 'VALUE ERROR'  # Added 'VALUE ERROR'
-            ]
-            
-            if value in missing_strings:
-                return None
-            
-            # Handle percentage values (e.g., "42%")
-            if value.endswith('%'):
-                try:
-                    return float(value[:-1]) / 100
-                except (ValueError, TypeError):
-                    return None
-        
-        # Handle numeric types that don't need conversion
-        if isinstance(value, (int, float, np.number)):
-            # Check for infinity or NaN
-            if np.isinf(value) or np.isnan(value):
-                return None
-            return float(value)
-        
-        # Final conversion attempt
-        try:
-            float_val = float(value)
-            # Additional checks for extreme values
-            if abs(float_val) > 1e150 or np.isnan(float_val) or np.isinf(float_val):
-                return None
-            return float_val
-        except (ValueError, TypeError, OverflowError):
-            return None
-
-    def analyze_categorical_columns(self, df, categorical_columns=None):
-        if not categorical_columns:
-            categorical_columns = df.select_dtypes(include=['object']).columns
-
-        results = {}
-        for col in categorical_columns:
-            if col in df.columns:
-                value_counts = df[col].value_counts()
-                results[col] = {
-                    "unique_values": int(df[col].nunique()),
-                    "top_categories": {
-                        str(k): int(v) for k, v in value_counts.head(10).items()
-                    },
-                    "category_distribution": {
-                        str(k): float(v / len(df) * 100) for k, v in value_counts.items()
-                    }
-                }
-        return results
-
-    def analyze_correlations(self, df, numerical_columns=None):
-        if not numerical_columns:
-            numerical_columns = df.select_dtypes(include=['int64', 'float64']).columns
-        
-        if len(numerical_columns) > 1:
-            # Replace infinite values with NaN
-            df_clean = df[numerical_columns].replace([np.inf, -np.inf], np.nan)
-            correlation_matrix = df_clean.corr()
-            return {
-                col1: {
-                    col2: self.safe_float(correlation_matrix.loc[col1, col2])
-                    for col2 in correlation_matrix.columns
-                    if col1 != col2
-                }
-                for col1 in correlation_matrix.columns
-            }
-        return {}
-
-    def analyze_datetime_columns(self, df, datetime_columns=None):
-        results = {}
-        for col in datetime_columns:
-            if col in df.columns:
-                try:
-                    dates = pd.to_datetime(df[col])
-                    results[col] = {
-                        "min_date": dates.min().strftime('%Y-%m-%d %H:%M:%S'),
-                        "max_date": dates.max().strftime('%Y-%m-%d %H:%M:%S'),
-                        "range_days": (dates.max() - dates.min()).days,
-                        "temporal_distribution": {
-                            "yearly": dates.dt.year.value_counts().to_dict(),
-                            "monthly": dates.dt.month.value_counts().to_dict(),
-                            "weekday": dates.dt.dayofweek.value_counts().to_dict()
-                        }
-                    }
-                except Exception:
-                    continue
-        return results
 
 
 class PivotEDAAnalysis(APIView):
@@ -3534,56 +2967,32 @@ class CustomScriptRun(APIView):
                                 subprocess.run(["git", "init"], cwd=project_folder, check=True)
                                 subprocess.run(["git", "config", "user.name", project.user.name], cwd=project_folder, check=True)
                                 subprocess.run(["git", "config", "user.email", project.user.email], cwd=project_folder, check=True)
+                        except Exception as e:
+                            print(f"Error initializing git: {str(e)}")
 
-                            # Check if there are any changes to commit
-                            status_result = subprocess.run(
-                                ["git", "status", "--porcelain", file_path], 
-                                cwd=project_folder, 
-                                capture_output=True, 
-                                text=True, 
-                                check=True
-                            )
-                            
-                            if status_result.stdout.strip():
-                                # Only commit if there are changes
-                                commit_msg = f"Custom script execution on {sheet_name}"
-                                subprocess.run(["git", "add", file_path], cwd=project_folder, check=True)
-                                subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder, check=True)
-                            else:
-                                print(f"No changes detected in {file_path}")
-                        except subprocess.CalledProcessError as e:
-                            error_msg = f"Git operation failed: {e.stderr.decode() if e.stderr else str(e)}"
-                            print(error_msg)  # Log the error
-                            # Continue with the response even if git commit fails
-                            print("Continuing without git commit")
-
-                        # Prepare sheet data in the same format as cleaning/melting APIs
-                        modified_df = modified_df.replace([np.inf, -np.inf], np.nan)
-                        modified_df = modified_df.fillna("NA")
-                        
-                        sheet_data = {
-                            sheet_name: {
-                                'columns': modified_df.columns.tolist(),
-                                'data': modified_df.values.tolist()
-                            }
-                        }
+                        # Commit the changes
+                        try:
+                            subprocess.run(["git", "add", "."], cwd=project_folder, check=True)
+                            subprocess.run(["git", "commit", "-m", f"Script execution: {sheet_name}"], cwd=project_folder, check=True)
+                        except Exception as e:
+                            print(f"Error committing to git: {str(e)}")
 
                         return Response({
-                            'message': 'Script executed and changes saved successfully',
-                            'sheet_data': sheet_data
+                            'message': 'Script executed and saved successfully',
+                            'file_path': file_path,
+                            'total_rows': len(modified_df)
                         }, status=200)
+
                     except Exception as e:
                         return Response({'error': f'Error saving file: {str(e)}'}, status=400)
 
             except TimeoutException:
                 return Response({'error': 'Script execution timed out (max 10 seconds)'}, status=400)
-            except MemoryError:
-                return Response({'error': 'Script exceeded memory limits'}, status=400)
             except Exception as e:
-                return Response({'error': f'Script execution error: {str(e)}'}, status=400)
+                return Response({'error': f'Error executing script: {str(e)}'}, status=400)
 
         except Exception as e:
-            return Response({'error': f'Server error: {str(e)}'}, status=500)
+            return Response({'error': f'Unexpected error: {str(e)}'}, status=400)
 
 
 class SaveScript(APIView):
@@ -3793,40 +3202,59 @@ class SavePlot(APIView):
                     'error': 'Invalid file_type. Must be either "kpi" or "media"'
                 }, status=400)
 
+            # Check if user has access to this project/file
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name, sheet_name
+            )
+            
+            if not has_access:
+                return Response({
+                    'error': 'Access denied. You don\'t have permission to save plots for this project/file.'
+                }, status=403)
+            
+            # Check if user has edit permissions
+            if permission_level == 'view':
+                return Response({
+                    'error': 'Access denied. You only have view permissions. Edit permissions required to save plots.'
+                }, status=403)
+
             # Get user and project
             try:
                 user = User.objects.get(id=user_id)
-                project = Projects.objects.get(id=project_id, user=user)
+                project = Projects.objects.get(id=project_id)
             except User.DoesNotExist:
                 return Response({'error': 'User not found'}, status=404)
             except Projects.DoesNotExist:
                 return Response({'error': 'Project not found'}, status=404)
 
-            # Create new saved plot
-            saved_plot = SavedPlot.objects.create(
+            # Create or update saved plot
+            saved_plot, created = SavedPlot.objects.update_or_create(
                 user=user,
                 project=project,
                 file_type=file_type,
                 file_name=file_name,
                 sheet_name=sheet_name,
                 plot_name=plot_name,
-                plot_config=plot_config,
-                chart_data=chart_data,
-                chart_options=chart_options
+                defaults={
+                    'plot_config': plot_config,
+                    'chart_data': chart_data,
+                    'chart_options': chart_options
+                }
             )
 
             return Response({
                 'message': 'Plot saved successfully',
                 'plot_id': saved_plot.id,
-                'plot_name': saved_plot.plot_name,
-                'created_at': saved_plot.created_at,
-                'updated_at': saved_plot.updated_at
-            }, status=201)  # Changed to 201 for creation
+                'created': created,
+                'updated_at': saved_plot.updated_at,
+                'access_info': {
+                    'permission_level': permission_level,
+                    'is_owner': share_object is None
+                }
+            }, status=200)
 
         except Exception as e:
-            return Response({
-                'error': f'Error saving plot: {str(e)}'
-            }, status=500)
+            return Response({'error': str(e)}, status=500)
 
 @method_decorator(csrf_exempt, name='dispatch')
 class FetchPlots(APIView):
@@ -3845,54 +3273,72 @@ class FetchPlots(APIView):
             print(f"Extracted data: user_id={user_id}, project_id={project_id}, file_type={file_type}, file_name={file_name}, sheet_name={sheet_name}")  # Debug log
 
             # Validate required fields
-            if not all([user_id, project_id, file_type, file_name, sheet_name]):
+            if not all([user_id, project_id]):
                 missing_fields = []
                 if not user_id: missing_fields.append('user_id')
                 if not project_id: missing_fields.append('project_id')
-                if not file_type: missing_fields.append('file_type')
-                if not file_name: missing_fields.append('file_name')
-                if not sheet_name: missing_fields.append('sheet_name')
                 print(f"Missing required fields: {missing_fields}")  # Debug log
                 return Response({
                     'error': f'Missing required fields: {", ".join(missing_fields)}'
                 }, status=400)
 
-            # Validate file_type
-            if file_type not in ['kpi', 'media']:
-                print(f"Invalid file_type: {file_type}")  # Debug log
+            # Check if user has access to this project
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name, sheet_name
+            )
+            
+            if not has_access:
                 return Response({
-                    'error': 'Invalid file_type. Must be either "kpi" or "media"'
-                }, status=400)
+                    'error': 'Access denied. You don\'t have permission to view plots for this project/file.'
+                }, status=403)
 
             # Get user and project
             try:
                 user = User.objects.get(id=user_id)
-                project = Projects.objects.get(id=project_id, user=user)
+                project = Projects.objects.get(id=project_id)
                 print(f"Found user: {user.username}, project: {project.name}")  # Debug log
             except User.DoesNotExist:
                 print(f"User not found with id: {user_id}")  # Debug log
                 return Response({'error': 'User not found'}, status=404)
             except Projects.DoesNotExist:
-                print(f"Project not found with id: {project_id} for user: {user_id}")  # Debug log
+                print(f"Project not found with id: {project_id}")  # Debug log
                 return Response({'error': 'Project not found'}, status=404)
 
+            # Build filter for plots based on access level
+            plot_filter = {
+                'project': project
+            }
+            
+            # If this is a file-specific share, only show plots for that file
+            if share_object and share_object.share_type == 'file':
+                plot_filter.update({
+                    'file_type': share_object.file_type,
+                    'file_name': share_object.file_name
+                })
+                
+                # If specific sheet is shared, only show plots for that sheet
+                if share_object.sheet_name:
+                    plot_filter['sheet_name'] = share_object.sheet_name
+            else:
+                # Project-level sharing or owner access - apply optional filters
+                if file_type:
+                    plot_filter['file_type'] = file_type
+                if file_name:
+                    plot_filter['file_name'] = file_name
+                if sheet_name:
+                    plot_filter['sheet_name'] = sheet_name
+
             # Debug: Print all plots for this user/project combination
-            all_plots = SavedPlot.objects.filter(user=user, project=project)
-            print(f"Total plots for user {user_id} and project {project_id}: {all_plots.count()}")
+            all_plots = SavedPlot.objects.filter(project=project)
+            print(f"Total plots for project {project_id}: {all_plots.count()}")
             for plot in all_plots:
                 print(f"Plot ID: {plot.id}, Name: {plot.plot_name}, File: {plot.file_name}, Sheet: {plot.sheet_name}, Updated: {plot.updated_at}")
 
-            # Fetch saved plots with specific filters
-            saved_plots = SavedPlot.objects.filter(
-                user=user,
-                project=project,
-                file_type=file_type,
-                file_name=file_name,
-                sheet_name=sheet_name
-            ).order_by('-updated_at')
+            # Fetch saved plots with filters
+            saved_plots = SavedPlot.objects.filter(**plot_filter).order_by('-updated_at')
 
-            print(f"Found {saved_plots.count()} plots matching specific filters")
-            print(f"Filter criteria: file_type={file_type}, file_name={file_name}, sheet_name={sheet_name}")
+            print(f"Found {saved_plots.count()} plots matching filters")
+            print(f"Filter criteria: {plot_filter}")
             
             # Debug: Print details of each matching plot
             for plot in saved_plots:
@@ -3921,14 +3367,15 @@ class FetchPlots(APIView):
 
             return Response({
                 'plots': plots_data,
+                'access_info': {
+                    'permission_level': permission_level,
+                    'is_owner': share_object is None,
+                    'share_type': share_object.share_type if share_object else 'owner'
+                },
                 'debug_info': {
                     'total_plots': all_plots.count(),
                     'matching_plots': saved_plots.count(),
-                    'filter_criteria': {
-                        'file_type': file_type,
-                        'file_name': file_name,
-                        'sheet_name': sheet_name
-                    }
+                    'filter_criteria': plot_filter
                 }
             }, status=200)
 
@@ -3941,10 +3388,21 @@ class FetchPlots(APIView):
 class ProjectDetails(APIView):
     def post(self, request):
         try:
-            # Extract project_id from request
+            # Extract project_id and user_id from request
             project_id = request.data.get('project_id')
+            user_id = request.data.get('user_id')
+            
             if not project_id:
                 return Response({"error": "project_id is required"}, status=400)
+            
+            if not user_id:
+                return Response({"error": "user_id is required"}, status=400)
+
+            # Check if user has access to this project
+            has_access, share_object, permission_level = check_project_access(user_id, project_id)
+            
+            if not has_access:
+                return Response({"error": "Access denied. You don't have permission to view this project."}, status=403)
 
             # Get project
             try:
@@ -3959,50 +3417,114 @@ class ProjectDetails(APIView):
             project_details = {
                 "project_id": project.id,
                 "project_name": project.name,
+                "access_info": {
+                    "permission_level": permission_level,
+                    "is_owner": share_object is None,  # True if user is project owner
+                    "shared_by": None
+                },
                 "files": {
                     "media": [],
                     "kpi": []
                 }
             }
+            
+            # Add sharing info if this is a shared project
+            if share_object:
+                project_details["access_info"]["shared_by"] = {
+                    "id": share_object.shared_by.id,
+                    "username": share_object.shared_by.username,
+                    "email": share_object.shared_by.email
+                }
+                
+                # For file-specific sharing, add shared file info
+                if share_object.share_type == 'file':
+                    project_details["shared_file"] = {
+                        "file_type": share_object.file_type,
+                        "file_name": share_object.file_name,
+                        "sheet_name": share_object.sheet_name
+                    }
 
-            # Process both media and kpi files
-            for file_type in ["media", "kpi"]:
+            # Process files based on access level
+            if share_object and share_object.share_type == 'file':
+                # File-specific sharing - only show the shared file
+                file_type = share_object.file_type
+                file_name = share_object.file_name
+                
                 file_folder = os.path.join(project_folder, file_type)
-                if not os.path.exists(file_folder):
-                    continue
+                file_path = os.path.join(file_folder, file_name)
+                
+                if os.path.exists(file_path) and os.path.isdir(file_path):
+                    file_info = {
+                        "name": file_name,
+                        "sheets": []
+                    }
+                    
+                    # Get all sheets (CSV files) in the file directory
+                    for sheet_file in os.listdir(file_path):
+                        if sheet_file.endswith('.csv'):
+                            # For file-specific sharing, only show the shared sheet if specified
+                            if share_object.sheet_name and sheet_file != share_object.sheet_name:
+                                continue
+                                
+                            sheet_path = os.path.join(file_path, sheet_file)
+                            sheet_info = {
+                                "name": sheet_file,
+                                "size": os.path.getsize(sheet_path),
+                                "last_modified": os.path.getmtime(sheet_path)
+                            }
+                            
+                            # Read complete sheet data
+                            try:
+                                df = pd.read_csv(sheet_path, dtype=str)
+                                df = df.replace([np.nan, np.inf, -np.inf], None)
+                                sheet_info["columns"] = df.columns.tolist()
+                                sheet_info["data"] = make_json_safe(df.values.tolist())
+                            except Exception as e:
+                                print(f"Error reading sheet {sheet_file}: {str(e)}")
+                                sheet_info["error"] = "Could not read sheet data"
+                            
+                            file_info["sheets"].append(sheet_info)
+                    
+                    project_details["files"][file_type].append(file_info)
+            else:
+                # Project-level sharing or owner access - show all files
+                for file_type in ["media", "kpi"]:
+                    file_folder = os.path.join(project_folder, file_type)
+                    if not os.path.exists(file_folder):
+                        continue
 
-                # Get all files in the folder
-                for file_name in os.listdir(file_folder):
-                    file_path = os.path.join(file_folder, file_name)
-                    if os.path.isdir(file_path):  # Each file is a directory containing sheets
-                        file_info = {
-                            "name": file_name,
-                            "sheets": []
-                        }
-                        
-                        # Get all sheets (CSV files) in the file directory
-                        for sheet_file in os.listdir(file_path):
-                            if sheet_file.endswith('.csv'):
-                                sheet_path = os.path.join(file_path, sheet_file)
-                                sheet_info = {
-                                    "name": sheet_file,
-                                    "size": os.path.getsize(sheet_path),
-                                    "last_modified": os.path.getmtime(sheet_path)
-                                }
-                                
-                                # Read complete sheet data
-                                try:
-                                    df = pd.read_csv(sheet_path, dtype=str)
-                                    df = df.replace([np.nan, np.inf, -np.inf], None)
-                                    sheet_info["columns"] = df.columns.tolist()
-                                    sheet_info["data"] = make_json_safe(df.values.tolist())
-                                except Exception as e:
-                                    print(f"Error reading sheet {sheet_file}: {str(e)}")
-                                    sheet_info["error"] = "Could not read sheet data"
-                                
-                                file_info["sheets"].append(sheet_info)
-                        
-                        project_details["files"][file_type].append(file_info)
+                    # Get all files in the folder
+                    for file_name in os.listdir(file_folder):
+                        file_path = os.path.join(file_folder, file_name)
+                        if os.path.isdir(file_path):  # Each file is a directory containing sheets
+                            file_info = {
+                                "name": file_name,
+                                "sheets": []
+                            }
+                            
+                            # Get all sheets (CSV files) in the file directory
+                            for sheet_file in os.listdir(file_path):
+                                if sheet_file.endswith('.csv'):
+                                    sheet_path = os.path.join(file_path, sheet_file)
+                                    sheet_info = {
+                                        "name": sheet_file,
+                                        "size": os.path.getsize(sheet_path),
+                                        "last_modified": os.path.getmtime(sheet_path)
+                                    }
+                                    
+                                    # Read complete sheet data
+                                    try:
+                                        df = pd.read_csv(sheet_path, dtype=str)
+                                        df = df.replace([np.nan, np.inf, -np.inf], None)
+                                        sheet_info["columns"] = df.columns.tolist()
+                                        sheet_info["data"] = make_json_safe(df.values.tolist())
+                                    except Exception as e:
+                                        print(f"Error reading sheet {sheet_file}: {str(e)}")
+                                        sheet_info["error"] = "Could not read sheet data"
+                                    
+                                    file_info["sheets"].append(sheet_info)
+                            
+                            project_details["files"][file_type].append(file_info)
 
             return Response(project_details, status=200)
 
@@ -4046,10 +3568,26 @@ class SaveReportPivot(APIView):
                     'error': 'Invalid file_type. Must be either "kpi" or "media"'
                 }, status=400)
 
+            # Check if user has access to this project/file
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name, sheet_name
+            )
+            
+            if not has_access:
+                return Response({
+                    'error': 'Access denied. You don\'t have permission to save pivots for this project/file.'
+                }, status=403)
+            
+            # Check if user has edit permissions
+            if permission_level == 'view':
+                return Response({
+                    'error': 'Access denied. You only have view permissions. Edit permissions required to save pivots.'
+                }, status=403)
+
             # Get user and project
             try:
                 user = User.objects.get(id=user_id)
-                project = Projects.objects.get(id=project_id, user=user)
+                project = Projects.objects.get(id=project_id)
             except User.DoesNotExist:
                 return Response({'error': 'User not found'}, status=404)
             except Projects.DoesNotExist:
@@ -4073,7 +3611,11 @@ class SaveReportPivot(APIView):
                 'message': 'Pivot table saved successfully',
                 'pivot_id': saved_pivot.id,
                 'created': created,
-                'updated_at': saved_pivot.updated_at
+                'updated_at': saved_pivot.updated_at,
+                'access_info': {
+                    'permission_level': permission_level,
+                    'is_owner': share_object is None
+                }
             }, status=200)
 
         except Exception as e:
@@ -4088,6 +3630,9 @@ class FetchReportPivot(APIView):
             # Extract data from request
             user_id = request.data.get('user_id')
             project_id = request.data.get('project_id')
+            file_type = request.data.get('file_type')  # Optional filter
+            file_name = request.data.get('file_name')  # Optional filter
+            sheet_name = request.data.get('sheet_name')  # Optional filter
 
             # Validate required fields
             if not all([user_id, project_id]):
@@ -4098,20 +3643,49 @@ class FetchReportPivot(APIView):
                     'error': f'Missing required fields: {", ".join(missing_fields)}'
                 }, status=400)
 
+            # Check if user has access to this project
+            has_access, share_object, permission_level = check_project_access(user_id, project_id)
+            
+            if not has_access:
+                return Response({
+                    'error': 'Access denied. You don\'t have permission to view pivots for this project.'
+                }, status=403)
+
             # Get user and project
             try:
                 user = User.objects.get(id=user_id)
-                project = Projects.objects.get(id=project_id, user=user)
+                project = Projects.objects.get(id=project_id)
             except User.DoesNotExist:
                 return Response({'error': 'User not found'}, status=404)
             except Projects.DoesNotExist:
                 return Response({'error': 'Project not found'}, status=404)
 
-            # Fetch all saved pivots for this user and project
-            saved_pivots = SavedPivot.objects.filter(
-                user=user,
-                project=project
-            ).order_by('-updated_at')
+            # Build filter for pivots based on access level
+            pivot_filter = {
+                'project': project
+            }
+            
+            # If this is a file-specific share, only show pivots for that file
+            if share_object and share_object.share_type == 'file':
+                pivot_filter.update({
+                    'file_type': share_object.file_type,
+                    'file_name': share_object.file_name
+                })
+                
+                # If specific sheet is shared, only show pivots for that sheet
+                if share_object.sheet_name:
+                    pivot_filter['sheet_name'] = share_object.sheet_name
+            else:
+                # Project-level sharing or owner access - apply optional filters
+                if file_type:
+                    pivot_filter['file_type'] = file_type
+                if file_name:
+                    pivot_filter['file_name'] = file_name
+                if sheet_name:
+                    pivot_filter['sheet_name'] = sheet_name
+
+            # Fetch all saved pivots for this project with filters
+            saved_pivots = SavedPivot.objects.filter(**pivot_filter).order_by('-updated_at')
 
             # Format response
             pivots_data = [{
@@ -4128,7 +3702,12 @@ class FetchReportPivot(APIView):
 
             return Response({
                 'pivots': pivots_data,
-                'total_pivots': saved_pivots.count()
+                'total_pivots': saved_pivots.count(),
+                'access_info': {
+                    'permission_level': permission_level,
+                    'is_owner': share_object is None,
+                    'share_type': share_object.share_type if share_object else 'owner'
+                }
             }, status=200)
 
         except Exception as e:
@@ -4343,28 +3922,51 @@ class FetchPivotPlots(APIView):
                     'error': f'Missing required fields: {", ".join(missing_fields)}'
                 }, status=400)
 
-            # Get user and project
+            # Get user
             try:
                 user = User.objects.get(id=user_id)
             except User.DoesNotExist:
                 return Response({'error': 'User not found'}, status=404)
 
+            # Get project and check access
             try:
-                project = Projects.objects.get(id=project_id, user=user)
+                project = Projects.objects.get(id=project_id)
             except Projects.DoesNotExist:
                 return Response({'error': 'Project not found'}, status=404)
 
+            # Check if user has access to this project
+            has_access, share_object, permission_level = check_project_access(user_id, project_id)
+            
+            if not has_access:
+                return Response({
+                    'error': 'Access denied. You don\'t have permission to access this project.'
+                }, status=403)
+
+            # Get the pivot table
             try:
-                pivot = SavedPivot.objects.get(id=pivot_id, project=project, user=user)
+                # For project owner, get pivot by user and project
+                if project.user.id == int(user_id):
+                    pivot = SavedPivot.objects.get(id=pivot_id, project=project, user=user)
+                else:
+                    # For shared access, get pivot by project only (pivots belong to project owner)
+                    pivot = SavedPivot.objects.get(id=pivot_id, project=project)
             except SavedPivot.DoesNotExist:
                 return Response({'error': 'Pivot table not found'}, status=404)
 
             # Fetch all plots for this pivot
-            plots = SavedPivotPlot.objects.filter(
-                user=user,
-                project=project,
-                pivot=pivot
-            ).order_by('-updated_at')
+            # For project owner, get plots by user and project
+            if project.user.id == int(user_id):
+                plots = SavedPivotPlot.objects.filter(
+                    user=user,
+                    project=project,
+                    pivot=pivot
+                ).order_by('-updated_at')
+            else:
+                # For shared access, get plots by project only (plots belong to project owner)
+                plots = SavedPivotPlot.objects.filter(
+                    project=project,
+                    pivot=pivot
+                ).order_by('-updated_at')
 
             # Prepare the response data
             plots_data = []
@@ -4390,403 +3992,14 @@ class FetchPivotPlots(APIView):
             return Response({
                 'message': 'Plots fetched successfully',
                 'plots': plots_data,
-                'total_plots': len(plots_data)
+                'total_plots': len(plots_data),
+                'permission_level': permission_level
             }, status=200)
 
         except Exception as e:
             return Response({
                 'error': f'Error fetching plots: {str(e)}'
             }, status=500)
-
-class DownloadPivotPPT(APIView):
-    parser_classes = [JSONParser]
-
-    def post(self, request):
-        user_id = request.data.get('user_id')
-        project_id = request.data.get('project_id')
-        if not user_id or not project_id:
-            return Response({'error': 'user_id and project_id are required'}, status=400)
-
-        # Fetch all pivots for this user and project
-        try:
-            user = User.objects.get(id=user_id)
-            project = Projects.objects.get(id=project_id, user=user)
-        except User.DoesNotExist:
-            return Response({'error': 'User not found'}, status=404)
-        except Projects.DoesNotExist:
-            return Response({'error': 'Project not found'}, status=404)
-
-        pivots = SavedPivot.objects.filter(user=user, project=project).order_by('created_at')
-        if not pivots.exists():
-            return Response({'error': 'No pivots found for this user and project'}, status=404)
-
-        prs = Presentation()
-        blank_slide_layout = prs.slide_layouts[6]  # blank
-
-        # First slide: Title
-        title_slide = prs.slides.add_slide(prs.slide_layouts[5])
-        title_shape = title_slide.shapes.title
-        title_shape.text = "Generated by Sanitify"
-        # Set background color
-        fill = title_slide.background.fill
-        fill.solid()
-        fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
-        # Add logo
-        logo_path = os.path.join(os.path.dirname(__file__), 'skewb-logomark 3.png')
-        if os.path.exists(logo_path):
-            left = Inches(7.5)
-            top = Inches(0.1)
-            width = Inches(1.2)
-            title_slide.shapes.add_picture(logo_path, left, top, width=width)
-        # Set title color
-        for shape in title_slide.shapes:
-            if shape.has_text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    for run in paragraph.runs:
-                        run.font.bold = True
-                        run.font.size = Pt(44)
-                        run.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
-
-        # For each pivot, add a slide with its name and all its plots
-        for pivot in pivots:
-            # Pivot slide
-            slide = prs.slides.add_slide(blank_slide_layout)
-            # Set background color
-            fill = slide.background.fill
-            fill.solid()
-            fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
-            # Add pivot name as heading
-            left = Inches(0.5)
-            top = Inches(0.2)
-            width = Inches(9)
-            height = Inches(1)
-            title_box = slide.shapes.add_textbox(left, top, width, height)
-            tf = title_box.text_frame
-            p = tf.add_paragraph()
-            p.text = f"Pivot: {pivot.pivot_name}"
-            p.font.size = Pt(32)
-            p.font.bold = True
-            p.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
-            # Add logo
-            if os.path.exists(logo_path):
-                slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.1), width=Inches(1))
-
-            # Fetch all plots for this pivot
-            plots = SavedPivotPlot.objects.filter(user=user, project=project, pivot=pivot).order_by('created_at')
-            for plot in plots:
-                # Plot slide
-                plot_slide = prs.slides.add_slide(blank_slide_layout)
-                fill = plot_slide.background.fill
-                fill.solid()
-                fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
-                # Add plot name as heading
-                left = Inches(0.5)
-                top = Inches(0.2)
-                width = Inches(9)
-                height = Inches(1)
-                title_box = plot_slide.shapes.add_textbox(left, top, width, height)
-                tf = title_box.text_frame
-                p = tf.add_paragraph()
-                p.text = plot.plot_name or "Plot"
-                p.font.size = Pt(28)
-                p.font.bold = True
-                p.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
-                # Add logo
-                if os.path.exists(logo_path):
-                    plot_slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.1), width=Inches(1))
-                # Render plot image from chart_data (matplotlib)
-                chart_data = plot.chart_data
-                plot_config = plot.plot_config or {}
-                try:
-                    fig, ax = plt.subplots(figsize=(12, 7))
-                    labels = chart_data.get('labels', [])
-                    datasets = chart_data.get('datasets', [])
-                    chart_type = (plot_config.get('chartType') or 'bar').lower()
-                    for ds in datasets:
-                        data = ds.get('data', [])
-                        label = ds.get('label', '')
-                        if chart_type == 'bar':
-                            ax.bar(labels, data, label=label)
-                        elif chart_type == 'line':
-                            ax.plot(labels, data, label=label)
-                        elif chart_type == 'pie':
-                            ax.pie(data, labels=labels, autopct='%1.1f%%')
-                        # Add more chart types as needed
-                    ax.set_title(plot.plot_name or "Plot", color="#d6ff41", fontsize=20)
-                    ax.tick_params(axis='x', colors='#d6ff41')
-                    ax.tick_params(axis='y', colors='#d6ff41')
-                    ax.spines['bottom'].set_color('#d6ff41')
-                    ax.spines['left'].set_color('#d6ff41')
-                    ax.spines['top'].set_color('#d6ff41')
-                    ax.spines['right'].set_color('#d6ff41')
-                    ax.yaxis.label.set_color('#d6ff41')
-                    ax.xaxis.label.set_color('#d6ff41')
-                    ax.title.set_color('#d6ff41')
-                    if chart_type != 'pie':
-                        ax.legend()
-                    fig.patch.set_facecolor('#1c2427')
-                    buf = BytesIO()
-                    plt.tight_layout()
-                    plt.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor())
-                    plt.close(fig)
-                    buf.seek(0)
-                    # Add image to slide, enlarged
-                    img_left = Inches(0.5)
-                    img_top = Inches(1.2)
-                    img_width = Inches(9)
-                    img_height = Inches(5.5)
-                    plot_slide.shapes.add_picture(buf, img_left, img_top, width=img_width, height=img_height)
-                except Exception as e:
-                    # If plot rendering fails, add error text
-                    err_box = plot_slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
-                    err_tf = err_box.text_frame
-                    err_p = err_tf.add_paragraph()
-                    err_p.text = f"Error rendering plot: {e}"
-                    err_p.font.size = Pt(18)
-                    err_p.font.color.rgb = RGBColor(0xff, 0x41, 0x41)
-
-        # Save to a temporary file and return as response
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
-            prs.save(tmp.name)
-            tmp.seek(0)
-            response = HttpResponse(tmp.read(), content_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
-            response['Content-Disposition'] = 'attachment; filename="pivot_report.pptx"'
-            return response
-
-
-import json
-import os
-import tempfile
-from io import BytesIO
-
-import matplotlib.pyplot as plt
-from matplotlib import style
-
-from django.http import HttpResponse
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework.parsers import JSONParser
-
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
-from openpyxl.drawing.image import Image as XLImage
-from openpyxl.utils import get_column_letter
-from openpyxl.utils.cell import coordinate_from_string
-
-from api.models import User, Projects, SavedPivot, SavedPivotPlot
-
-
-class DownloadPivotExcel(APIView):
-    parser_classes = [JSONParser]
-
-    def is_merged_column(self, column_letter, merged_ranges):
-        for merged_range in merged_ranges:
-            start_cell = merged_range.min_col
-            end_cell = merged_range.max_col
-            for col in range(start_cell, end_cell + 1):
-                if get_column_letter(col) == column_letter:
-                    return True
-        return False
-
-
-    def post(self, request):
-        try:
-            user_id = int(request.data.get('user_id'))
-            project_id = int(request.data.get('project_id'))
-        except (TypeError, ValueError):
-            return Response({'error': 'user_id and project_id must be integers'}, status=400)
-
-        if not user_id or not project_id:
-            return Response({'error': 'user_id and project_id are required'}, status=400)
-
-        try:
-            user = User.objects.get(id=user_id)
-            project = Projects.objects.get(id=project_id, user=user)
-        except User.DoesNotExist:
-            return Response({'error': 'User not found'}, status=404)
-        except Projects.DoesNotExist:
-            return Response({'error': 'Project not found'}, status=404)
-
-        pivots = SavedPivot.objects.filter(user=user, project=project).order_by('created_at')
-        if not pivots.exists():
-            return Response({'error': 'No pivots found for this user and project'}, status=404)
-
-        wb = Workbook()
-        ws_summary = wb.active
-        ws_summary.title = "Report Summary"
-
-        # Define styles
-        header_font = Font(name='Calibri', bold=True, size=12, color='FFFFFFFF')
-        header_fill = PatternFill(start_color='FF4F81BD', end_color='FF4F81BD', fill_type='solid')
-        cell_fill = PatternFill(start_color='FFDCE6F1', end_color='FFDCE6F1', fill_type='solid')
-        border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                        top=Side(style='thin'), bottom=Side(style='thin'))
-        center_aligned = Alignment(horizontal='center', vertical='center')
-
-        ws_summary.append(['Project Pivot Report Summary'])
-        ws_summary.merge_cells('A1:F1')
-        summary_title = ws_summary['A1']
-        summary_title.font = Font(name='Calibri', bold=True, size=16, color='FF4F81BD')
-        summary_title.alignment = center_aligned
-
-        headers = ['Pivot Name', 'Sheet Name', 'File Name', 'File Type', 'Created At', 'Updated At']
-        ws_summary.append(headers)
-
-        for col in range(1, len(headers) + 1):
-            cell = ws_summary.cell(row=2, column=col)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.border = border
-            cell.alignment = center_aligned
-
-        for pivot in pivots:
-            ws_summary.append([
-                pivot.pivot_name,
-                pivot.sheet_name,
-                pivot.file_name,
-                pivot.file_type,
-                pivot.created_at.strftime('%Y-%m-%d %H:%M'),
-                pivot.updated_at.strftime('%Y-%m-%d %H:%M')
-            ])
-
-        for col in ws_summary.columns:
-            column_letter = get_column_letter(col[0].column)
-            if self.is_merged_column(column_letter, ws_summary.merged_cells.ranges):
-                continue
-            max_length = max((len(str(cell.value)) for cell in col if cell.value), default=0)
-            ws_summary.column_dimensions[column_letter].width = (max_length + 2) * 1.2
-
-        for pivot in pivots:
-            sheet_title = (pivot.pivot_name[:27] + '..') if pivot.pivot_name and len(pivot.pivot_name) > 27 else pivot.pivot_name or f"Pivot_{pivot.id}"
-            ws_pivot = wb.create_sheet(title=sheet_title)
-
-            ws_pivot.append([f"Pivot: {pivot.pivot_name}"])
-            ws_pivot.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
-            title_cell = ws_pivot.cell(row=1, column=1)
-            title_cell.font = Font(name='Calibri', bold=True, size=14, color='FF4F81BD')
-            title_cell.alignment = center_aligned
-
-            try:
-                pivot_data = json.loads(pivot.pivot_data) if isinstance(pivot.pivot_data, str) else pivot.pivot_data
-            except json.JSONDecodeError:
-                pivot_data = {}
-
-            if isinstance(pivot_data, dict) and 'columns' in pivot_data and 'data' in pivot_data:
-                columns = pivot_data['columns']
-                data = pivot_data['data']
-
-                ws_pivot.append(columns)
-                for col_num, column_title in enumerate(columns, 1):
-                    cell = ws_pivot.cell(row=2, column=col_num)
-                    cell.font = header_font
-                    cell.fill = header_fill
-                    cell.border = border
-                    cell.alignment = center_aligned
-
-                for row_num, row in enumerate(data, 3):
-                    for col_num, cell_value in enumerate(row, 1):
-                        cell = ws_pivot.cell(row=row_num, column=col_num)
-                        cell_value = '' if cell_value is None else (str(cell_value) if isinstance(cell_value, (dict, list, bytes)) else cell_value)
-                        cell.value = cell_value
-                        cell.border = border
-                        if row_num % 2 == 1:
-                            cell.fill = cell_fill
-                        cell.alignment = Alignment(horizontal='left', vertical='center')
-
-                for col in ws_pivot.columns:
-                    column_letter = get_column_letter(col[0].column)
-                    if self.is_merged_column(column_letter, ws_pivot.merged_cells.ranges):
-                        continue
-                    max_length = max((len(str(cell.value)) for cell in col if cell.value), default=0)
-                    ws_pivot.column_dimensions[column_letter].width = (max_length + 2) * 1.2
-
-                plots = SavedPivotPlot.objects.filter(user=user, project=project, pivot=pivot).order_by('created_at')
-                plot_col = len(columns) + 3
-                plot_row = 2
-
-                for plot in plots:
-                    chart_data = plot.chart_data or {}
-                    plot_config = plot.plot_config or {}
-                    plot_name = plot.plot_name or "Plot"
-                    labels = chart_data.get('labels') or []
-                    datasets = chart_data.get('datasets') or []
-
-                    ws_pivot.cell(row=plot_row, column=plot_col, value=plot_name)
-                    ws_pivot.merge_cells(start_row=plot_row, start_column=plot_col, end_row=plot_row, end_column=plot_col + 5)
-                    title_cell = ws_pivot.cell(row=plot_row, column=plot_col)
-                    title_cell.font = Font(name='Calibri', bold=True, size=12, color='FF4F81BD')
-                    title_cell.alignment = center_aligned
-                    plot_row += 1
-
-                    if not labels or not datasets:
-                        ws_pivot.cell(row=plot_row, column=plot_col, value="Invalid plot data")
-                        continue
-
-                    try:
-                        fig, ax = plt.subplots(figsize=(8, 4))
-                        style.use('seaborn-v0_8')
-                        fig.patch.set_facecolor('#FFFFFF')
-                        ax.set_facecolor('#F5F5F5')
-                        chart_type = plot_config.get('chartType', 'bar').lower()
-
-                        if chart_type == 'bar':
-                            width = 0.35
-                            for i, ds in enumerate(datasets):
-                                data = ds.get('data', [])
-                                label = ds.get('label', '')
-                                positions = [x + i * width for x in range(len(labels))]
-                                ax.bar(positions, data, width, label=label)
-                            ax.set_xticks([x + width / 2 for x in range(len(labels))])
-                            ax.set_xticklabels(labels)
-
-                        elif chart_type == 'line':
-                            for ds in datasets:
-                                data = ds.get('data', [])
-                                label = ds.get('label', '')
-                                ax.plot(labels, data, marker='o', label=label)
-
-                        elif chart_type == 'pie':
-                            data = datasets[0].get('data', []) if datasets else []
-                            ax.pie(data, labels=labels, autopct='%1.1f%%', shadow=True)
-
-                        ax.set_title(plot_name, fontsize=12, pad=20)
-                        if chart_type != 'pie':
-                            ax.legend()
-
-                        buf = BytesIO()
-                        plt.tight_layout()
-                        plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
-                        plt.close(fig)
-                        buf.seek(0)
-
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as img_tmp:
-                            img_tmp.write(buf.read())
-                            img_tmp.flush()
-                            img = XLImage(img_tmp.name)
-                            img.anchor = f'{get_column_letter(plot_col)}{plot_row}'
-                            ws_pivot.add_image(img)
-
-                        os.unlink(img_tmp.name)
-                        plot_row += 20
-
-                    except Exception as e:
-                        ws_pivot.cell(row=plot_row, column=plot_col, value=f"Error rendering plot: {str(e)}")
-                        plot_row += 2
-
-            else:
-                ws_pivot.append(["No data available for this pivot"])
-
-        if len(wb.worksheets) > 1 and wb.worksheets[0].title == 'Sheet':
-            wb.remove(wb.worksheets[0])
-
-        filename = f"{project.name.replace(' ', '_')}_pivot_report.xlsx"
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-            wb.save(tmp.name)
-            tmp.seek(0)
-            response = HttpResponse(tmp.read(),
-                                    content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            response['Content-Disposition'] = f'attachment; filename="{filename}"'
-            return response
 
 
 class ConcatenateProjectSheets(APIView):
@@ -5059,71 +4272,76 @@ class GetProjectFiles(APIView):
             }, status=404)
 
         try:
-            # Get all available files in the project
+            # Get all files from the project folder
             all_files = []
-            database_files = set()
-            filesystem_files = set()
-            
-            # Get files from database
-            for kpi_file in project.kpi_file:
-                kpi_path = os.path.join(project_folder, 'kpi', kpi_file)
-                if os.path.exists(kpi_path):
+            database_files = []
+            filesystem_files = []
+            missing_files = []
+
+            # Check KPI files
+            kpi_folder = os.path.join(project_folder, 'kpi')
+            if os.path.exists(kpi_folder):
+                for item in os.listdir(kpi_folder):
+                    item_path = os.path.join(kpi_folder, item)
+                    if os.path.isdir(item_path):
+                        # This is a file folder, look for Excel files inside
+                        for file in os.listdir(item_path):
+                            if file.endswith(('.xlsx', '.xls')):
+                                file_path = os.path.join(item, file)
+                                all_files.append({
+                                    'type': 'kpi',
+                                    'name': file_path,
+                                    'path': f"user_{user_id}/project_{project_id}/kpi/{file_path}",
+                                    'exists_in_db': file_path in (project.kpi_file or []),
+                                    'exists_in_fs': True
+                                })
+                                filesystem_files.append(file_path)
+                                if file_path not in (project.kpi_file or []):
+                                    missing_files.append(('kpi', file_path))
+
+            # Check Media files
+            media_folder = os.path.join(project_folder, 'media')
+            if os.path.exists(media_folder):
+                for item in os.listdir(media_folder):
+                    item_path = os.path.join(media_folder, item)
+                    if os.path.isdir(item_path):
+                        # This is a file folder, look for Excel files inside
+                        for file in os.listdir(item_path):
+                            if file.endswith(('.xlsx', '.xls')):
+                                file_path = os.path.join(item, file)
+                                all_files.append({
+                                    'type': 'media',
+                                    'name': file_path,
+                                    'path': f"user_{user_id}/project_{project_id}/media/{file_path}",
+                                    'exists_in_db': file_path in (project.media_file or []),
+                                    'exists_in_fs': True
+                                })
+                                filesystem_files.append(file_path)
+                                if file_path not in (project.media_file or []):
+                                    missing_files.append(('media', file_path))
+
+            # Add database files that might not exist in filesystem
+            for file_path in (project.kpi_file or []):
+                database_files.append(file_path)
+                if not any(f['name'] == file_path for f in all_files):
                     all_files.append({
                         'type': 'kpi',
-                        'name': kpi_file,
-                        'path': kpi_path,
-                        'index': len(all_files),
-                        'source': 'database'
+                        'name': file_path,
+                        'path': f"user_{user_id}/project_{project_id}/kpi/{file_path}",
+                        'exists_in_db': True,
+                        'exists_in_fs': False
                     })
-                    database_files.add(kpi_file)
-            
-            for media_file in project.media_file:
-                media_path = os.path.join(project_folder, 'media', media_file)
-                if os.path.exists(media_path):
+
+            for file_path in (project.media_file or []):
+                database_files.append(file_path)
+                if not any(f['name'] == file_path for f in all_files):
                     all_files.append({
                         'type': 'media',
-                        'name': media_file,
-                        'path': media_path,
-                        'index': len(all_files),
-                        'source': 'database'
+                        'name': file_path,
+                        'path': f"user_{user_id}/project_{project_id}/media/{file_path}",
+                        'exists_in_db': True,
+                        'exists_in_fs': False
                     })
-                    database_files.add(media_file)
-
-            # Scan file system for additional files
-            kpi_folder = os.path.join(project_folder, 'kpi')
-            media_folder = os.path.join(project_folder, 'media')
-            
-            missing_files = []
-            
-            # Check KPI folder
-            if os.path.exists(kpi_folder):
-                for file_name in os.listdir(kpi_folder):
-                    file_path = os.path.join(kpi_folder, file_name)
-                    if os.path.isdir(file_path) and file_name not in database_files:
-                        all_files.append({
-                            'type': 'kpi',
-                            'name': file_name,
-                            'path': file_path,
-                            'index': len(all_files),
-                            'source': 'filesystem'
-                        })
-                        filesystem_files.add(file_name)
-                        missing_files.append(('kpi', file_name))
-            
-            # Check media folder
-            if os.path.exists(media_folder):
-                for file_name in os.listdir(media_folder):
-                    file_path = os.path.join(media_folder, file_name)
-                    if os.path.isdir(file_path) and file_name not in database_files:
-                        all_files.append({
-                            'type': 'media',
-                            'name': file_name,
-                            'path': file_path,
-                            'index': len(all_files),
-                            'source': 'filesystem'
-                        })
-                        filesystem_files.add(file_name)
-                        missing_files.append(('media', file_name))
 
             # Update database if requested and there are missing files
             if update_database and missing_files:
@@ -5156,4 +4374,1079 @@ class GetProjectFiles(APIView):
                 'success': False,
                 'message': f'Error getting project files: {str(e)}'
             }, status=500)
+
+
+# Project Sharing Views
+class ShareProject(APIView):
+    """
+    API endpoint to share a project or specific files with other users.
+    """
+    def post(self, request):
+        try:
+            # Extract data from request
+            project_id = request.data.get('project_id')
+            shared_by_user_id = request.data.get('shared_by_user_id')
+            shared_with_email = request.data.get('shared_with_email')
+            share_type = request.data.get('share_type', 'project')  # 'project' or 'file'
+            permission_level = request.data.get('permission_level', 'view')  # 'view', 'edit', 'admin'
+            
+            # For file-specific sharing
+            file_type = request.data.get('file_type')  # 'kpi' or 'media'
+            file_name = request.data.get('file_name')
+            sheet_name = request.data.get('sheet_name')
+            
+            # Validate required fields
+            if not all([project_id, shared_by_user_id, shared_with_email]):
+                return Response({
+                    'success': False,
+                    'message': 'project_id, shared_by_user_id, and shared_with_email are required'
+                }, status=400)
+            
+            # Validate share_type
+            if share_type not in ['project', 'file']:
+                return Response({
+                    'success': False,
+                    'message': 'share_type must be either "project" or "file"'
+                }, status=400)
+            
+            # Validate permission_level
+            if permission_level not in ['view', 'edit', 'admin']:
+                return Response({
+                    'success': False,
+                    'message': 'permission_level must be either "view", "edit", or "admin"'
+                }, status=400)
+            
+            # For file-specific sharing, validate file fields
+            if share_type == 'file':
+                if not all([file_type, file_name]):
+                    return Response({
+                        'success': False,
+                        'message': 'file_type and file_name are required for file-specific sharing'
+                    }, status=400)
+                
+                if file_type not in ['kpi', 'media']:
+                    return Response({
+                        'success': False,
+                        'message': 'file_type must be either "kpi" or "media"'
+                    }, status=400)
+            
+            # Get users
+            try:
+                shared_by_user = User.objects.get(id=shared_by_user_id)
+            except User.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'Shared by user not found'
+                }, status=404)
+            
+            try:
+                shared_with_user = User.objects.get(email=shared_with_email)
+            except User.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'User with provided email not found'
+                }, status=404)
+            
+            # Check if user is trying to share with themselves
+            if shared_by_user.id == shared_with_user.id:
+                return Response({
+                    'success': False,
+                    'message': 'Cannot share project with yourself'
+                }, status=400)
+            
+            # Get project
+            try:
+                project = Projects.objects.get(id=project_id, user=shared_by_user)
+            except Projects.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'Project not found or you do not have permission to share it'
+                }, status=404)
+            
+            # For file-specific sharing, validate file exists
+            if share_type == 'file':
+                project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
+                file_path = os.path.join(project_folder, file_type, file_name)
+                
+                if not os.path.exists(file_path):
+                    return Response({
+                        'success': False,
+                        'message': f'File {file_name} not found in {file_type} folder'
+                    }, status=404)
+                
+                # If sheet_name is provided, validate it exists
+                if sheet_name:
+                    sheet_path = os.path.join(file_path, sheet_name)
+                    if not os.path.exists(sheet_path):
+                        return Response({
+                            'success': False,
+                            'message': f'Sheet {sheet_name} not found in file {file_name}'
+                        }, status=404)
+            
+            # Check if share already exists
+            share_filter = {
+                'project': project,
+                'shared_with': shared_with_user,
+                'is_active': True
+            }
+            
+            if share_type == 'file':
+                share_filter.update({
+                    'share_type': 'file',
+                    'file_type': file_type,
+                    'file_name': file_name,
+                    'sheet_name': sheet_name
+                })
+            else:
+                share_filter['share_type'] = 'project'
+            
+            existing_share = ProjectShare.objects.filter(**share_filter).first()
+            
+            if existing_share:
+                # Update existing share
+                existing_share.permission_level = permission_level
+                existing_share.updated_at = timezone.now()
+                existing_share.save()
+                
+                return Response({
+                    'success': True,
+                    'message': 'Project share updated successfully',
+                    'share_id': existing_share.id
+                }, status=200)
+            else:
+                # Create new share
+                share = ProjectShare.objects.create(
+                    project=project,
+                    shared_by=shared_by_user,
+                    shared_with=shared_with_user,
+                    share_type=share_type,
+                    permission_level=permission_level,
+                    file_type=file_type if share_type == 'file' else None,
+                    file_name=file_name if share_type == 'file' else None,
+                    sheet_name=sheet_name if share_type == 'file' else None
+                )
+                
+                return Response({
+                    'success': True,
+                    'message': 'Project shared successfully',
+                    'share_id': share.id
+                }, status=201)
+                
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'Error sharing project: {str(e)}'
+            }, status=500)
+
+
+class RemoveProjectShare(APIView):
+    """
+    API endpoint to remove a project share.
+    """
+    def post(self, request):
+        try:
+            # Extract data from request
+            share_id = request.data.get('share_id')
+            project_id = request.data.get('project_id')
+            shared_by_user_id = request.data.get('shared_by_user_id')
+            shared_with_email = request.data.get('shared_with_email')
+            
+            # Validate required fields
+            if not share_id and not all([project_id, shared_by_user_id, shared_with_email]):
+                return Response({
+                    'success': False,
+                    'message': 'Either share_id or (project_id, shared_by_user_id, shared_with_email) are required'
+                }, status=400)
+            
+            # Get the share to remove
+            if share_id:
+                try:
+                    share = ProjectShare.objects.get(id=share_id, is_active=True)
+                except ProjectShare.DoesNotExist:
+                    return Response({
+                        'success': False,
+                        'message': 'Share not found'
+                    }, status=404)
+            else:
+                try:
+                    shared_by_user = User.objects.get(id=shared_by_user_id)
+                    shared_with_user = User.objects.get(email=shared_with_email)
+                    project = Projects.objects.get(id=project_id)
+                except (User.DoesNotExist, Projects.DoesNotExist):
+                    return Response({
+                        'success': False,
+                        'message': 'User or project not found'
+                    }, status=404)
+                
+                try:
+                    share = ProjectShare.objects.get(
+                        project=project,
+                        shared_by=shared_by_user,
+                        shared_with=shared_with_user,
+                        is_active=True
+                    )
+                except ProjectShare.DoesNotExist:
+                    return Response({
+                        'success': False,
+                        'message': 'Share not found'
+                    }, status=404)
+            
+            # Deactivate the share
+            share.is_active = False
+            share.updated_at = timezone.now()
+            share.save()
+            
+            return Response({
+                'success': True,
+                'message': 'Project share removed successfully'
+            }, status=200)
+            
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'Error removing project share: {str(e)}'
+            }, status=500)
+
+
+class GetSharedProjects(APIView):
+    """
+    API endpoint to get all projects shared with a user.
+    """
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            
+            if not user_id:
+                return Response({
+                    'success': False,
+                    'message': 'user_id is required'
+                }, status=400)
+            
+            # Get user
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'User not found'
+                }, status=404)
+            
+            # Get all active shares for this user
+            shares = ProjectShare.objects.filter(
+                shared_with=user,
+                is_active=True
+            ).select_related('project', 'shared_by').order_by('-created_at')
+            
+            shared_projects = []
+            
+            for share in shares:
+                project_info = {
+                    'share_id': share.id,
+                    'project_id': share.project.id,
+                    'project_name': share.project.name,
+                    'share_type': share.share_type,
+                    'permission_level': share.permission_level,
+                    'shared_by': {
+                        'id': share.shared_by.id,
+                        'username': share.shared_by.username,
+                        'email': share.shared_by.email
+                    },
+                    'created_at': share.created_at.isoformat(),
+                    'updated_at': share.updated_at.isoformat()
+                }
+                
+                # Add file-specific info if this is a file share
+                if share.share_type == 'file':
+                    project_info['shared_file'] = {
+                        'file_type': share.file_type,
+                        'file_name': share.file_name,
+                        'sheet_name': share.sheet_name
+                    }
+                
+                shared_projects.append(project_info)
+            
+            return Response({
+                'success': True,
+                'shared_projects': shared_projects,
+                'total_count': len(shared_projects)
+            }, status=200)
+            
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'Error getting shared projects: {str(e)}'
+            }, status=500)
+
+
+class GetSharedProjectDetails(APIView):
+    """
+    API endpoint to get details of a shared project for a user.
+    """
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            share_id = request.data.get('share_id')
+            
+            if not user_id or not project_id:
+                return Response({
+                    'success': False,
+                    'message': 'user_id and project_id are required'
+                }, status=400)
+            
+            # Get user
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'User not found'
+                }, status=404)
+            
+            # Get the share
+            share_filter = {
+                'shared_with': user,
+                'project_id': project_id,
+                'is_active': True
+            }
+            
+            if share_id:
+                share_filter['id'] = share_id
+            
+            try:
+                share = ProjectShare.objects.get(**share_filter)
+            except ProjectShare.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'Project access not found or revoked'
+                }, status=404)
+            
+            # Get project details
+            project = share.project
+            
+            # Base project folder path
+            project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
+            
+            # Initialize response data structure
+            project_details = {
+                "project_id": project.id,
+                "project_name": project.name,
+                "share_info": {
+                    "share_id": share.id,
+                    "share_type": share.share_type,
+                    "permission_level": share.permission_level,
+                    "shared_by": {
+                        "id": share.shared_by.id,
+                        "username": share.shared_by.username,
+                        "email": share.shared_by.email
+                    },
+                    "created_at": share.created_at.isoformat()
+                },
+                "files": {
+                    "media": [],
+                    "kpi": []
+                }
+            }
+            
+            # Add file-specific info if this is a file share
+            if share.share_type == 'file':
+                project_details["shared_file"] = {
+                    "file_type": share.file_type,
+                    "file_name": share.file_name,
+                    "sheet_name": share.sheet_name
+                }
+            
+            # Get file details based on share type
+            if share.share_type == 'project':
+                # For project-level sharing, show all files
+                for file_type in ["media", "kpi"]:
+                    file_folder = os.path.join(project_folder, file_type)
+                    if not os.path.exists(file_folder):
+                        continue
+
+                    # Get all files in the folder
+                    for file_name in os.listdir(file_folder):
+                        file_path = os.path.join(file_folder, file_name)
+                        if os.path.isdir(file_path):  # Each file is a directory containing sheets
+                            file_info = {
+                                "name": file_name,
+                                "sheets": []
+                            }
+                            
+                            # Get all sheets (CSV files) in the file directory
+                            for sheet_file in os.listdir(file_path):
+                                if sheet_file.endswith('.csv'):
+                                    sheet_path = os.path.join(file_path, sheet_file)
+                                    sheet_info = {
+                                        "name": sheet_file,
+                                        "size": os.path.getsize(sheet_path),
+                                        "last_modified": os.path.getmtime(sheet_path)
+                                    }
+                                    
+                                    # Read complete sheet data
+                                    try:
+                                        df = pd.read_csv(sheet_path, dtype=str)
+                                        df = df.replace([np.nan, np.inf, -np.inf], None)
+                                        sheet_info["columns"] = df.columns.tolist()
+                                        sheet_info["data"] = make_json_safe(df.values.tolist())
+                                    except Exception as e:
+                                        print(f"Error reading sheet {sheet_file}: {str(e)}")
+                                        sheet_info["error"] = "Could not read sheet data"
+                                    
+                                    file_info["sheets"].append(sheet_info)
+                            
+                            project_details["files"][file_type].append(file_info)
+            else:
+                # For file-level sharing, show only the shared file
+                file_type = share.file_type
+                file_name = share.file_name
+                
+                file_folder = os.path.join(project_folder, file_type)
+                file_path = os.path.join(file_folder, file_name)
+                
+                if os.path.exists(file_path) and os.path.isdir(file_path):
+                    file_info = {
+                        "name": file_name,
+                        "sheets": []
+                    }
+                    
+                    # Get all sheets (CSV files) in the file directory
+                    for sheet_file in os.listdir(file_path):
+                        if sheet_file.endswith('.csv'):
+                            # For file-specific sharing, only show the shared sheet if specified
+                            if share.sheet_name and sheet_file != share.sheet_name:
+                                continue
+                                
+                            sheet_path = os.path.join(file_path, sheet_file)
+                            sheet_info = {
+                                "name": sheet_file,
+                                "size": os.path.getsize(sheet_path),
+                                "last_modified": os.path.getmtime(sheet_path)
+                            }
+                            
+                            # Read complete sheet data
+                            try:
+                                df = pd.read_csv(sheet_path, dtype=str)
+                                df = df.replace([np.nan, np.inf, -np.inf], None)
+                                sheet_info["columns"] = df.columns.tolist()
+                                sheet_info["data"] = make_json_safe(df.values.tolist())
+                            except Exception as e:
+                                print(f"Error reading sheet {sheet_file}: {str(e)}")
+                                sheet_info["error"] = "Could not read sheet data"
+                            
+                            file_info["sheets"].append(sheet_info)
+                    
+                    project_details["files"][file_type].append(file_info)
+            
+            return Response({
+                "success": True,
+                "project_details": project_details
+            }, status=200)
+            
+        except Exception as e:
+            return Response({
+                "success": False,
+                "message": f"Error getting shared project details: {str(e)}"
+            }, status=500)
+    
+    def get_sheet_names(self, file_path):
+        """Helper method to get sheet names from Excel file"""
+        try:
+            import pandas as pd
+            excel_file = pd.ExcelFile(file_path)
+            return excel_file.sheet_names
+        except Exception:
+            return []
+
+
+class GetSharedProjectPlots(APIView):
+    """
+    API endpoint to get plots/pivots for a shared project.
+    """
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            share_id = request.data.get('share_id')
+            
+            if not user_id or not project_id:
+                return Response({
+                    'success': False,
+                    'message': 'user_id and project_id are required'
+                }, status=400)
+            
+            # Get user
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'User not found'
+                }, status=404)
+            
+            # Get the share
+            share_filter = {
+                'shared_with': user,
+                'project_id': project_id,
+                'is_active': True
+            }
+            
+            if share_id:
+                share_filter['id'] = share_id
+            
+            try:
+                share = ProjectShare.objects.get(**share_filter)
+            except ProjectShare.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'Project access not found or revoked'
+                }, status=404)
+            
+            # Get project
+            project = share.project
+            
+            # Get plots and pivots based on share type
+            plots = []
+            pivots = []
+            
+            if share.share_type == 'project':
+                # For project-level sharing, get all plots and pivots
+                plots = SavedPlot.objects.filter(project=project).values()
+                pivots = SavedPivot.objects.filter(project=project).values()
+            else:
+                # For file-level sharing, get only plots/pivots for the shared file
+                plots = SavedPlot.objects.filter(
+                    project=project,
+                    file_type=share.file_type,
+                    file_name=share.file_name
+                ).values()
+                
+                if share.sheet_name:
+                    plots = plots.filter(sheet_name=share.sheet_name)
+                
+                pivots = SavedPivot.objects.filter(
+                    project=project,
+                    file_type=share.file_type,
+                    file_name=share.file_name
+                ).values()
+                
+                if share.sheet_name:
+                    pivots = pivots.filter(sheet_name=share.sheet_name)
+            
+            # Convert datetime fields to strings for JSON serialization
+            for plot in plots:
+                plot['created_at'] = plot['created_at'].isoformat()
+                plot['updated_at'] = plot['updated_at'].isoformat()
+            
+            for pivot in pivots:
+                pivot['created_at'] = pivot['created_at'].isoformat()
+                pivot['updated_at'] = pivot['updated_at'].isoformat()
+            
+            return Response({
+                'success': True,
+                'plots': list(plots),
+                'pivots': list(pivots),
+                'share_info': {
+                    'share_type': share.share_type,
+                    'permission_level': share.permission_level
+                }
+            }, status=200)
+            
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'Error getting shared project plots: {str(e)}'
+            }, status=500)
+
+
+
+class GetProjectSharedAccess(APIView):
+    """
+    API endpoint to get shared access information for a project that the user owns.
+    """
+    def post(self, request):
+        try:
+            # Extract data from request
+            project_id = request.data.get('project_id')
+            user_id = request.data.get('user_id')
+            
+            if not project_id or not user_id:
+                return Response({
+                    'success': False,
+                    'message': 'project_id and user_id are required'
+                }, status=400)
+            
+            # Get user
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'User not found'
+                }, status=404)
+            
+            # Get the project and verify ownership
+            try:
+                project = Projects.objects.get(id=project_id, user_id=user_id)
+            except Projects.DoesNotExist:
+                return Response({
+                    'success': False,
+                    'message': 'Project not found or access denied'
+                }, status=404)
+            
+            # Get all active shares for this project
+            shares = ProjectShare.objects.filter(
+                project=project,
+                is_active=True
+            ).select_related('shared_with', 'shared_by')
+            
+            shared_access = []
+            
+            for share in shares:
+                access_data = {
+                    'share_id': share.id,
+                    'shared_with': {
+                        'id': share.shared_with.id,
+                        'username': share.shared_with.username,
+                        'email': share.shared_with.email
+                    },
+                    'shared_by': {
+                        'id': share.shared_by.id,
+                        'username': share.shared_by.username,
+                        'email': share.shared_by.email
+                    },
+                    'share_type': share.share_type,
+                    'permission_level': share.permission_level,
+                    'created_at': share.created_at.isoformat(),
+                    'updated_at': share.updated_at.isoformat()
+                }
+                
+                if share.share_type == 'file':
+                    access_data.update({
+                        'file_type': share.file_type,
+                        'file_name': share.file_name,
+                        'sheet_name': share.sheet_name
+                    })
+                
+                shared_access.append(access_data)
+            
+            return Response({
+                'success': True,
+                'shared_access': shared_access,
+                'total_count': len(shared_access)
+            }, status=200)
+            
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'Error getting project shared access: {str(e)}'
+            }, status=500)
+
+# class DownloadReportTemplate(APIView):
+#     parser_classes = [JSONParser]
+
+#     def post(self, request):
+#         try:
+#             # Extract data from request
+#             user_id = request.data.get('user_id')
+#             project_id = request.data.get('project_id')
+
+#             # Validate required fields
+#             if not all([user_id, project_id]):
+#                 missing_fields = []
+#                 if not user_id: missing_fields.append('user_id')
+#                 if not project_id: missing_fields.append('project_id')
+#                 return Response({
+#                     'error': f'Missing required fields: {", ".join(missing_fields)}'
+#                 }, status=400)
+
+#             # Get user
+#             try:
+#                 user = User.objects.get(id=user_id)
+#             except User.DoesNotExist:
+#                 return Response({'error': 'User not found'}, status=404)
+
+#             # Get project and check access
+#             try:
+#                 project = Projects.objects.get(id=project_id)
+#             except Projects.DoesNotExist:
+#                 return Response({'error': 'Project not found'}, status=404)
+
+#             # Check if user has access to this project
+#             has_access, share_object, permission_level = check_project_access(user_id, project_id)
+            
+#             if not has_access:
+#                 return Response({
+#                     'error': 'Access denied. You don\'t have permission to access this project.'
+#                 }, status=403)
+
+#             # Load the template presentation
+#             template_path = os.path.join(os.path.dirname(__file__), 'Template.pptx')
+#             if not os.path.exists(template_path):
+#                 return Response({'error': 'Template file not found'}, status=404)
+
+#             prs = Presentation(template_path)
+            
+#             # Get all slides from template
+#             template_slides = list(prs.slides)
+            
+#             # Create a new presentation
+#             new_prs = Presentation()
+            
+#             # Copy the first slide (title slide)
+#             if len(template_slides) > 0:
+#                 # Use the same layout as the first template slide
+#                 first_slide_layout = template_slides[0].slide_layout
+#                 first_slide = new_prs.slides.add_slide(first_slide_layout)
+                
+#                 # Copy background
+#                 if hasattr(template_slides[0], 'background') and hasattr(template_slides[0].background, 'fill'):
+#                     try:
+#                         new_prs.slides[-1].background.fill.solid()
+#                         new_prs.slides[-1].background.fill.fore_color.rgb = template_slides[0].background.fill.fore_color.rgb
+#                     except:
+#                         pass
+                
+#                 # Copy all shapes from first template slide
+#                 for shape in template_slides[0].shapes:
+#                     try:
+#                         if hasattr(shape, 'shape_type'):
+#                             new_shape = first_slide.shapes.add_shape(
+#                                 shape.shape_type,
+#                                 shape.left,
+#                                 shape.top,
+#                                 shape.width,
+#                                 shape.height
+#                             )
+#                             # Copy text if it's a text shape
+#                             if hasattr(shape, 'text') and hasattr(new_shape, 'text'):
+#                                 new_shape.text = shape.text
+#                             # Copy fill color if available
+#                             if hasattr(shape, 'fill') and hasattr(new_shape, 'fill'):
+#                                 try:
+#                                     new_shape.fill.solid()
+#                                     new_shape.fill.fore_color.rgb = shape.fill.fore_color.rgb
+#                                 except:
+#                                     pass
+#                         elif hasattr(shape, 'image'):
+#                             # Handle images
+#                             try:
+#                                 img_stream = shape.image.blob
+#                                 first_slide.shapes.add_picture(
+#                                     BytesIO(img_stream),
+#                                     shape.left,
+#                                     shape.top,
+#                                     shape.width,
+#                                     shape.height
+#                                 )
+#                             except:
+#                                 pass
+#                     except Exception as e:
+#                         # Skip shapes that can't be copied
+#                         continue
+
+#             # Get all pivots for this project
+#             if project.user.id == int(user_id):
+#                 # Project owner - get all pivots
+#                 pivots = SavedPivot.objects.filter(project=project).order_by('created_at')
+#             else:
+#                 # Shared access - get pivots based on share permissions
+#                 pivot_filter = {'project': project}
+#                 if share_object and share_object.share_type == 'file':
+#                     pivot_filter.update({
+#                         'file_type': share_object.file_type,
+#                         'file_name': share_object.file_name
+#                     })
+#                     if share_object.sheet_name:
+#                         pivot_filter['sheet_name'] = share_object.sheet_name
+#                 pivots = SavedPivot.objects.filter(**pivot_filter).order_by('created_at')
+
+#             if not pivots.exists():
+#                 return Response({'error': 'No pivots found for this project'}, status=404)
+
+#             # Create middle slides with pivots and plots
+#             for pivot in pivots:
+#                 # Add pivot slide with proper layout
+#                 pivot_slide = new_prs.slides.add_slide(new_prs.slide_layouts[6])  # blank layout
+                
+#                 # Set background color
+#                 background = pivot_slide.background
+#                 fill = background.fill
+#                 fill.solid()
+#                 fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
+                
+#                 # Add pivot name as heading
+#                 left = Inches(0.5)
+#                 top = Inches(0.2)
+#                 width = Inches(9)
+#                 height = Inches(0.8)
+#                 title_box = pivot_slide.shapes.add_textbox(left, top, width, height)
+#                 tf = title_box.text_frame
+#                 tf.clear()  # Clear any existing text
+#                 p = tf.add_paragraph()
+#                 p.text = f"Pivot: {pivot.pivot_name}"
+#                 p.font.size = Pt(32)
+#                 p.font.bold = True
+#                 p.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
+                
+#                 # Add logo
+#                 logo_path = os.path.join(os.path.dirname(__file__), 'skewb-logomark 3.png')
+#                 if os.path.exists(logo_path):
+#                     pivot_slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.1), width=Inches(1))
+
+#                 # Add pivot table data
+#                 try:
+#                     pivot_data = json.loads(pivot.pivot_data) if isinstance(pivot.pivot_data, str) else pivot.pivot_data
+                    
+#                     if isinstance(pivot_data, dict) and 'columns' in pivot_data and 'data' in pivot_data:
+#                         columns = pivot_data['columns']
+#                         data = pivot_data['data']
+                        
+#                         # Limit to 15 entries if more exist
+#                         if len(data) > 15:
+#                             data = data[:15]
+                        
+#                         # Create table with proper dimensions
+#                         rows = len(data) + 1  # +1 for header
+#                         cols = len(columns)
+                        
+#                         if rows > 0 and cols > 0:
+#                             # Calculate table dimensions based on content
+#                             table_left = Inches(0.5)
+#                             table_top = Inches(1.2)
+#                             table_width = Inches(9)
+#                             row_height = Inches(0.3)
+#                             table_height = row_height * rows
+                            
+#                             table = pivot_slide.shapes.add_table(rows, cols, table_left, table_top, table_width, table_height).table
+                            
+#                             # Set consistent column widths
+#                             col_width = table_width / cols
+#                             for col in table.columns:
+#                                 for cell in col.cells:
+#                                     cell.width = col_width
+                            
+#                             # Add headers with proper styling
+#                             for col_idx, col_name in enumerate(columns):
+#                                 cell = table.cell(0, col_idx)
+#                                 cell.text = str(col_name)
+#                                 cell.fill.solid()
+#                                 cell.fill.fore_color.rgb = RGBColor(0x4f, 0x81, 0xbd)
+#                                 paragraph = cell.text_frame.paragraphs[0]
+#                                 paragraph.font.bold = True
+#                                 paragraph.font.size = Pt(11)
+#                                 paragraph.font.color.rgb = RGBColor(0xff, 0xff, 0xff)
+#                                 paragraph.alignment = PP_ALIGN.CENTER
+                            
+#                             # Add data with proper styling
+#                             for row_idx, row_data in enumerate(data, 1):
+#                                 for col_idx, cell_value in enumerate(row_data):
+#                                     if col_idx < cols:
+#                                         cell = table.cell(row_idx, col_idx)
+#                                         cell.text = str(cell_value) if cell_value is not None else ''
+#                                         paragraph = cell.text_frame.paragraphs[0]
+#                                         paragraph.font.size = Pt(10)
+#                                         paragraph.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
+#                                         paragraph.alignment = PP_ALIGN.LEFT
+                                        
+#                                         # Set row background color
+#                                         cell.fill.solid()
+#                                         if row_idx % 2 == 0:
+#                                             cell.fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
+#                                         else:
+#                                             cell.fill.fore_color.rgb = RGBColor(0x2a, 0x35, 0x3a)
+#                 except Exception as e:
+#                     # If table creation fails, add error text
+#                     err_box = pivot_slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
+#                     err_tf = err_box.text_frame
+#                     err_p = err_tf.add_paragraph()
+#                     err_p.text = f"Error creating pivot table: {e}"
+#                     err_p.font.size = Pt(18)
+#                     err_p.font.color.rgb = RGBColor(0xff, 0x41, 0x41)
+
+#                 # Get plots for this pivot
+#                 if project.user.id == int(user_id):
+#                     plots = SavedPivotPlot.objects.filter(project=project, pivot=pivot).order_by('created_at')
+#                 else:
+#                     plots = SavedPivotPlot.objects.filter(project=project, pivot=pivot).order_by('created_at')
+
+#                 # Add plot slides
+#                 for plot in plots:
+#                     plot_slide = new_prs.slides.add_slide(new_prs.slide_layouts[6])  # blank layout
+                    
+#                     # Set background color
+#                     background = plot_slide.background
+#                     fill = background.fill
+#                     fill.solid()
+#                     fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
+                    
+#                     # Add plot name as heading
+#                     left = Inches(0.5)
+#                     top = Inches(0.2)
+#                     width = Inches(9)
+#                     height = Inches(0.8)
+#                     title_box = plot_slide.shapes.add_textbox(left, top, width, height)
+#                     tf = title_box.text_frame
+#                     tf.clear()  # Clear any existing text
+#                     p = tf.add_paragraph()
+#                     p.text = plot.plot_name or "Plot"
+#                     p.font.size = Pt(28)
+#                     p.font.bold = True
+#                     p.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
+                    
+#                     # Add logo
+#                     if os.path.exists(logo_path):
+#                         plot_slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.1), width=Inches(1))
+                    
+#                     # Render plot image from chart_data with improved quality
+#                     chart_data = plot.chart_data
+#                     plot_config = plot.plot_config or {}
+#                     try:
+#                         # Create high-resolution figure
+#                         plt.rcParams['figure.dpi'] = 300
+#                         plt.rcParams['savefig.dpi'] = 300
+#                         fig, ax = plt.subplots(figsize=(12, 7))
+                        
+#                         # Set figure background color
+#                         fig.patch.set_facecolor('#1c2427')
+#                         ax.set_facecolor('#1c2427')
+                        
+#                         labels = chart_data.get('labels', [])
+#                         datasets = chart_data.get('datasets', [])
+#                         chart_type = (plot_config.get('chartType') or 'bar').lower()
+                        
+#                         # Custom color cycle for multiple datasets
+#                         colors = ['#d6ff41', '#41ffd6', '#ff41d6', '#41d6ff', '#ffd641']
+                        
+#                         for idx, ds in enumerate(datasets):
+#                             data = ds.get('data', [])
+#                             label = ds.get('label', '')
+#                             color = colors[idx % len(colors)]
+                            
+#                             if chart_type == 'bar':
+#                                 if len(datasets) > 1:
+#                                     width = 0.8 / len(datasets)
+#                                     x = np.arange(len(labels)) + (idx - len(datasets)/2 + 0.5) * width
+#                                     ax.bar(x, data, width, label=label, color=color)
+#                                 else:
+#                                     ax.bar(labels, data, label=label, color=color)
+#                             elif chart_type == 'line':
+#                                 ax.plot(labels, data, label=label, color=color, linewidth=2, marker='o')
+#                             elif chart_type == 'pie':
+#                                 ax.pie(data, labels=labels, autopct='%1.1f%%', colors=colors)
+                        
+#                         # Style the plot
+#                         ax.set_title(plot.plot_name or "Plot", color="#d6ff41", fontsize=20, pad=20)
+#                         if chart_type != 'pie':
+#                             ax.tick_params(axis='both', colors='#d6ff41', labelsize=10)
+#                             ax.spines['bottom'].set_color('#d6ff41')
+#                             ax.spines['left'].set_color('#d6ff41')
+#                             ax.spines['top'].set_color('#d6ff41')
+#                             ax.spines['right'].set_color('#d6ff41')
+                            
+#                             # Rotate x-axis labels if they are too long
+#                             if max(len(str(label)) for label in labels) > 10:
+#                                 plt.xticks(rotation=45, ha='right')
+                        
+#                         # Add legend with custom styling
+#                         if chart_type != 'pie' and len(datasets) > 1:
+#                             legend = ax.legend(loc='upper right', facecolor='#1c2427', edgecolor='#d6ff41')
+#                             for text in legend.get_texts():
+#                                 text.set_color('#d6ff41')
+                        
+#                         # Adjust layout and save
+#                         plt.tight_layout()
+                        
+#                         # Save to BytesIO with high quality
+#                         buf = BytesIO()
+#                         plt.savefig(buf, format='png', 
+#                                   bbox_inches='tight', 
+#                                   facecolor=fig.get_facecolor(),
+#                                   edgecolor='none',
+#                                   pad_inches=0.1,
+#                                   dpi=300)
+#                         plt.close(fig)
+#                         buf.seek(0)
+                        
+#                         # Add image to slide with proper positioning
+#                         img_left = Inches(0.5)
+#                         img_top = Inches(1.2)
+#                         img_width = Inches(9)
+#                         img_height = Inches(5.5)
+#                         plot_slide.shapes.add_picture(buf, img_left, img_top, img_width, img_height)
+                        
+#                     except Exception as e:
+#                         # If plot rendering fails, add error text
+#                         err_box = plot_slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
+#                         err_tf = err_box.text_frame
+#                         err_p = err_tf.add_paragraph()
+#                         err_p.text = f"Error rendering plot: {e}"
+#                         err_p.font.size = Pt(18)
+#                         err_p.font.color.rgb = RGBColor(0xff, 0x41, 0x41)
+
+#             # Copy the last slide from template
+#             if len(template_slides) > 1:
+#                 # Use the same layout as the last template slide
+#                 last_slide_layout = template_slides[-1].slide_layout
+#                 last_slide = new_prs.slides.add_slide(last_slide_layout)
+                
+#                 # Copy background
+#                 if hasattr(template_slides[-1], 'background') and hasattr(template_slides[-1].background, 'fill'):
+#                     try:
+#                         new_prs.slides[-1].background.fill.solid()
+#                         new_prs.slides[-1].background.fill.fore_color.rgb = template_slides[-1].background.fill.fore_color.rgb
+#                     except:
+#                         pass
+                
+#                 # Copy all shapes from last template slide
+#                 for shape in template_slides[-1].shapes:
+#                     try:
+#                         if hasattr(shape, 'shape_type'):
+#                             new_shape = last_slide.shapes.add_shape(
+#                                 shape.shape_type,
+#                                 shape.left,
+#                                 shape.top,
+#                                 shape.width,
+#                                 shape.height
+#                             )
+#                             # Copy text if it's a text shape
+#                             if hasattr(shape, 'text') and hasattr(new_shape, 'text'):
+#                                 new_shape.text = shape.text
+#                             # Copy fill color if available
+#                             if hasattr(shape, 'fill') and hasattr(new_shape, 'fill'):
+#                                 try:
+#                                     new_shape.fill.solid()
+#                                     new_shape.fill.fore_color.rgb = shape.fill.fore_color.rgb
+#                                 except:
+#                                     pass
+#                         elif hasattr(shape, 'image'):
+#                             # Handle images
+#                             try:
+#                                 img_stream = shape.image.blob
+#                                 last_slide.shapes.add_picture(
+#                                     BytesIO(img_stream),
+#                                     shape.left,
+#                                     shape.top,
+#                                     shape.width,
+#                                     shape.height
+#                                 )
+#                             except:
+#                                 pass
+#                     except Exception as e:
+#                         # Skip shapes that can't be copied
+#                         continue
+
+#             # Save to a temporary file and return as response
+#             with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
+#                 new_prs.save(tmp.name)
+#                 tmp.seek(0)
+#                 response = HttpResponse(tmp.read(), content_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
+#                 response['Content-Disposition'] = f'attachment; filename="report_{project.name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pptx"'
+#                 return response
+
+#         except Exception as e:
+#             return Response({'error': str(e)}, status=500)
 

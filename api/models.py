@@ -134,3 +134,55 @@ class SavedPivotPlot(models.Model):
 
     def __str__(self):
         return f"{self.plot_name} - {self.pivot.pivot_name} - {self.user.username}"
+
+# Project Sharing Models
+class ProjectShare(models.Model):
+    SHARE_TYPES = [
+        ('project', 'Entire Project'),
+        ('file', 'Specific File'),
+    ]
+    
+    PERMISSION_LEVELS = [
+        ('view', 'View Only'),
+        ('edit', 'Edit'),
+        ('admin', 'Admin'),
+    ]
+    
+    project = models.ForeignKey('Projects', on_delete=models.CASCADE, related_name='shares')
+    shared_by = models.ForeignKey('User', on_delete=models.CASCADE, related_name='shared_projects')
+    shared_with = models.ForeignKey('User', on_delete=models.CASCADE, related_name='received_shares')
+    share_type = models.CharField(max_length=10, choices=SHARE_TYPES, default='project')
+    permission_level = models.CharField(max_length=10, choices=PERMISSION_LEVELS, default='view')
+    
+    # For file-specific sharing
+    file_type = models.CharField(max_length=10, blank=True, null=True)  # 'kpi' or 'media'
+    file_name = models.CharField(max_length=255, blank=True, null=True)
+    sheet_name = models.CharField(max_length=255, blank=True, null=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        unique_together = [
+            ('project', 'shared_with', 'share_type', 'file_type', 'file_name', 'sheet_name')
+        ]
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        if self.share_type == 'project':
+            return f"{self.project.name} shared with {self.shared_with.username}"
+        else:
+            return f"{self.project.name} - {self.file_name} shared with {self.shared_with.username}"
+    
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        if self.share_type == 'file' and not all([self.file_type, self.file_name]):
+            raise ValidationError("File type and file name are required for file-specific sharing")
+        
+        if self.share_type == 'project' and any([self.file_type, self.file_name, self.sheet_name]):
+            raise ValidationError("File-specific fields should not be set for project-level sharing")
+    
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
