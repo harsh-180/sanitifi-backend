@@ -181,3 +181,19 @@ AUTHENTICATION_BACKENDS = [
 
 # AUTH_USER_MODEL = 'api.Model.User'
 
+
+# Email Configuration
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+# EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587  # TLS port
+EMAIL_USE_TLS = True
+EMAIL_USE_SSL = False
+EMAIL_HOST_USER = 'forms.skewb@gmail.com'  # Your email address
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')  # Password from environment variable
+DEFAULT_FROM_EMAIL = 'forms.skewb@gmail.com'
+SERVER_EMAIL = 'forms.skewb@gmail.com'
+
+# For development/testing, you can use console backend instead
+# EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+

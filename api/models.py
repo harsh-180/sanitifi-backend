@@ -125,6 +125,7 @@ class SavedPivotPlot(models.Model):
     plot_config = models.JSONField()  # Stores plot configuration
     chart_data = models.JSONField()  # Stores chart data
     chart_options = models.JSONField()  # Stores chart options
+    active_filters = models.JSONField(default=dict, blank=True)  # Stores active filters separately
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -186,3 +187,13 @@ class ProjectShare(models.Model):
     def save(self, *args, **kwargs):
         self.clean()
         super().save(*args, **kwargs)
+
+class UserActionLog(models.Model):
+    user = models.ForeignKey('User', on_delete=models.SET_NULL, null=True, blank=True)
+    action = models.CharField(max_length=255)
+    details = models.TextField(blank=True, null=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.user} - {self.action} at {self.timestamp}"

@@ -1,6 +1,7 @@
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
-
+from .log_utils import log_user_action
+from django.core.mail import send_mail
 import re
 import os
 import subprocess
@@ -320,6 +321,11 @@ class MergeFile(APIView):
                 file_basename
             )
 
+            # Log the merge event
+            user = get_logging_user(request, getattr(project, 'user', None))
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "merge_file", details=f"Merged file: {file_name}, sheet: {sheet_name}, type: {file_type}", ip_address=ip)
+
             return Response({
                 "message": "Merged and updated the original file successfully",
                 "merged_file": {
@@ -365,12 +371,21 @@ class Save(APIView):
             print(f"  - file_type: {file_type}")
             print(f"  - data_stage: {data_stage}")
 
+            # Log the file download event
+            user = get_logging_user(request, None)
+            ip = request.META.get('REMOTE_ADDR')
             # Validate project existence
             try:
                 project = Projects.objects.get(id=project_id)
                 print(f"Project found: user_{project.user.id}/project_{project.id}")
             except Projects.DoesNotExist:
                 return Response({"error": "Project not found"}, status=404)
+
+            # If user is still None, use project.user as fallback
+            if user is None and hasattr(project, 'user'):
+                user = project.user
+
+            log_user_action(user, "download_file", details=f"Download file: {file_name}, sheet: {sheet_name}, type: {file_type}", ip_address=ip)
 
             # Clean up file_name if it contains path information
             file_name = os.path.basename(file_name)
@@ -542,6 +557,14 @@ class Mapping(APIView):
                 file_name,
                 sheet_name or ''
             )
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "mapping_file", details=f"Mapped file: {file_name}, sheet: {sheet_name}, type: {file_type}", ip_address=ip)
+
             return Response({
                 "message": "Mapped and overwritten the original file successfully",
                 "mapped_file": {
@@ -631,6 +654,14 @@ class Melting(APIView):
                 melted_df.fillna("NA", inplace=True)
                 melted_df.to_csv(original_file_path, index=False)
             self.commit_to_git(project_base_folder, user, project_id, file_type, file_name, sheet_name)
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "melt_file", details=f"Melted file: {file_name}, sheet: {sheet_name}, type: {file_type}", ip_address=ip)
+
             return Response({
                 "message": "Melted and overwritten the original file successfully",
                 "melted_file": {
@@ -677,14 +708,29 @@ class SheetInfo(APIView):
                 return Response({"error": "Project not found"}, status=404)
 
             # Construct file path
-            file_path = os.path.join(
-                settings.MEDIA_ROOT,
-                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
-            )
-            file_path = os.path.normpath(file_path)
-
-            if not os.path.exists(file_path):
-                return Response({"error": "File not found"}, status=404)
+            if file_type == 'concatenated':
+                # Search all subfolders for the sheet_name
+                concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+                found = False
+                file_path = None
+                if os.path.exists(concatenated_base):
+                    for folder in os.listdir(concatenated_base):
+                        folder_path = os.path.join(concatenated_base, folder)
+                        candidate = os.path.join(folder_path, sheet_name)
+                        if os.path.isfile(candidate):
+                            file_path = candidate
+                            found = True
+                            break
+                if not found:
+                    return Response({"error": "File not found"}, status=404)
+            else:
+                file_path = os.path.join(
+                    settings.MEDIA_ROOT,
+                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+                )
+                file_path = os.path.normpath(file_path)
+                if not os.path.exists(file_path):
+                    return Response({"error": "File not found"}, status=404)
 
             # Read the file
             file_extension = os.path.splitext(sheet_name)[1].lower()
@@ -787,6 +833,13 @@ class SheetInfo(APIView):
                     "type": "string",
                     "unique_values": int(column_data.nunique())
                 })
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "column_info", details=f"Column information retrieved successfully", ip_address=ip)
 
             return Response({
                 "message": "Column information retrieved successfully",
@@ -884,6 +937,13 @@ class CleaningColumns(APIView):
                 with default_storage.open(csv_file_path, 'w') as f:
                     cleaned_data.to_csv(f, index=False, lineterminator='\n')
             self.commit_to_git(project_folder, user, project_id, file_type, file_name, sheet_name)
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "clean_file", details=f"Cleaned file: {file_name}, sheet: {sheet_name}, type: {file_type}", ip_address=ip)
             return Response({
                 'message': 'CSV file cleaned successfully',
                 'cleaned_sheet': {
@@ -1018,8 +1078,16 @@ class FileUploadView(APIView):
 
         # Define folder structure
         project_folder = f"user_{project.user.id}/project_{project.id}"
-        last_name_kpi = [os.path.basename(file) for file in project.kpi_file] if project.kpi_file else []
-        last_name_media = [os.path.basename(file) for file in project.media_file] if project.media_file else []
+        
+        # Extract just the filenames from the database paths (handle both full paths and just filenames)
+        def extract_filename(file_path):
+            """Extract filename from either full path or just filename"""
+            if '\\' in file_path or '/' in file_path:
+                return os.path.basename(file_path)
+            return file_path
+        
+        last_name_kpi = [extract_filename(file) for file in project.kpi_file] if project.kpi_file else []
+        last_name_media = [extract_filename(file) for file in project.media_file] if project.media_file else []
         last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
 
         # Validate that the file exists in the project
@@ -1114,50 +1182,63 @@ class FileUploadView(APIView):
                 file_size_mb = os.path.getsize(csv_file) / (1024 * 1024)
 
                 # Open CSV file using default_storage in binary mode, wrap in TextIOWrapper for utf-8
-                with default_storage.open(rel_csv_file, 'rb') as f:
-                    csvfile = io.TextIOWrapper(f, encoding='utf-8')
-                    reader = csv.reader(csvfile)
-                    rows = list(reader)
+                try:
+                    with default_storage.open(rel_csv_file, 'rb') as f:
+                        csvfile = io.TextIOWrapper(f, encoding='utf-8')
+                        reader = csv.reader(csvfile)
+                        rows = list(reader)
+                except UnicodeDecodeError:
+                    with default_storage.open(rel_csv_file, 'rb') as f:
+                        csvfile = io.TextIOWrapper(f, encoding='latin1')
+                        reader = csv.reader(csvfile)
+                        rows = list(reader)
 
-                    if not rows:
-                        continue  # Skip empty CSV files
+                if not rows:
+                    continue  # Skip empty CSV files
 
-                    columns = rows[0]  # Header
-                    if file_size_mb < 50:
-                        data = rows[1:]  # All data rows
-                    else:
-                        data = rows[1:1001]  # Top 1000 rows
+                columns = rows[0]  # Header
+                if file_size_mb < 50:
+                    data = rows[1:]  # All data rows
+                else:
+                    data = rows[1:1001]  # Top 1000 rows
 
-                    column_types = {}
+                column_types = {}
 
-                    # Common error values to ignore
-                    error_values = {"#VALUE!", "#N/A", "#DIV/0!", "#REF!", "#NAME?", "#NULL!", "#NUM!"}
+                # Common error values to ignore
+                error_values = {"#VALUE!", "#N/A", "#DIV/0!", "#REF!", "#NAME?", "#NULL!", "#NUM!"}
 
-                    for col_index, col_name in enumerate(columns):
-                        column_types[col_name] = "Unknown"
-                        for row in data:
-                            try:
-                                value = row[col_index]
-                                if value and value not in error_values:
-                                    if value.replace('.', '', 1).isdigit():
-                                        if '.' in value:
-                                            column_types[col_name] = "float"
-                                        else:
-                                            column_types[col_name] = "int"
+                for col_index, col_name in enumerate(columns):
+                    column_types[col_name] = "Unknown"
+                    for row in data:
+                        try:
+                            value = row[col_index]
+                            if value and value not in error_values:
+                                if value.replace('.', '', 1).isdigit():
+                                    if '.' in value:
+                                        column_types[col_name] = "float"
                                     else:
-                                        column_types[col_name] = "str"
-                                    break
-                            except (IndexError, ValueError, TypeError):
-                                continue
+                                        column_types[col_name] = "int"
+                                else:
+                                    column_types[col_name] = "str"
+                                break
+                        except (IndexError, ValueError, TypeError):
+                            continue
 
-                    # Use CSV file name as "sheet name"
-                    sheet_name = os.path.basename(csv_file)
-                    sheets_data[sheet_name] = {
-                        'columns': columns,
-                        'data': data,
-                        'column_types': column_types,
-                        'hidden': False  # CSV can't have hidden sheets
-                    }
+                # Use CSV file name as "sheet name"
+                sheet_name = os.path.basename(csv_file)
+                sheets_data[sheet_name] = {
+                    'columns': columns,
+                    'data': data,
+                    'column_types': column_types,
+                    'hidden': False  # CSV can't have hidden sheets
+                }
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "file_data", details=f"File data retrieved successfully", ip_address=ip)
 
             return Response({
                 'message': 'CSV file(s) data retrieved successfully',
@@ -1184,6 +1265,9 @@ class SignupView(APIView):
 
         user = User.objects.create(username=username, email=email, password=password)
         refresh = RefreshToken.for_user(user)
+        ip = request.META.get('REMOTE_ADDR')
+        log_user_action(user, "signup", details=f"User signed up successfully", ip_address=ip)
+
         return Response({
             'user': {
                 'id': user.id,
@@ -1204,6 +1288,9 @@ class SigninView(APIView):
         # print(user)
         if user:
             refresh = RefreshToken.for_user(user)
+            # Log the login event
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "login", details="User logged in", ip_address=ip)
             return Response({
                 'user': {
                     'id': user.id,
@@ -1233,6 +1320,10 @@ class UploadProject(APIView):
             user = User.objects.get(id=user_id)
         except User.DoesNotExist:
             return Response({'error': 'User not found'}, status=404)
+
+        # Log the project upload event
+        ip = request.META.get('REMOTE_ADDR')
+        log_user_action(user, "upload_project", details=f"Project name: {name}", ip_address=ip)
 
         # Create new project
         project = Projects.objects.create(user=user, name=name, kpi_file=[], media_file=[])
@@ -1423,7 +1514,7 @@ class UserProjectsView(APIView):
                                 'path': f"user_{user.id}/project_{project.id}/concatenated/{timestamp_folder}/{file}",
                                 'name': f"{timestamp_folder}/{file}"
                             })
-
+            
             project_data.append({
                 'id': project.id,
                 'name': project.name,
@@ -1435,7 +1526,11 @@ class UserProjectsView(APIView):
                     'concatenated': concatenated_file_data
                 }
             })
-
+        # Robust user logging
+        logging_user = get_logging_user(request, user)
+        if logging_user:
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(logging_user, "view_projects", details="User viewed projects", ip_address=ip)
         return Response({'projects': project_data}, status=200)
 
 
@@ -1482,7 +1577,13 @@ class DeleteProject(APIView):
 
             # Delete the project from the database
             project.delete()
-
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "delete_project", details=f"Project deleted successfully", ip_address=ip)
             return Response({"message": "Project, files, and Git repository deleted successfully"}, status=200)
 
         except Exception as e:
@@ -1656,6 +1757,11 @@ class UpdateProject(APIView):
         if spark:
             spark.stop()
 
+        logging_user = get_logging_user(request, user)
+        if logging_user:
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(logging_user, "update_project", details=f"Project updated successfully", ip_address=ip)
+
         return Response({
             'message': 'Project files updated successfully',
             'project_id': project.id,
@@ -1781,6 +1887,9 @@ class GetSpecificSheetCommits(APIView):
                 for parent_hash in commit["parents"]:
                     if parent_hash in commit_map:
                         commit_map[parent_hash]["children"].append(commit["hash"])
+
+            # Log the event
+            
 
             return Response({"commits": list(commit_map.values())}, status=200)
 
@@ -1913,6 +2022,12 @@ class GetSpecificSheetCommitsArray(APIView):
             # Exclude undo and redo commits from the response
             filtered_commits = [commit for commit in commit_map.values() if commit["operation_type"] not in ["undo", "redo"]]
 
+            # Log the event
+            logging_user = get_logging_user(request, user_id)
+            if logging_user:
+                ip = request.META.get('REMOTE_ADDR')
+                log_user_action(logging_user, "get_specific_sheet_commits_array", details=f"Specific sheet commits retrieved successfully", ip_address=ip)
+
             return Response({"commits": filtered_commits}, status=200)
 
         except Exception as e:
@@ -1997,6 +2112,13 @@ class UndoRedoSheet(APIView):
                 )
             except Exception as e:
                 print(f"Failed to create commit: {str(e)}")
+
+            # Log the event
+            logging_user = get_logging_user(request, user_id)
+            if logging_user:
+                ip = request.META.get('REMOTE_ADDR')
+                log_user_action(logging_user, "undo_redo_sheet", details=f"{action.capitalize()} sheet successful", ip_address=ip)
+
             return Response({
                 "message": f"{action.capitalize()} successful",
                 "sheet_data": {
@@ -2042,6 +2164,7 @@ class PivotEDAAnalysis(APIView):
                 "categorical_stats": self.analyze_categorical_data(df),
                 "correlation": self.analyze_correlations(df),
             }
+           
             return Response({"eda_results": eda_results}, status=200)
         except Exception as e:
             return Response({"error": str(e)}, status=500)
@@ -2564,6 +2687,16 @@ class AddDateColumns(APIView):
                     'data': [[json_safe(cell) for cell in row] for row in df.values.tolist()]
                 }
             }
+            # Log the event
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "add_date_columns", details=f"Date columns added successfully", ip_address=ip)
+
+
             return Response({
                 'message': 'Date columns added successfully',
                 'added_columns': added_columns,
@@ -2724,6 +2857,14 @@ class UpdateFromGoogleSheet(APIView):
             updated_df = updated_df.replace([np.inf, -np.inf], np.nan)
             updated_df = updated_df.astype(object).where(pd.notnull(updated_df), None)
             safe_data = [[json_safe(cell) for cell in row] for row in updated_df.values.tolist()]
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "update_from_google_sheet", details=f"Data updated from Google Sheet successfully", ip_address=ip)
+
             return Response({
                 'message': 'Data updated from Google Sheet successfully',
                 'columns': updated_df.columns.tolist(),
@@ -2747,21 +2888,45 @@ class DeleteFile(APIView):
         except Projects.DoesNotExist:
             return Response({'error': 'Project not found'}, status=404)
 
-        file_path = os.path.join(
-            settings.MEDIA_ROOT,
-            f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}"
-        )
-        file_path = os.path.normpath(file_path)
-
-        if not os.path.exists(file_path):
-            return Response({'error': 'File or folder not found'}, status=404)
+        if file_type == 'concatenated':
+            # Search all subfolders for the file_name
+            concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+            found = False
+            file_path = None
+            folder_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    candidate_folder = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(candidate_folder, file_name)
+                    if os.path.isfile(candidate):
+                        file_path = candidate
+                        folder_path = candidate_folder
+                        found = True
+                        break
+            if not found:
+                return Response({'error': 'File or folder not found'}, status=404)
+        else:
+            file_path = os.path.join(
+                settings.MEDIA_ROOT,
+                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}"
+            )
+            file_path = os.path.normpath(file_path)
+            folder_path = file_path
+            if not os.path.exists(file_path):
+                return Response({'error': 'File or folder not found'}, status=404)
 
         try:
             if os.path.isfile(file_path):
                 os.remove(file_path)
+                # If concatenated, remove the folder if empty
+                if file_type == 'concatenated' and folder_path and os.path.isdir(folder_path):
+                    if not os.listdir(folder_path):
+                        import shutil
+                        shutil.rmtree(folder_path)
             else:
                 import shutil
                 shutil.rmtree(file_path)
+
             return Response({'message': 'File or folder deleted successfully'}, status=200)
         except Exception as e:
             return Response({'error': str(e)}, status=500)
@@ -2950,6 +3115,13 @@ class CustomScriptRun(APIView):
                         'is_complete_data': file_size_mb < 50,
                         'file_size_mb': round(file_size_mb, 2)
                     }
+                    user = None
+                    if hasattr(request, 'user') and request.user.is_authenticated:
+                        user = request.user
+                    elif project and hasattr(project, 'user'):
+                        user = project.user
+                    ip = request.META.get('REMOTE_ADDR')
+                    log_user_action(user, "custom_script_run", details=f"Script executed successfully (preview)", ip_address=ip)
                     return Response({
                         'message': 'Script executed successfully (preview)',
                         'preview_data': preview_data
@@ -2981,10 +3153,44 @@ class CustomScriptRun(APIView):
                         except Exception as e:
                             print(f"Error committing to git: {str(e)}")
 
+                        # Prepare sheet data for response (like preview)
+                        # --- Add column_types for frontend ---
+                        def get_column_types(df):
+                            types = {}
+                            for col in df.columns:
+                                dtype = str(df[col].dtype)
+                                if dtype.startswith('int'):
+                                    types[col] = 'int'
+                                elif dtype.startswith('float'):
+                                    types[col] = 'float'
+                                elif dtype.startswith('bool'):
+                                    types[col] = 'bool'
+                                elif dtype.startswith('datetime'):
+                                    types[col] = 'datetime'
+                                else:
+                                    types[col] = 'str'
+                            return types
+                        # --- End column_types ---
+                        sheet_data = {
+                            'columns': modified_df.columns.tolist(),
+                            'data': modified_df.replace([np.inf, -np.inf], np.nan).fillna('NA').values.tolist(),
+                            'column_types': get_column_types(modified_df),
+                            'total_rows': len(modified_df)
+                        }
+
+                        # Wrap sheet_data in a dict keyed by sheet_name for frontend compatibility
+                        user = None
+                        if hasattr(request, 'user') and request.user.is_authenticated:
+                            user = request.user
+                        elif project and hasattr(project, 'user'):
+                            user = project.user
+                        ip = request.META.get('REMOTE_ADDR')
+                        log_user_action(user, "custom_script_run", details=f"Script executed and saved successfully", ip_address=ip)
                         return Response({
                             'message': 'Script executed and saved successfully',
                             'file_path': file_path,
-                            'total_rows': len(modified_df)
+                            'total_rows': len(modified_df),
+                            'sheet_data': {sheet_name: sheet_data}
                         }, status=200)
 
                     except Exception as e:
@@ -3022,6 +3228,12 @@ class SaveScript(APIView):
             )
             script.save()
 
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "save_script", details=f"Script saved successfully", ip_address=ip)
+
             return Response({
                 'message': 'Script saved successfully',
                 'script_id': script.id,
@@ -3056,6 +3268,8 @@ class FetchScripts(APIView):
                 'created_at': script.created_at,
                 'updated_at': script.updated_at,
             } for script in scripts]
+
+           
 
             return Response({
                 'scripts': scripts_list
@@ -3151,6 +3365,10 @@ class ConcatenateSheets(APIView):
             for col in safe_df.columns:
                 safe_df[col] = safe_df[col].astype(str)
 
+            user = get_logging_user(request, getattr(project, 'user', None))
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "concatenate_sheets", details=f"Sheets concatenated successfully", ip_address=ip)
+
             return Response({
                 'message': 'Sheets concatenated successfully',
                 'new_sheet': {
@@ -3245,6 +3463,12 @@ class SavePlot(APIView):
                     'chart_options': chart_options
                 }
             )
+
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "save_plot", details=f"Plot saved successfully", ip_address=ip)
 
             return Response({
                 'message': 'Plot saved successfully',
@@ -3369,6 +3593,14 @@ class FetchPlots(APIView):
                 'updated_at': plot.updated_at
             } for plot in saved_plots]
 
+            # --- Fix: Make filter_criteria serializable ---
+            serializable_filter_criteria = {}
+            for k, v in plot_filter.items():
+                if k == 'project' and hasattr(v, 'id'):
+                    serializable_filter_criteria[k] = v.id
+                else:
+                    serializable_filter_criteria[k] = v
+
             return Response({
                 'plots': plots_data,
                 'access_info': {
@@ -3379,7 +3611,7 @@ class FetchPlots(APIView):
                 'debug_info': {
                     'total_plots': all_plots.count(),
                     'matching_plots': saved_plots.count(),
-                    'filter_criteria': plot_filter
+                    'filter_criteria': serializable_filter_criteria
                 }
             }, status=200)
 
@@ -3612,6 +3844,9 @@ class SaveReportPivot(APIView):
                 }
             )
 
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "save_pivot", details=f"Pivot table saved successfully", ip_address=ip)
+
             return Response({
                 'message': 'Pivot table saved successfully',
                 'pivot_id': saved_pivot.id,
@@ -3705,6 +3940,8 @@ class FetchReportPivot(APIView):
                 'updated_at': pivot.updated_at
             } for pivot in saved_pivots]
 
+           
+
             return Response({
                 'pivots': pivots_data,
                 'total_pivots': saved_pivots.count(),
@@ -3755,6 +3992,8 @@ class DeleteReportPivot(APIView):
                     project=project
                 )
                 pivot.delete()
+                ip = request.META.get('REMOTE_ADDR')
+                log_user_action(user, "delete_pivot", details=f"Pivot table deleted successfully", ip_address=ip)
                 return Response({
                     'message': 'Pivot table deleted successfully',
                     'pivot_id': pivot_id
@@ -3809,6 +4048,9 @@ class SavePivotPlot(APIView):
             except SavedPivot.DoesNotExist:
                 return Response({'error': 'Pivot table not found'}, status=404)
 
+            # Extract activeFilters from plot_config if it exists
+            active_filters = plot_config.get('activeFilters', {}) if plot_config else {}
+
             # Create or update the plot
             saved_plot, created = SavedPivotPlot.objects.update_or_create(
                 user=user,
@@ -3818,9 +4060,13 @@ class SavePivotPlot(APIView):
                 defaults={
                     'plot_config': plot_config,
                     'chart_data': chart_data,
-                    'chart_options': chart_options
+                    'chart_options': chart_options,
+                    'active_filters': active_filters
                 }
             )
+
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "save_pivot_plot", details=f"Plot saved successfully", ip_address=ip)
 
             return Response({
                 'message': 'Plot saved successfully',
@@ -3982,6 +4228,7 @@ class FetchPivotPlots(APIView):
                     'plot_config': plot.plot_config,
                     'chart_data': plot.chart_data,
                     'chart_options': plot.chart_options,
+                    'active_filters': plot.active_filters,
                     'created_at': plot.created_at,
                     'updated_at': plot.updated_at,
                     'pivot_info': {
@@ -4244,6 +4491,12 @@ class ConcatenateProjectSheets(APIView):
             if concatenated_name not in project.concatenated_file:
                 project.concatenated_file.append(concatenated_name)
             project.save()
+
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "concatenate_sheets", details=f"Sheets concatenated successfully", ip_address=ip)
 
             return Response({
                 'success': True,
@@ -4543,6 +4796,9 @@ class ShareProject(APIView):
                 'shared_with': shared_with_user,
                 'is_active': True
             }
+            user = get_logging_user(request, getattr(project, 'user', None))
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "share_project", details=f"Project shared successfully", ip_address=ip)
             
             if share_type == 'file':
                 share_filter.update({
@@ -4561,7 +4817,17 @@ class ShareProject(APIView):
                 existing_share.permission_level = permission_level
                 existing_share.updated_at = timezone.now()
                 existing_share.save()
-                
+                # Send email notification for update
+                try:
+                    subject = f"Project Share Updated: {project.name}"
+                    if share_type == 'file':
+                        message = f"Hi {shared_with_user.username},\n\nYou have been granted updated {permission_level} access to the file '{file_name}' in the project '{project.name}' by {shared_by_user.username}.\n\nLogin to your account to access the shared file."
+                    else:
+                        message = f"Hi {shared_with_user.username},\n\nYou have been granted updated {permission_level} access to the project '{project.name}' by {shared_by_user.username}.\n\nLogin to your account to access the shared project."
+                    send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [shared_with_user.email], fail_silently=True)
+                except Exception as e:
+                    print("email not sent", e)
+                    pass  # Do not block API on email failure
                 return Response({
                     'success': True,
                     'message': 'Project share updated successfully',
@@ -4579,7 +4845,21 @@ class ShareProject(APIView):
                     file_name=file_name if share_type == 'file' else None,
                     sheet_name=sheet_name if share_type == 'file' else None
                 )
-                
+                # Send email notification for new share
+                try:
+                    subject = f"Project Shared: {project.name} on Sanitify"
+                    if share_type == 'file':
+                        message = f"Hi {shared_with_user.username},\n\nYou have been granted {permission_level} access to the file '{file_name}' in the project '{project.name}' by {shared_by_user.username}.\n\nLogin to your account to access the shared file."
+                        print("message", message)
+                    else:
+                        message = f"Hi {shared_with_user.username},\n\nYou have been granted {permission_level} access to the project '{project.name}' by {shared_by_user.username}.\n\nLogin to your account to access the shared project."
+                        print("message", message)
+                    print("sending mail")
+                    send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [shared_with_user.email], fail_silently=True)
+                    print("mail sent")
+                except Exception as e:
+                    print("email not sent", e)
+                    pass  # Do not block API on email failure
                 return Response({
                     'success': True,
                     'message': 'Project shared successfully',
@@ -4650,6 +4930,10 @@ class RemoveProjectShare(APIView):
             share.updated_at = timezone.now()
             share.save()
             
+            user = get_logging_user(request, getattr(share.project, 'user', None))
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "remove_project_share", details=f"Project share removed successfully", ip_address=ip)
+
             return Response({
                 'success': True,
                 'message': 'Project share removed successfully'
@@ -4720,6 +5004,8 @@ class GetSharedProjects(APIView):
                 
                 shared_projects.append(project_info)
             
+            
+
             return Response({
                 'success': True,
                 'shared_projects': shared_projects,
@@ -5087,7 +5373,8 @@ class GetProjectSharedAccess(APIView):
                     })
                 
                 shared_access.append(access_data)
-            
+        
+
             return Response({
                 'success': True,
                 'shared_access': shared_access,
@@ -5573,8 +5860,16 @@ class GetSheets(APIView):
 
             # Define folder structure
             project_folder = f"user_{project.user.id}/project_{project.id}"
-            last_name_kpi = [os.path.basename(file) for file in project.kpi_file] if project.kpi_file else []
-            last_name_media = [os.path.basename(file) for file in project.media_file] if project.media_file else []
+            
+            # Extract just the filenames from the database paths (handle both full paths and just filenames)
+            def extract_filename(file_path):
+                """Extract filename from either full path or just filename"""
+                if '\\' in file_path or '/' in file_path:
+                    return os.path.basename(file_path)
+                return file_path
+            
+            last_name_kpi = [extract_filename(file) for file in project.kpi_file] if project.kpi_file else []
+            last_name_media = [extract_filename(file) for file in project.media_file] if project.media_file else []
             last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
 
             # Validate that the file exists in the project
@@ -5693,4 +5988,24 @@ class GetSheets(APIView):
             return Response({
                 'error': f'An unexpected error occurred: {str(e)}'
             }, status=500)
+
+
+def get_logging_user(request, fallback_user=None):
+    if hasattr(request, 'user') and getattr(request.user, 'is_authenticated', False):
+        return request.user
+    if fallback_user is not None:
+        return fallback_user
+    user_id = None
+    if hasattr(request, 'data', ) and isinstance(request.data, dict):
+        user_id = request.data.get('user_id')
+    if not user_id and hasattr(request, 'query_params'):
+        user_id = request.query_params.get('user_id')
+    if user_id:
+        try:
+            return User.objects.get(id=user_id)
+        except Exception:
+            return None
+    return None
+
+
 

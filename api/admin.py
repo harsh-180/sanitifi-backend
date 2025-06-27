@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import User, Projects, ProjectShare  # Import your model
+from .models import User, Projects, ProjectShare, UserActionLog  # Import your model
 
 class userModel(admin.ModelAdmin):
     list_display=['id','username','email','password']
@@ -15,5 +15,6 @@ class ProjectShareModel(admin.ModelAdmin):
 admin.site.register(User, userModel)
 admin.site.register(Projects, UserModel)
 admin.site.register(ProjectShare, ProjectShareModel)
+admin.site.register(UserActionLog)
 
 
