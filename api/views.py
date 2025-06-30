@@ -497,24 +497,73 @@ class Mapping(APIView):
         file_size_mb = os.path.getsize(original_file_path) / (1024 * 1024)
         try:
             if file_size_mb > 50:
-                spark = get_spark_session()
-                if file_ext in ['.xlsx', '.xls']:
-                    df = spark.read.format("com.crealytics.spark.excel").option("header", True).load(original_file_path)
-                elif file_ext == '.csv':
-                    df = spark.read.option("header", True).csv(original_file_path)
-                else:
-                    return Response({"error": "Unsupported file type. Only .csv, .xls, .xlsx allowed."}, status=400)
-                mapping_df = pd.read_excel(mapping_file)
-                for original_col, mapping_col in json.loads(column_mappings) if isinstance(column_mappings, str) else column_mappings.items():
-                    if original_col in df.columns and mapping_col in mapping_df.columns:
-                        mapping_spark = spark.createDataFrame(mapping_df[[mapping_col, mapping_df.columns[mapping_df.columns.get_loc(mapping_col)+1]]])
-                        mapping_spark = mapping_spark.withColumnRenamed(mapping_col, "key").withColumnRenamed(mapping_df.columns[mapping_df.columns.get_loc(mapping_col)+1], "value")
-                        df = df.join(mapping_spark, df[original_col] == mapping_spark["key"], "left") \
-                               .withColumn(f"{original_col}_New", expr(f"coalesce(value, {original_col})")) \
-                               .drop("key", "value")
-                df = df.na.fill("NA")
-                df.toPandas().to_csv(original_file_path, index=False)
-                result_df = df.limit(50).toPandas()
+                # Use the new robust Spark session management
+                from .spark_utils import spark_session_context, validate_spark_session
+                
+                with spark_session_context() as spark:
+                    # Validate session before use
+                    if not validate_spark_session(spark):
+                        raise Exception("Invalid Spark session. Please try again.")
+                    
+                    # Read file with optimized settings
+                    if file_ext in ['.xlsx', '.xls']:
+                        df = spark.read \
+                            .format("com.crealytics.spark.excel") \
+                            .option("header", True) \
+                            .option("inferSchema", False) \
+                            .option("maxRowsInMemory", 50000) \
+                            .option("maxColumns", 20000) \
+                            .load(original_file_path)
+                    elif file_ext == '.csv':
+                        df = spark.read \
+                            .option("header", True) \
+                            .option("inferSchema", False) \
+                            .option("maxRowsInMemory", 50000) \
+                            .option("maxColumns", 20000) \
+                            .csv(original_file_path)
+                    else:
+                        return Response({"error": "Unsupported file type. Only .csv, .xls, .xlsx allowed."}, status=400)
+                    
+                    # Cache the DataFrame for better performance
+                    df = df.cache()
+                    
+                    # Read mapping file
+                    mapping_df = pd.read_excel(mapping_file)
+                    
+                    # Process column mappings with proper column escaping
+                    column_mappings_dict = json.loads(column_mappings) if isinstance(column_mappings, str) else column_mappings
+                    
+                    for original_col, mapping_col in column_mappings_dict.items():
+                        if original_col in df.columns and mapping_col in mapping_df.columns:
+                            # Create mapping DataFrame
+                            mapping_col_index = mapping_df.columns.get_loc(mapping_col)
+                            next_col_index = mapping_col_index + 1
+                            
+                            if next_col_index < len(mapping_df.columns):
+                                next_col_name = mapping_df.columns[next_col_index]
+                                mapping_spark = spark.createDataFrame(mapping_df[[mapping_col, next_col_name]])
+                                mapping_spark = mapping_spark.withColumnRenamed(mapping_col, "key").withColumnRenamed(next_col_name, "value")
+                                
+                                # Escape column names that contain spaces or special characters
+                                escaped_original_col = f"`{original_col}`" if ' ' in original_col or any(char in original_col for char in ['-', '.', '/', '\\']) else original_col
+                                escaped_new_col = f"`{original_col}_New`" if ' ' in f"{original_col}_New" or any(char in f"{original_col}_New" for char in ['-', '.', '/', '\\']) else f"{original_col}_New"
+                                
+                                # Perform the join with proper column escaping
+                                df = df.join(mapping_spark, df[original_col] == mapping_spark["key"], "left") \
+                                       .withColumn(escaped_new_col, expr(f"coalesce(value, {escaped_original_col})")) \
+                                       .drop("key", "value")
+                            else:
+                                print(f"Warning: No next column exists after '{mapping_col}' in mapping_df")
+                    
+                    # Fill NA values
+                    df = df.na.fill("NA")
+                    
+                    # Save the result
+                    df.toPandas().to_csv(original_file_path, index=False)
+                    result_df = df.limit(50).toPandas()
+                    
+                    # Uncache to free memory
+                    df.unpersist()
             else:
                 if file_ext in ['.xlsx', '.xls']:
                     df = pd.read_excel(original_file_path)
@@ -624,22 +673,72 @@ class Melting(APIView):
         file_size_mb = os.path.getsize(original_file_path) / (1024 * 1024)
         try:
             if file_size_mb > 50:
-                spark = get_spark_session()
-                df = spark.read.option("header", True).csv(original_file_path)
-                # Handle comma-separated input
-                if isinstance(id_vars, str):
-                    id_vars = [col.strip() for col in id_vars.split(",")]
-                if isinstance(value_vars, str):
-                    value_vars = [col.strip() for col in value_vars.split(",")]
-                n = len(value_vars)
-                exprs = ", ".join([f"'{v}', {v}" for v in value_vars])
-                melted = df.selectExpr(
-                    *id_vars,
-                    f"stack({n}, {exprs}) as ({var_name}, {value_name})"
-                )
-                melted = melted.na.fill("NA")
-                melted.toPandas().to_csv(original_file_path, index=False)
-                melted_df = melted.limit(50).toPandas()
+                # Use the new robust Spark session management
+                from .spark_utils import spark_session_context, validate_spark_session
+                
+                with spark_session_context() as spark:
+                    # Validate session before use
+                    if not validate_spark_session(spark):
+                        raise Exception("Invalid Spark session. Please try again.")
+                    
+                    # Read CSV with optimized settings
+                    df = spark.read \
+                        .option("header", True) \
+                        .option("inferSchema", False) \
+                        .option("maxRowsInMemory", 50000) \
+                        .option("maxColumns", 20000) \
+                        .csv(original_file_path)
+                    
+                    # Cache the DataFrame for better performance
+                    df = df.cache()
+                    
+                    # Handle comma-separated input
+                    if isinstance(id_vars, str):
+                        id_vars = [col.strip() for col in id_vars.split(",")]
+                    if isinstance(value_vars, str):
+                        value_vars = [col.strip() for col in value_vars.split(",")]
+                    
+                    # Validate that all columns exist
+                    all_columns = df.columns
+                    missing_id_vars = [col for col in id_vars if col not in all_columns]
+                    missing_value_vars = [col for col in value_vars if col not in all_columns]
+                    
+                    if missing_id_vars or missing_value_vars:
+                        missing_cols = missing_id_vars + missing_value_vars
+                        raise Exception(f"Columns not found in dataset: {', '.join(missing_cols)}")
+                    
+                    # Create the melt operation using proper column escaping
+                    n = len(value_vars)
+                    
+                    # Build the stack expression with proper column escaping
+                    stack_parts = []
+                    for v in value_vars:
+                        # Escape column names that contain spaces or special characters
+                        escaped_col = f"`{v}`" if ' ' in v or any(char in v for char in ['-', '.', '/', '\\']) else v
+                        stack_parts.append(f"'{v}', {escaped_col}")
+                    
+                    exprs = ", ".join(stack_parts)
+                    
+                    # Build the select expression with proper column escaping
+                    select_cols = []
+                    for col in id_vars:
+                        # Escape column names that contain spaces or special characters
+                        escaped_col = f"`{col}`" if ' ' in col or any(char in col for char in ['-', '.', '/', '\\']) else col
+                        select_cols.append(escaped_col)
+                    
+                    # Add the stack expression
+                    select_cols.append(f"stack({n}, {exprs}) as ({var_name}, {value_name})")
+                    
+                    # Perform the melt operation
+                    melted = df.selectExpr(*select_cols)
+                    melted = melted.na.fill("NA")
+                    
+                    # Save the result
+                    melted.toPandas().to_csv(original_file_path, index=False)
+                    melted_df = melted.limit(50).toPandas()
+                    
+                    # Uncache to free memory
+                    df.unpersist()
             else:
                 try:
                     df = pd.read_csv(original_file_path)
@@ -885,28 +984,66 @@ class CleaningColumns(APIView):
 
         try:
             if file_size_mb > 50:
-                spark = get_spark_session()
-                df = spark.read.option("header", True).csv(local_path)
-                # Lowercase columns
-                for col_name in options.get("lowercase_columns", []):
-                    if col_name in df.columns:
-                        df = df.withColumn(col_name, lower(col(col_name)))
-                # Remove spaces
-                for col_name in options.get("remove_spaces_columns", []):
-                    if col_name in df.columns:
-                        df = df.withColumn(col_name, regexp_replace(col(col_name), " ", ""))
-                # Remove special chars
-                for col_name, char_map in options.get("remove_special_chars", {}).items():
-                    if col_name in df.columns:
-                        for char, remove in char_map.items():
-                            if remove:
-                                df = df.withColumn(col_name, regexp_replace(col(col_name), re.escape(char), ""))
-                # Fill NA
-                df = df.na.fill("NA")
-                # Save back to CSV
-                df.toPandas().to_csv(local_path, index=False)
-                cleaned_data = df.limit(50).toPandas()  # For preview
-                special_chars_analysis = {}  # Not implemented for Spark
+                # Use the new robust Spark session management
+                from .spark_utils import spark_session_context, validate_spark_session
+                
+                with spark_session_context() as spark:
+                    # Validate session before use
+                    if not validate_spark_session(spark):
+                        raise Exception("Invalid Spark session. Please try again.")
+                    
+                    # Read CSV with optimized settings
+                    df = spark.read \
+                        .option("header", True) \
+                        .option("inferSchema", False) \
+                        .option("maxRowsInMemory", 50000) \
+                        .option("maxColumns", 20000) \
+                        .csv(local_path)
+                    
+                    # Cache the DataFrame for better performance
+                    df = df.cache()
+                    
+                    # Apply cleaning operations
+                    if not analysis_only:
+                        # Lowercase columns
+                        for col_name in options.get("lowercase_columns", []):
+                            if col_name in df.columns:
+                                df = df.withColumn(col_name, lower(col(col_name)))
+                        
+                        # Remove spaces
+                        for col_name in options.get("remove_spaces_columns", []):
+                            if col_name in df.columns:
+                                df = df.withColumn(col_name, regexp_replace(col(col_name), " ", ""))
+                        
+                        # Remove special chars
+                        for col_name, char_map in options.get("remove_special_chars", {}).items():
+                            if col_name in df.columns:
+                                for char, remove in char_map.items():
+                                    if remove:
+                                        df = df.withColumn(col_name, regexp_replace(col(col_name), re.escape(char), ""))
+                        
+                        # Fill NA
+                        df = df.na.fill("NA")
+                        
+                        # Save back to CSV with optimized settings
+                        df.toPandas().to_csv(local_path, index=False)
+                    
+                    # Get preview data for response
+                    cleaned_data = df.limit(50).toPandas()
+                    
+                    # Uncache to free memory
+                    df.unpersist()
+                    
+                    # For analysis_only mode, we don't need special chars analysis with Spark
+                    special_chars_analysis = {} if analysis_only else {}
+                    
+                    if analysis_only:
+                        return Response({
+                            'status': 'success',
+                            'special_chars_analysis': special_chars_analysis,
+                            'columns': cleaned_data.columns.tolist(),
+                            'total_rows': df.count() if not analysis_only else None
+                        }, status=200)
             else:
                 with default_storage.open(csv_file_path, 'rb') as f:
                     df = pd.read_csv(f)
@@ -1260,8 +1397,13 @@ class SignupView(APIView):
         if not username or not password or not email:
             return Response({'error': 'Missing required fields'}, status=400)
 
+        # Check if email already exists
+        if User.objects.filter(email=email).exists():
+            return Response({'error': 'E-Mail ID already exist'}, status=400)
+
+        # Check if username already exists
         if User.objects.filter(username=username).exists():
-            return Response({'error': 'Username already taken'}, status=400)
+            return Response({'error': 'Username already exist'}, status=400)
 
         user = User.objects.create(username=username, email=email, password=password)
         refresh = RefreshToken.for_user(user)
@@ -1404,48 +1546,65 @@ class UploadProject(APIView):
                             subprocess.run(["git", "add", sheet_path], cwd=project_folder)
                             subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
                 else:
-                    if spark is None:
-                        raise Exception("Spark session was not initialized for large file update.")
+                    # Use the new robust Spark session management for large files
+                    from .spark_utils import spark_session_context, validate_spark_session
+                    
                     try:
                         xls = pd.ExcelFile(temp_path, engine='openpyxl')
                         sheet_names = xls.sheet_names
                     except Exception as e:
                         print(f"❌ Failed to extract sheet names: {e}")
                         raise
+                    
                     def convert_sheet(sheet_name):
                         output_path = os.path.join(file_folder, f"{sheet_name}.csv")
                         commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
-                        try:
-                            df = spark.read \
-                                .format("com.crealytics.spark.excel") \
-                                .option("dataAddress", f"'{sheet_name}'!A1") \
-                                .option("header", "true") \
-                                .option("inferSchema", "false") \
-                                .option("maxRowsInMemory", 10000) \
-                                .option("maxColumns", 10000) \
-                                .option("treatEmptyValuesAsNulls", "true") \
-                                .option("workbookPassword", None) \
-                                .load(temp_path)
-                            df.toPandas().to_csv(output_path, index=False)
-                            subprocess.run(["git", "add", output_path], cwd=project_folder)
-                            subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                        except Exception as e:
-                            if "RecordFormatException" in str(e):
-                                import warnings
-                                warnings.filterwarnings("ignore", category=UserWarning)
-                                try:
-                                    xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                                    df = xls.parse(sheet_name, dtype=str)
-                                    df.to_csv(output_path, index=False)
-                                    subprocess.run(["git", "add", output_path], cwd=project_folder)
-                                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                                    print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
-                                except Exception as pe:
-                                    print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
-                            else:
-                                print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
-                                raise
-                    with ThreadPoolExecutor(max_workers=min(4, len(sheet_names))) as executor:
+                        
+                        with spark_session_context() as spark:
+                            # Validate session before use
+                            if not validate_spark_session(spark):
+                                raise Exception("Invalid Spark session. Please try again.")
+                            
+                            try:
+                                df = spark.read \
+                                    .format("com.crealytics.spark.excel") \
+                                    .option("dataAddress", f"'{sheet_name}'!A1") \
+                                    .option("header", "true") \
+                                    .option("inferSchema", "false") \
+                                    .option("maxRowsInMemory", 50000) \
+                                    .option("maxColumns", 20000) \
+                                    .option("treatEmptyValuesAsNulls", "true") \
+                                    .option("workbookPassword", None) \
+                                    .load(temp_path)
+                                
+                                # Cache for better performance
+                                df = df.cache()
+                                df.toPandas().to_csv(output_path, index=False)
+                                df.unpersist()  # Free memory
+                                
+                                subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                
+                            except Exception as e:
+                                if "RecordFormatException" in str(e):
+                                    import warnings
+                                    warnings.filterwarnings("ignore", category=UserWarning)
+                                    try:
+                                        xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                                        df = xls.parse(sheet_name, dtype=str)
+                                        df.to_csv(output_path, index=False)
+                                        subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                        print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
+                                    except Exception as pe:
+                                        print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
+                                        raise
+                                else:
+                                    print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
+                                    raise
+                    
+                    # Use optimized thread pool for parallel processing
+                    with ThreadPoolExecutor(max_workers=min(8, len(sheet_names))) as executor:
                         futures = [executor.submit(convert_sheet, sheet) for sheet in sheet_names]
                         for f in futures:
                             f.result()
@@ -1689,48 +1848,65 @@ class UpdateProject(APIView):
                             subprocess.run(["git", "add", sheet_path], cwd=project_folder)
                             subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
                 else:
-                    if spark is None:
-                        raise Exception("Spark session was not initialized for large file update.")
+                    # Use the new robust Spark session management for large files
+                    from .spark_utils import spark_session_context, validate_spark_session
+                    
                     try:
                         xls = pd.ExcelFile(temp_path, engine='openpyxl')
                         sheet_names = xls.sheet_names
                     except Exception as e:
                         print(f"❌ Failed to extract sheet names: {e}")
                         raise
+                    
                     def convert_sheet(sheet_name):
                         output_path = os.path.join(file_folder, f"{sheet_name}.csv")
                         commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
-                        try:
-                            df = spark.read \
-                                .format("com.crealytics.spark.excel") \
-                                .option("dataAddress", f"'{sheet_name}'!A1") \
-                                .option("header", "true") \
-                                .option("inferSchema", "false") \
-                                .option("maxRowsInMemory", 10000) \
-                                .option("maxColumns", 10000) \
-                                .option("treatEmptyValuesAsNulls", "true") \
-                                .option("workbookPassword", None) \
-                                .load(temp_path)
-                            df.toPandas().to_csv(output_path, index=False)
-                            subprocess.run(["git", "add", output_path], cwd=project_folder)
-                            subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                        except Exception as e:
-                            if "RecordFormatException" in str(e):
-                                import warnings
-                                warnings.filterwarnings("ignore", category=UserWarning)
-                                try:
-                                    xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                                    df = xls.parse(sheet_name, dtype=str)
-                                    df.to_csv(output_path, index=False)
-                                    subprocess.run(["git", "add", output_path], cwd=project_folder)
-                                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                                    print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
-                                except Exception as pe:
-                                    print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
-                            else:
-                                print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
-                                raise
-                    with ThreadPoolExecutor(max_workers=min(4, len(sheet_names))) as executor:
+                        
+                        with spark_session_context() as spark:
+                            # Validate session before use
+                            if not validate_spark_session(spark):
+                                raise Exception("Invalid Spark session. Please try again.")
+                            
+                            try:
+                                df = spark.read \
+                                    .format("com.crealytics.spark.excel") \
+                                    .option("dataAddress", f"'{sheet_name}'!A1") \
+                                    .option("header", "true") \
+                                    .option("inferSchema", "false") \
+                                    .option("maxRowsInMemory", 50000) \
+                                    .option("maxColumns", 20000) \
+                                    .option("treatEmptyValuesAsNulls", "true") \
+                                    .option("workbookPassword", None) \
+                                    .load(temp_path)
+                                
+                                # Cache for better performance
+                                df = df.cache()
+                                df.toPandas().to_csv(output_path, index=False)
+                                df.unpersist()  # Free memory
+                                
+                                subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                
+                            except Exception as e:
+                                if "RecordFormatException" in str(e):
+                                    import warnings
+                                    warnings.filterwarnings("ignore", category=UserWarning)
+                                    try:
+                                        xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                                        df = xls.parse(sheet_name, dtype=str)
+                                        df.to_csv(output_path, index=False)
+                                        subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                        print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
+                                    except Exception as pe:
+                                        print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
+                                        raise
+                                else:
+                                    print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
+                                    raise
+                    
+                    # Use optimized thread pool for parallel processing
+                    with ThreadPoolExecutor(max_workers=min(8, len(sheet_names))) as executor:
                         futures = [executor.submit(convert_sheet, sheet) for sheet in sheet_names]
                         for f in futures:
                             f.result()
@@ -1779,12 +1955,51 @@ class GetSpecificSheetCommits(APIView):
         file_type = request.data.get("file_type")
         send_only_commits = request.data.get("send_only_commits")
 
+        # Store original file name for access control
+        original_file_name = file_name
+        
+        # Sanitize file_name to remove invalid characters and spaces
         file_name = file_name.replace("\\", "/").split("/")[-1]
+        # Remove leading/trailing spaces and replace spaces with underscores
+        file_name = file_name.strip().replace(" ", "_")
 
         if not project_id or not user_id or not file_name or not sheet_name:
             return Response({"error": "Missing required parameters"}, status=400)
 
-        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user_id}/project_{project_id}")
+        # Check project access (including shared projects) - try both original and sanitized names
+        has_access = False
+        share_object = None
+        permission_level = None
+        
+        # First try with original file name (as stored in ProjectShare)
+        has_access, share_object, permission_level = check_project_access(
+            user_id, project_id, file_type, original_file_name, sheet_name
+        )
+        
+        # If that fails, try with sanitized file name
+        if not has_access:
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name, sheet_name
+            )
+        
+        # If still no access, try project-level access
+        if not has_access:
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id
+            )
+        
+        if not has_access:
+            return Response({"error": "Access denied to this project or file"}, status=403)
+
+        # Get the project owner's user ID for the correct folder path
+        try:
+            project = Projects.objects.get(id=project_id)
+            project_owner_id = project.user.id
+        except Projects.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+        # Use project owner's folder for git operations
+        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project_owner_id}/project_{project_id}")
         git_relative_path = f"{file_type}/{file_name}/{sheet_name}"
 
         try:
@@ -1889,9 +2104,14 @@ class GetSpecificSheetCommits(APIView):
                         commit_map[parent_hash]["children"].append(commit["hash"])
 
             # Log the event
-            
+            user = get_logging_user(request, User.objects.get(id=user_id))
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "get_commits", details=f"Retrieved commits for project {project_id}, file: {file_name}, sheet: {sheet_name}", ip_address=ip)
 
-            return Response({"commits": list(commit_map.values())}, status=200)
+            return Response({
+                "commits": list(commit_map.values()),
+                "permission_level": permission_level
+            }, status=200)
 
         except Exception as e:
             return Response({"error": str(e)}, status=500)
@@ -1909,12 +2129,31 @@ class GetSpecificSheetCommitsArray(APIView):
         file_type = request.data.get("file_type")
         send_only_commits = request.data.get("send_only_commits")
 
+        # Sanitize file_name to remove invalid characters and spaces
         file_name = file_name.replace("\\", "/").split("/")[-1]
+        # Remove leading/trailing spaces and replace spaces with underscores
+        file_name = file_name.strip().replace(" ", "_")
 
         if not project_id or not user_id or not file_name or not sheet_name:
             return Response({"error": "Missing required parameters"}, status=400)
 
-        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user_id}/project_{project_id}")
+        # Check project access (including shared projects)
+        has_access, share_object, permission_level = check_project_access(
+            user_id, project_id, file_type, file_name, sheet_name
+        )
+        
+        if not has_access:
+            return Response({"error": "Access denied to this project or file"}, status=403)
+
+        # Get the project owner's user ID for the correct folder path
+        try:
+            project = Projects.objects.get(id=project_id)
+            project_owner_id = project.user.id
+        except Projects.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+        # Use project owner's folder for git operations
+        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project_owner_id}/project_{project_id}")
         git_relative_path = f"{file_type}/{file_name}/{sheet_name}"
 
         try:
@@ -2023,12 +2262,14 @@ class GetSpecificSheetCommitsArray(APIView):
             filtered_commits = [commit for commit in commit_map.values() if commit["operation_type"] not in ["undo", "redo"]]
 
             # Log the event
-            logging_user = get_logging_user(request, user_id)
-            if logging_user:
-                ip = request.META.get('REMOTE_ADDR')
-                log_user_action(logging_user, "get_specific_sheet_commits_array", details=f"Specific sheet commits retrieved successfully", ip_address=ip)
+            user = get_logging_user(request, User.objects.get(id=user_id))
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "get_specific_sheet_commits_array", details=f"Retrieved commits array for project {project_id}, file: {file_name}, sheet: {sheet_name}", ip_address=ip)
 
-            return Response({"commits": filtered_commits}, status=200)
+            return Response({
+                "commits": filtered_commits,
+                "permission_level": permission_level
+            }, status=200)
 
         except Exception as e:
             return Response({"error": str(e)}, status=500)
@@ -2044,12 +2285,31 @@ class UndoRedoSheet(APIView):
         action = request.data.get("action")  # 'undo' or 'redo'
         hash = request.data.get("hash")
 
-        file_name=file_name.split("\\")[1]
+        # Sanitize file_name to remove invalid characters and spaces
+        file_name = file_name.split("\\")[1] if "\\" in file_name else file_name
+        # Remove leading/trailing spaces and replace spaces with underscores
+        file_name = file_name.strip().replace(" ", "_")
 
         if not all([project_id, user_id, file_name, sheet_name, file_type, action]):
             return Response({"error": "Missing required parameters"}, status=400)
 
-        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user_id}/project_{project_id}")
+        # Check project access (including shared projects)
+        has_access, share_object, permission_level = check_project_access(
+            user_id, project_id, file_type, file_name, sheet_name
+        )
+        
+        if not has_access:
+            return Response({"error": "Access denied to this project or file"}, status=403)
+
+        # Get the project owner's user ID for the correct folder path
+        try:
+            project = Projects.objects.get(id=project_id)
+            project_owner_id = project.user.id
+        except Projects.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+        # Use project owner's folder for git operations
+        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project_owner_id}/project_{project_id}")
         sheet_path = os.path.join(project_folder, file_type, file_name, f"{sheet_name}")
 
         sheet_path=os.path.normpath(sheet_path)
@@ -2100,7 +2360,6 @@ class UndoRedoSheet(APIView):
             df_restored = df_restored.replace([float("inf"), -float("inf")], None)
             df_restored = df_restored.fillna("NA")
             try:
-                project = Projects.objects.get(id=project_id)
                 self.commit_to_git(
                     project_folder,
                     project.user,
@@ -2114,10 +2373,9 @@ class UndoRedoSheet(APIView):
                 print(f"Failed to create commit: {str(e)}")
 
             # Log the event
-            logging_user = get_logging_user(request, user_id)
-            if logging_user:
-                ip = request.META.get('REMOTE_ADDR')
-                log_user_action(logging_user, "undo_redo_sheet", details=f"{action.capitalize()} sheet successful", ip_address=ip)
+            user = get_logging_user(request, User.objects.get(id=user_id))
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "undo_redo_sheet", details=f"{action.capitalize()} sheet successful for project {project_id}, file: {file_name}, sheet: {sheet_name}", ip_address=ip)
 
             return Response({
                 "message": f"{action.capitalize()} successful",
@@ -2541,8 +2799,31 @@ class SheetCommitGraph(APIView):
         sheet_name = request.data.get("sheet_name")
         file_type = request.data.get("file_type")
 
-        file_name = file_name.split("\\")[-1]
-        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user_id}/project_{project_id}")
+        # Sanitize file_name to remove invalid characters and spaces
+        file_name = file_name.split("\\")[-1] if "\\" in file_name else file_name
+        # Remove leading/trailing spaces and replace spaces with underscores
+        file_name = file_name.strip().replace(" ", "_")
+
+        if not all([project_id, user_id, file_name, sheet_name, file_type]):
+            return Response({"error": "Missing required parameters"}, status=400)
+
+        # Check project access (including shared projects)
+        has_access, share_object, permission_level = check_project_access(
+            user_id, project_id, file_type, file_name, sheet_name
+        )
+        
+        if not has_access:
+            return Response({"error": "Access denied to this project or file"}, status=403)
+
+        # Get the project owner's user ID for the correct folder path
+        try:
+            project = Projects.objects.get(id=project_id)
+            project_owner_id = project.user.id
+        except Projects.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+        # Use project owner's folder for git operations
+        project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project_owner_id}/project_{project_id}")
         sheet_path = os.path.join(project_folder, file_type, file_name, f"{sheet_name}")
         sheet_path = os.path.normpath(sheet_path)
 
@@ -2578,6 +2859,11 @@ class SheetCommitGraph(APIView):
             for parent in c["parents"]:
                 if parent in hash_to_commit:
                     hash_to_commit[parent]["children"].append(c["hash"])
+
+        # Log the event
+        user = get_logging_user(request, User.objects.get(id=user_id))
+        ip = request.META.get('REMOTE_ADDR')
+        log_user_action(user, "sheet_commit_graph", details=f"Retrieved commit graph for project {project_id}, file: {file_name}, sheet: {sheet_name}", ip_address=ip)
 
         return Response({"commits": commits})
 
@@ -4470,7 +4756,7 @@ class ConcatenateProjectSheets(APIView):
                 csv_filename = f"concatenated_{timestamp}.csv"
             
             csv_path = os.path.join(concatenated_folder, csv_filename)
-            final_df.to_csv(csv_path, index=False)
+            final_df.to_csv(csv_path, index=False, encoding='utf-8')
 
             # Prepare sheet data for response
             sheets_data = {
@@ -6006,6 +6292,80 @@ def get_logging_user(request, fallback_user=None):
         except Exception:
             return None
     return None
+
+class GetUserEmails(APIView):
+    def get(self, request):
+        try:
+            # Get all users and extract their email IDs
+            users = User.objects.all()
+            email_list = list(users.values_list('email', flat=True))
+            
+            return Response({
+                'success': True,
+                'emails': email_list,
+                'count': len(email_list)
+            }, status=200)
+        except Exception as e:
+            return Response({
+                'success': False,
+                'error': str(e)
+            }, status=500)
+
+
+class SparkSessionMonitor(APIView):
+    """
+    API endpoint to monitor and manage Spark sessions.
+    Useful for debugging and monitoring Spark session health.
+    """
+    
+    def get(self, request):
+        """Get information about current Spark sessions."""
+        try:
+            from .spark_utils import get_spark_session_info
+            session_info = get_spark_session_info()
+            return Response(session_info, status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+    
+    def post(self, request):
+        """Test Spark session creation and validation."""
+        try:
+            from .spark_utils import get_spark_session, validate_spark_session, stop_all_spark_sessions
+            
+            action = request.data.get('action', 'test')
+            
+            if action == 'test':
+                # Test session creation and validation
+                spark = get_spark_session()
+                is_valid = validate_spark_session(spark)
+                
+                return Response({
+                    'status': 'success',
+                    'session_created': True,
+                    'session_valid': is_valid,
+                    'spark_version': spark.version,
+                    'message': 'Spark session test completed successfully'
+                }, status=200)
+            
+            elif action == 'cleanup':
+                # Stop all sessions
+                stop_all_spark_sessions()
+                
+                return Response({
+                    'status': 'success',
+                    'message': 'All Spark sessions stopped successfully'
+                }, status=200)
+            
+            else:
+                return Response({
+                    'error': 'Invalid action. Use "test" or "cleanup"'
+                }, status=400)
+                
+        except Exception as e:
+            return Response({
+                'error': str(e),
+                'status': 'failed'
+            }, status=500)
 
 
 

@@ -54,6 +54,8 @@ urlpatterns = [
     path('concatenate-project-sheets/', views.ConcatenateProjectSheets.as_view(), name='concatenate_project_sheets'),
     path('get-project-files/', views.GetProjectFiles.as_view(), name='get_project_files'),
     path('sheets/', views.GetSheets.as_view(), name='get_sheets'),
+    path('users/emails/', views.GetUserEmails.as_view(), name='get_user_emails'),
+    path('spark-monitor/', views.SparkSessionMonitor.as_view(), name='spark_monitor'),
     
     # Project Sharing URLs
     path('share-project/', views.ShareProject.as_view(), name='share_project'),

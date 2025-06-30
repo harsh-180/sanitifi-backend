@@ -311,3 +311,5 @@ ERROR 2025-04-07 16:51:09,050 basehttp "POST /api/auth/signup/ HTTP/1.1" 500 84
 INFO 2025-04-07 16:52:33,394 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\models.py changed, reloading.
 INFO 2025-04-07 16:52:36,357 autoreload Watching for file changes with StatReloader
 INFO 2025-04-07 16:56:43,791 autoreload C:\Users\ritik\Desktop\Dashboard-backend\api\views.py changed, reloading.
+INFO 2025-06-30 11:12:47,512 autoreload 20908 12756 Watching for file changes with StatReloader
+INFO 2025-06-30 11:14:16,657 autoreload 20908 12756 C:\Users\harsh\Documents\skewb\dashboard\Dashboard-backend\dashboard\settings.py changed, reloading.
