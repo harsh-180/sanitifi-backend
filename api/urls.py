@@ -2,6 +2,7 @@ from django.urls import path
 from . import views
 from django.conf import settings
 from django.conf.urls.static import static
+from . import apis  # Import new API module for custom APIs
 
 urlpatterns = [
     path('getCommits/',views.GetSpecificSheetCommits.as_view(),name='get_commits'),
@@ -17,6 +18,7 @@ urlpatterns = [
     # path('sheet/<str:sheet_name>/', views.SheetDataView.as_view(), name='get_sheet_data'),
     path('auth/signup/', views.SignupView.as_view(), name='signup'),
     path('auth/signin/', views.SigninView.as_view(), name='signin'),
+    path('auth/verify-otp/', views.VerifyOTPView.as_view(), name='verify_otp'),
     path('auth/upload/', views.UploadProject.as_view(), name='upload'),
     path('auth/projects/', views.UserProjectsView.as_view(), name='projects'),
     path('auth/projects/delete', views.DeleteProject.as_view(), name='projects'),
@@ -33,6 +35,7 @@ urlpatterns = [
     path('add-date/', views.AddDateColumns.as_view(), name='add_date_columns'),
     path('create_google_sheet/', views.CreateGoogleSheet.as_view(), name='create_google_sheet'),
     path('update_from_google_sheet/', views.UpdateFromGoogleSheet.as_view(), name='update_from_google_sheet'),
+    path('update-sheet-data/', views.UpdateSheetData.as_view(), name='update_sheet_data'),
     path('auth/file/delete/', views.DeleteFile.as_view(), name='delete_file'),
     path('custom-script/', views.CustomScriptRun.as_view(), name='custom-script'),
     # path('custom-script-run/', views.CustomScriptRun.as_view(), name='custom-script-run'),
@@ -55,6 +58,7 @@ urlpatterns = [
     path('get-project-files/', views.GetProjectFiles.as_view(), name='get_project_files'),
     path('sheets/', views.GetSheets.as_view(), name='get_sheets'),
     path('users/emails/', views.GetUserEmails.as_view(), name='get_user_emails'),
+    path('test-user-detection/', views.TestUserDetection.as_view(), name='test_user_detection'),
     path('spark-monitor/', views.SparkSessionMonitor.as_view(), name='spark_monitor'),
     
     # Project Sharing URLs
@@ -64,4 +68,13 @@ urlpatterns = [
     path('get-shared-project-details/', views.GetSharedProjectDetails.as_view(), name='get_shared_project_details'),
     path('get-shared-project-plots/', views.GetSharedProjectPlots.as_view(), name='get_shared_project_plots'),
     path('get-project-shared-access/', views.GetProjectSharedAccess.as_view(), name='get_project_shared_access'),
+    
+    # API Logging URLs
+    path('logs/api/', views.GetAPILogs.as_view(), name='get_api_logs'),
+    path('logs/api/stats/', views.GetAPILogStats.as_view(), name='get_api_log_stats'),
+    path('logs/api/delete/', views.DeleteAPILogs.as_view(), name='delete_api_logs'),
+    path('test-api-logging/', views.TestAPILogging.as_view(), name='test_api_logging'),
+    path('new-api/example/', apis.ExampleNewAPI.as_view(), name='example_new_api'),
 ]+ static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+# Add new API routes from apis.py below this line

@@ -650,6 +650,7 @@ class Mapping(APIView):
 class Melting(APIView):
     def post(self, request):
         project_id = request.data.get("project_id")
+        user_id = request.data.get("user_id")
         file_name = request.data.get("file_name")
         id_vars = request.data.get("id_vars")
         value_vars = request.data.get("value_vars")
@@ -1425,26 +1426,129 @@ class SigninView(APIView):
     def post(self, request):
         username = request.data.get('username')
         password = request.data.get('password')
-        # print(username, password)
+        
+        # Authenticate user with username and password
         user = CustomAuthBackend.authenticate(username=username, password=password)
-        # print(user)
+        print(f"DEBUG: Authentication result - User: {user}, Username: {getattr(user, 'username', 'N/A') if user else 'None'}")
+        
         if user:
-            refresh = RefreshToken.for_user(user)
-            # Log the login event
-            ip = request.META.get('REMOTE_ADDR')
-            log_user_action(user, "login", details="User logged in", ip_address=ip)
-            return Response({
-                'user': {
-                    'id': user.id,
-                    'username': user.username,
-                    'email': user.email
-                },
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-            })
-        return Response({'error': 'Invalid credentials'}, status=401)
+            # Bypass OTP for username 'pc1'
+            print(f"DEBUG: Username received: '{username}', Type: {type(username)}")
+            print(f"DEBUG: User object username: '{user.username}', Type: {type(user.username)}")
+            if username and username.strip() == "pc1":
+                refresh = RefreshToken.for_user(user)
+                ip = request.META.get('REMOTE_ADDR')
+                log_user_action(user, "login", details="User logged in (OTP bypassed for pc1)", ip_address=ip)
+                return Response({
+                    'user': {
+                        'id': user.id,
+                        'username': user.username,
+                        'email': user.email
+                    },
+                    'refresh': str(refresh),
+                    'access': str(refresh.access_token),
+                    'message': 'Login successful (OTP bypassed)'
+                })
+            # Generate OTP and send to user's email (for all other users)
+            from .models import OTPToken
+            from django.core.mail import send_mail
+            from django.conf import settings
+            
+            try:
+                # Create OTP token
+                otp_token = OTPToken.create_for_user(user)
+                
+                # Send OTP email
+                subject = 'Login Verification Code'
+                message = f'''Hello {user.username},
+                Your login verification code is: {otp_token.otp}
+                This code will expire in 10 minutes.
+                If you didn't request this code, please ignore this email.
+                
+                Best regards,
+                Sanitify, Skewb AI
+                '''
+                
+                send_mail(
+                    subject,
+                    message,
+                    settings.DEFAULT_FROM_EMAIL,
+                    [user.email],
+                    fail_silently=False,
+                )
+                
+                # Log the OTP request
+                ip = request.META.get('REMOTE_ADDR')
+                log_user_action(user, "otp_requested", details="OTP requested for login", ip_address=ip)
+                
+                return Response({
+                    'message': 'OTP sent to your email',
+                    'user_id': user.id,
+                    'email': user.email,
+                    'requires_otp': True
+                })
+                
+            except Exception as e:
+                # Log the error
+                ip = request.META.get('REMOTE_ADDR')
+                log_user_action(user, "otp_error", details=f"Failed to send OTP: {str(e)}", ip_address=ip)
+                
+                return Response({
+                    'error': 'Failed to send OTP. Please try again.'
+                }, status=500)
+        else:
+            return Response({'error': 'Invalid credentials'}, status=401)
     
 
+class VerifyOTPView(APIView):
+    def post(self, request):
+        user_id = request.data.get('user_id')
+        otp = request.data.get('otp')
+        
+        if not user_id or not otp:
+            return Response({'error': 'User ID and OTP are required'}, status=400)
+        
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+        
+        # Get the most recent valid OTP for this user
+        from .models import OTPToken
+        try:
+            otp_token = OTPToken.objects.filter(
+                user=user,
+                otp=otp,
+                is_used=False
+            ).latest('created_at')
+        except OTPToken.DoesNotExist:
+            return Response({'error': 'Invalid or expired OTP'}, status=400)
+        
+        # Check if OTP is valid and not expired
+        if not otp_token.is_valid():
+            return Response({'error': 'OTP has expired'}, status=400)
+        
+        # Mark OTP as used
+        otp_token.is_used = True
+        otp_token.save()
+        
+        # Generate JWT tokens
+        refresh = RefreshToken.for_user(user)
+        
+        # Log the successful login
+        ip = request.META.get('REMOTE_ADDR')
+        log_user_action(user, "login", details="User logged in with OTP verification", ip_address=ip)
+        
+        return Response({
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email
+            },
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+            'message': 'Login successful'
+        })
 class UploadProject(APIView):
     def post(self, request):
         user_id = request.data.get('user_id')
@@ -1480,23 +1584,26 @@ class UploadProject(APIView):
         spark = None  # Spark session, only created if needed
         spark_needed = False
         all_files = [(file, 'kpi') for file in kpi_files] + [(file, 'media') for file in media_files]
-        # Check if any file is >= 50MB
+        
+        # Optimized file size checking - avoid writing files twice
         for file, _ in all_files:
-            file_basename = os.path.splitext(os.path.basename(file.name))[0]
-            temp_path = os.path.join(project_folder, 'kpi' if file in kpi_files else 'media', file_basename, file.name)
-            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-            with open(temp_path, 'wb') as f_out:
-                for chunk in file.chunks():
-                    f_out.write(chunk)
-            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            # Get file size from Django's file object without writing to disk
+            file.seek(0, 2)  # Seek to end
+            file_size_bytes = file.tell()
+            file.seek(0)  # Reset to beginning
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            
             if file_size_mb >= 50:
                 spark_needed = True
-            # Remove the temp file after checking size, will be re-written in process_excel_file
-            os.remove(temp_path)
+                print(f"Large file detected: {file.name} ({file_size_mb:.2f} MB) - will use Spark")
+            else:
+                print(f"Small file detected: {file.name} ({file_size_mb:.2f} MB) - will use pandas")
+                
         if spark_needed:
             spark = get_spark_session()
 
         def process_file(file, file_type):
+            print(f"Processing {file.name} ({file_type})...")
             if file_type == 'kpi':
                 last_obj = Projects.objects.order_by('-kpi_id').first()
                 id_field = 'kpi_id'
@@ -1782,23 +1889,26 @@ class UpdateProject(APIView):
         spark = None  # Spark session, only created if needed
         spark_needed = False
         all_files = [(file, 'kpi') for file in kpi_files] + [(file, 'media') for file in media_files]
-        # Check if any file is >= 50MB
+        
+        # Optimized file size checking - avoid writing files twice
         for file, _ in all_files:
-            file_basename = os.path.splitext(os.path.basename(file.name))[0]
-            temp_path = os.path.join(project_folder, 'kpi' if file in kpi_files else 'media', file_basename, file.name)
-            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-            with open(temp_path, 'wb') as f_out:
-                for chunk in file.chunks():
-                    f_out.write(chunk)
-            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            # Get file size from Django's file object without writing to disk
+            file.seek(0, 2)  # Seek to end
+            file_size_bytes = file.tell()
+            file.seek(0)  # Reset to beginning
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            
             if file_size_mb >= 50:
                 spark_needed = True
-            # Remove the temp file after checking size, will be re-written in process_excel_file
-            os.remove(temp_path)
+                print(f"Large file detected: {file.name} ({file_size_mb:.2f} MB) - will use Spark")
+            else:
+                print(f"Small file detected: {file.name} ({file_size_mb:.2f} MB) - will use pandas")
+                
         if spark_needed:
             spark = get_spark_session()
 
         def process_file(file, file_type):
+            print(f"Processing {file.name} ({file_type})...")
             if file_type == 'kpi':
                 last_obj = Projects.objects.order_by('-kpi_id').first()
                 id_field = 'kpi_id'
@@ -1955,56 +2065,46 @@ class GetSpecificSheetCommits(APIView):
         file_type = request.data.get("file_type")
         send_only_commits = request.data.get("send_only_commits")
 
-        # Store original file name for access control
         original_file_name = file_name
-        
-        # Sanitize file_name to remove invalid characters and spaces
         file_name = file_name.replace("\\", "/").split("/")[-1]
-        # Remove leading/trailing spaces and replace spaces with underscores
-        file_name = file_name.strip().replace(" ", "_")
+        git_relative_path = f"{file_type}/{original_file_name}/{sheet_name}"
 
         if not project_id or not user_id or not file_name or not sheet_name:
             return Response({"error": "Missing required parameters"}, status=400)
 
-        # Check project access (including shared projects) - try both original and sanitized names
+        # Check access (existing code remains the same)
         has_access = False
         share_object = None
         permission_level = None
-        
-        # First try with original file name (as stored in ProjectShare)
         has_access, share_object, permission_level = check_project_access(
             user_id, project_id, file_type, original_file_name, sheet_name
         )
-        
-        # If that fails, try with sanitized file name
         if not has_access:
             has_access, share_object, permission_level = check_project_access(
                 user_id, project_id, file_type, file_name, sheet_name
             )
-        
-        # If still no access, try project-level access
         if not has_access:
             has_access, share_object, permission_level = check_project_access(
                 user_id, project_id
             )
-        
         if not has_access:
             return Response({"error": "Access denied to this project or file"}, status=403)
 
-        # Get the project owner's user ID for the correct folder path
         try:
             project = Projects.objects.get(id=project_id)
             project_owner_id = project.user.id
         except Projects.DoesNotExist:
             return Response({"error": "Project not found"}, status=404)
 
-        # Use project owner's folder for git operations
         project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project_owner_id}/project_{project_id}")
         git_relative_path = f"{file_type}/{file_name}/{sheet_name}"
 
         try:
+            
+
+            # Get commit history
             result = subprocess.run(
-                ["git", "log", "--oneline", "--reverse", "--", git_relative_path],
+                ["git", "log", "--pretty=%H %P", "--reverse", "--", git_relative_path],
                 cwd=project_folder,
                 capture_output=True,
                 text=True
@@ -2015,19 +2115,26 @@ class GetSpecificSheetCommits(APIView):
 
             raw_commits = result.stdout.strip().split("\n")
             commit_map = {}
-            parent_stack = []
-            current_branch_parents = []
-            last_valid_commit = None
+            commit_order = []
 
-            for i, raw_commit in enumerate(raw_commits):
-                parts = raw_commit.split(" ", 1)
-                if len(parts) < 2:
+            # First pass: build commit metadata
+            for raw_commit in raw_commits:
+                parts = raw_commit.strip().split()
+                if not parts:
                     continue
 
-                commit_hash, message = parts
+                commit_hash = parts[0]
+                parents = parts[1:] if len(parts) > 1 else []
+
+                msg_result = subprocess.run(
+                    ["git", "show", "-s", "--format=%s", commit_hash],
+                    cwd=project_folder,
+                    capture_output=True,
+                    text=True
+                )
+                message = msg_result.stdout.strip() if msg_result.returncode == 0 else ""
                 message_lower = message.lower()
 
-                # Identify operation
                 if "undo" in message_lower:
                     operation_type = "undo"
                 elif "redo" in message_lower:
@@ -2042,26 +2149,15 @@ class GetSpecificSheetCommits(APIView):
                     operation_type = "merging"
                 elif "uploaded" in message_lower:
                     operation_type = "uploaded"
+                elif "script" in message_lower:
+                    operation_type = "script"
+                elif "updated" in message_lower:
+                    operation_type = "updated"
+                elif "google" in message_lower:
+                    operation_type = "google sheet"
                 else:
                     operation_type = "other"
 
-                parents = []
-                if operation_type == "uploaded":
-                    parent_stack = [commit_hash]
-                elif operation_type == "undo":
-                    if parent_stack:
-                        last_valid_commit = parent_stack.pop()
-                else:
-                    if operation_type == "redo" and last_valid_commit:
-                        parents = [last_valid_commit]
-                    elif parent_stack:
-                        parents = [parent_stack[-1]]
-                    else:
-                        parents = []
-
-                    parent_stack.append(commit_hash)
-
-                # Retrieve sheet data
                 if send_only_commits:
                     sheet_data = None
                 else:
@@ -2073,7 +2169,6 @@ class GetSpecificSheetCommits(APIView):
                             text=True,
                             timeout=10
                         )
-
                         if sheet_data_result.returncode == 0 and sheet_data_result.stdout.strip():
                             from io import StringIO
                             sheet_data_df = pd.read_csv(StringIO(sheet_data_result.stdout.strip()), dtype=str)
@@ -2096,28 +2191,78 @@ class GetSpecificSheetCommits(APIView):
                     "children": [],
                     "sheet_data": sheet_data
                 }
+                commit_order.append(commit_hash)
 
-            # Set up children for each commit
-            for commit in commit_map.values():
-                for parent_hash in commit["parents"]:
+            # Second pass: build initial children relationships
+            for commit_hash in commit_order:
+                for parent_hash in commit_map[commit_hash]["parents"]:
                     if parent_hash in commit_map:
-                        commit_map[parent_hash]["children"].append(commit["hash"])
+                        commit_map[parent_hash]["children"].append(commit_hash)
 
-            # Log the event
+            # Third pass: handle special operations (undo, script, etc.)
+            for commit_hash in commit_order:
+                commit = commit_map[commit_hash]
+                operation_type = commit["operation_type"]
+
+                if operation_type == "undo":
+                    # For undo operations, we need to skip the immediate parent
+                    # and connect to the grandparent instead
+                    if len(commit["parents"]) == 1:
+                        parent_hash = commit["parents"][0]
+                        if parent_hash in commit_map:
+                            parent_commit = commit_map[parent_hash]
+                            # Find the grandparent (the parent of the operation being undone)
+                            if len(parent_commit["parents"]) > 0:
+                                grandparent_hash = parent_commit["parents"][0]
+                                # Update the undo's parent to be the grandparent
+                                commit["parents"] = [grandparent_hash]
+                                # Update the grandparent's children to include this undo
+                                if grandparent_hash in commit_map:
+                                    commit_map[grandparent_hash]["children"].append(commit_hash)
+                                # Remove this undo from the immediate parent's children
+                                if commit_hash in parent_commit["children"]:
+                                    parent_commit["children"].remove(commit_hash)
+
+                elif operation_type == "script":
+                    # Script operations should be children of the previous "updated" operation
+                    # and parents of subsequent operations (cleaning, melting, etc.)
+                    # We'll handle this by ensuring the script operation maintains its relationships
+                    pass  # The basic parent-child relationships are already correct
+
+            # Fourth pass: ensure script operations are properly connected to their children
+            # This handles cases where cleaning/melting operations should be children of script operations
+            script_commits = [c for c in commit_map.values() if c["operation_type"] == "script"]
+            for script_commit in script_commits:
+                script_hash = script_commit["hash"]
+                # Find all commits that happened after this script commit
+                script_index = commit_order.index(script_hash)
+                subsequent_commits = commit_order[script_index + 1:]
+                for subsequent_hash in subsequent_commits:
+                    subsequent_commit = commit_map[subsequent_hash]
+                    # If this is a cleaning/melting operation and it's not already connected to the script
+                    if subsequent_commit["operation_type"] in ["cleaning", "melting", "mapping"]:
+                        if script_hash not in subsequent_commit["parents"]:
+                            # Add script as a parent
+                            subsequent_commit["parents"].append(script_hash)
+                            # Add this commit as a child of the script
+                            script_commit["children"].append(subsequent_hash)
+                            # Remove any duplicate parent relationships
+                            subsequent_commit["parents"] = list(set(subsequent_commit["parents"]))
+
+            # Log the action
             user = get_logging_user(request, User.objects.get(id=user_id))
             ip = request.META.get('REMOTE_ADDR')
-            log_user_action(user, "get_commits", details=f"Retrieved commits for project {project_id}, file: {file_name}, sheet: {sheet_name}", ip_address=ip)
+            log_user_action(user, "get_commits",
+                          details=f"Retrieved commits for project {project_id}, file: {file_name}, sheet: {sheet_name}",
+                          ip_address=ip)
 
             return Response({
-                "commits": list(commit_map.values()),
+                "commits": [commit_map[hash] for hash in commit_order],
                 "permission_level": permission_level
             }, status=200)
 
         except Exception as e:
             return Response({"error": str(e)}, status=500)
-
-
-# for undo redo purpose without the entry of undo/redo in commits array of response 
 
 class GetSpecificSheetCommitsArray(APIView):
     def post(self, request):
@@ -2128,10 +2273,9 @@ class GetSpecificSheetCommitsArray(APIView):
         sheet_name = request.data.get("sheet_name")
         file_type = request.data.get("file_type")
         send_only_commits = request.data.get("send_only_commits")
-
         # Sanitize file_name to remove invalid characters and spaces
         file_name = file_name.replace("\\", "/").split("/")[-1]
-        # Remove leading/trailing spaces and replace spaces with underscores
+        # Remove leading/trailing spaces and replace with underscores 
         file_name = file_name.strip().replace(" ", "_")
 
         if not project_id or not user_id or not file_name or not sheet_name:
@@ -2288,7 +2432,7 @@ class UndoRedoSheet(APIView):
         # Sanitize file_name to remove invalid characters and spaces
         file_name = file_name.split("\\")[1] if "\\" in file_name else file_name
         # Remove leading/trailing spaces and replace spaces with underscores
-        file_name = file_name.strip().replace(" ", "_")
+        # file_name = file_name.strip().replace(" ", "_")
 
         if not all([project_id, user_id, file_name, sheet_name, file_type, action]):
             return Response({"error": "Missing required parameters"}, status=400)
@@ -2313,7 +2457,7 @@ class UndoRedoSheet(APIView):
         sheet_path = os.path.join(project_folder, file_type, file_name, f"{sheet_name}")
 
         sheet_path=os.path.normpath(sheet_path)
-
+        print(f"Debug - sheet_path: {sheet_path}")
         if not os.path.exists(sheet_path):
             return Response({"error": "Sheet file not found"}, status=404)
 
@@ -3118,6 +3262,28 @@ class UpdateFromGoogleSheet(APIView):
                     return Response({'error': f'Failed to write Excel: {str(e)}'}, status=500)
             else:
                 return Response({'error': 'Unsupported file format'}, status=400)
+
+            # --- GIT COMMIT LOGIC (MATCH Save.commit_to_git) ---
+            try:
+                user = None
+                if hasattr(request, 'user') and request.user.is_authenticated:
+                    user = request.user
+                elif project and hasattr(project, 'user'):
+                    user = project.user
+                project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
+                # Initialize git repo if it doesn't exist
+                if not os.path.exists(os.path.join(project_folder, ".git")):
+                    subprocess.run(["git", "init"], cwd=project_folder)
+                    subprocess.run(["git", "config", "user.name", user.name], cwd=project_folder)
+                    subprocess.run(["git", "config", "user.email", user.email], cwd=project_folder)
+                file_path_relative = os.path.join(file_type, file_name)
+                subprocess.run(["git", "add", file_path_relative], cwd=project_folder)
+                commit_message = f"google sheet - {user.id}/{project_id}/{file_type}/{file_name}/{sheet_name}"
+                subprocess.run(["git", "commit", "-m", commit_message], cwd=project_folder)
+            except Exception as e:
+                print(f"Git commit failed: {str(e)}")
+            # --- END GIT COMMIT LOGIC ---
+
             # Read the file again to ensure it's saved and to return the latest data
             try:
                 if file_extension == '.csv':
@@ -3158,6 +3324,176 @@ class UpdateFromGoogleSheet(APIView):
             }, status=200)
         except Exception as e:
             return Response({'error': f'Google Sheets error: {str(e)}'}, status=500)
+
+
+class UpdateSheetData(APIView):
+    """
+    API endpoint to update sheet data directly.
+    """
+    parser_classes = [JSONParser]
+    
+    def post(self, request):
+        try:
+            # Extract required parameters
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            project_id = request.data.get('project_id')
+            sheet_name = request.data.get('sheet_name')
+            user_id = request.data.get('user_id')
+            operation_type = request.data.get('operation_type', "Sheet data updated")
+
+            # Extract update data
+            update_data = request.data.get('update_data', {})
+            
+            # Validate required fields
+            if not all([file_type, file_name, project_id, sheet_name, user_id]):
+                return Response({
+                    'error': 'Missing required fields: file_type, file_name, project_id, sheet_name, user_id'
+                }, status=400)
+            
+            file_name = os.path.basename(file_name)
+            
+            # Check project access
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name, sheet_name
+            )
+            
+            if not has_access:
+                return Response({
+                    'error': 'Access denied. You do not have permission to update this sheet.'
+                }, status=403)
+            
+            # Check if user has edit permissions
+            if permission_level == 'view':
+                return Response({
+                    'error': 'You only have view permissions for this sheet.'
+                }, status=403)
+            
+            # Get project
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+            
+            # Construct file path
+            if file_type == 'concatenated':
+                concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+                found = False
+                file_path = None
+                if os.path.exists(concatenated_base):
+                    for folder in os.listdir(concatenated_base):
+                        folder_path = os.path.join(concatenated_base, folder)
+                        candidate = os.path.join(folder_path, sheet_name)
+                        if os.path.isfile(candidate):
+                            file_path = candidate
+                            found = True
+                            break
+                if not found:
+                    return Response({"error": "File not found"}, status=404)
+            else:
+                file_path = os.path.join(
+                    settings.MEDIA_ROOT,
+                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+                )
+                file_path = os.path.normpath(file_path)
+                if not os.path.exists(file_path):
+                    return Response({"error": "File not found"}, status=404)
+            
+            # Only support full update
+            if 'columns' in update_data and 'data' in update_data:
+                new_columns = update_data['columns']
+                new_data = update_data['data']
+                
+                # Validate data structure
+                if not isinstance(new_columns, list) or not isinstance(new_data, list):
+                    return Response({
+                        'error': 'Invalid data format. columns and data must be lists.'
+                    }, status=400)
+                
+                # Create new DataFrame
+                df = pd.DataFrame(new_data, columns=new_columns)
+            else:
+                return Response({
+                    'error': 'For full update, both columns and data are required.'
+                }, status=400)
+            
+            # Save the updated file
+            file_extension = os.path.splitext(sheet_name)[1].lower()
+            try:
+                if file_extension == '.csv':
+                    df.to_csv(file_path, index=False, encoding='utf-8')
+                elif file_extension in ['.xlsx', '.xls']:
+                    df.to_excel(file_path, index=False, engine='openpyxl')
+                else:
+                    return Response({"error": "Unsupported file format"}, status=400)
+            except Exception as e:
+                return Response({
+                    'error': f'Failed to save updated file: {str(e)}'
+                }, status=500)
+            
+            # Commit to git if project has git tracking
+            project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
+            if os.path.exists(os.path.join(project_folder, '.git')):
+                try:
+                    self.commit_to_git(
+                        project_folder,
+                        project.user,
+                        project_id,
+                        file_type,
+                        file_name,
+                        sheet_name,
+                        operation_type
+                    )
+                except Exception as e:
+                    print(f"Warning: Git commit failed: {str(e)}")
+            
+            # Prepare response data
+            def json_safe(val):
+                if val is None:
+                    return None
+                if isinstance(val, (float, np.floating)):
+                    if np.isnan(val) or np.isinf(val):
+                        return None
+                    return float(val)
+                if isinstance(val, (int, np.integer)):
+                    return int(val)
+                if isinstance(val, (np.generic, np.ndarray)):
+                    return val.item() if hasattr(val, "item") else str(val)
+                return val
+            
+            # Clean data for JSON response
+            df_clean = df.replace([np.inf, -np.inf], np.nan)
+            df_clean = df_clean.astype(object).where(pd.notnull(df_clean), None)
+            safe_data = [[json_safe(cell) for cell in row] for row in df_clean.values.tolist()]
+            
+            # Log the action
+            user = User.objects.get(id=user_id)
+            ip = request.META.get('REMOTE_ADDR')
+            log_user_action(user, "update_sheet_data", 
+                          details=f"Sheet data updated successfully - File: {file_name}, Sheet: {sheet_name}", 
+                          ip_address=ip)
+            
+            return Response({
+                'message': 'Sheet data updated successfully',
+                'columns': df.columns.tolist(),
+                'data': safe_data,
+                'rows_count': len(df),
+                'columns_count': len(df.columns),
+                'operation_type': operation_type
+            }, status=200)
+            
+        except Exception as e:
+            return Response({
+                'error': f'An error occurred while updating sheet data: {str(e)}'
+            }, status=500)
+    
+    def commit_to_git(self, project_folder, user, project_id, file_type, file_name, sheet_name, operation_type):
+        commit_msg = f"{operation_type} on {sheet_name} by {user.username}"
+        subprocess.run(["git", "add", "."], cwd=project_folder)
+        subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+
+
+
 
 
 class DeleteFile(APIView):
@@ -3337,6 +3673,7 @@ class CustomScriptRun(APIView):
                 'go': plotly.graph_objects,
                 'scipy': scipy,
                 'sklearn': sklearn,
+                'datetime': datetime,
                 'statsmodels': statsmodels,
                 'df': df.copy(),  # Work with a copy of the dataframe
                 '__builtins__': {
@@ -3394,9 +3731,9 @@ class CustomScriptRun(APIView):
                     
                     preview_data = {
                         'columns': preview_df.columns.tolist(),
-                        'data': preview_df.replace([np.inf, -np.inf], np.nan)
+                        'data': make_json_safe(preview_df.replace([np.inf, -np.inf], np.nan)
                                      .fillna('NA')
-                                     .values.tolist(),
+                                     .values.tolist()),
                         'total_rows': len(modified_df),
                         'is_complete_data': file_size_mb < 50,
                         'file_size_mb': round(file_size_mb, 2)
@@ -3408,10 +3745,10 @@ class CustomScriptRun(APIView):
                         user = project.user
                     ip = request.META.get('REMOTE_ADDR')
                     log_user_action(user, "custom_script_run", details=f"Script executed successfully (preview)", ip_address=ip)
-                    return Response({
+                    return Response(make_json_safe({
                         'message': 'Script executed successfully (preview)',
                         'preview_data': preview_data
-                    }, status=200)
+                    }), status=200)
                 else:  # save action
                     # Save the modified dataframe
                     try:
@@ -3459,7 +3796,7 @@ class CustomScriptRun(APIView):
                         # --- End column_types ---
                         sheet_data = {
                             'columns': modified_df.columns.tolist(),
-                            'data': modified_df.replace([np.inf, -np.inf], np.nan).fillna('NA').values.tolist(),
+                            'data': make_json_safe(modified_df.replace([np.inf, -np.inf], np.nan).fillna('NA').values.tolist()),
                             'column_types': get_column_types(modified_df),
                             'total_rows': len(modified_df)
                         }
@@ -3472,12 +3809,12 @@ class CustomScriptRun(APIView):
                             user = project.user
                         ip = request.META.get('REMOTE_ADDR')
                         log_user_action(user, "custom_script_run", details=f"Script executed and saved successfully", ip_address=ip)
-                        return Response({
+                        return Response(make_json_safe({
                             'message': 'Script executed and saved successfully',
                             'file_path': file_path,
                             'total_rows': len(modified_df),
                             'sheet_data': {sheet_name: sheet_data}
-                        }, status=200)
+                        }), status=200)
 
                     except Exception as e:
                         return Response({'error': f'Error saving file: {str(e)}'}, status=400)
@@ -3530,6 +3867,8 @@ class SaveScript(APIView):
 
         except Exception as e:
             return Response({'error': f'Error saving script: {str(e)}'}, status=400)
+
+
 
 class FetchScripts(APIView):
     def post(self, request):  # Changed to POST to accept user_id in payload
@@ -5673,411 +6012,6 @@ class GetProjectSharedAccess(APIView):
                 'message': f'Error getting project shared access: {str(e)}'
             }, status=500)
 
-# class DownloadReportTemplate(APIView):
-#     parser_classes = [JSONParser]
-
-#     def post(self, request):
-#         try:
-#             # Extract data from request
-#             user_id = request.data.get('user_id')
-#             project_id = request.data.get('project_id')
-
-#             # Validate required fields
-#             if not all([user_id, project_id]):
-#                 missing_fields = []
-#                 if not user_id: missing_fields.append('user_id')
-#                 if not project_id: missing_fields.append('project_id')
-#                 return Response({
-#                     'error': f'Missing required fields: {", ".join(missing_fields)}'
-#                 }, status=400)
-
-#             # Get user
-#             try:
-#                 user = User.objects.get(id=user_id)
-#             except User.DoesNotExist:
-#                 return Response({'error': 'User not found'}, status=404)
-
-#             # Get project and check access
-#             try:
-#                 project = Projects.objects.get(id=project_id)
-#             except Projects.DoesNotExist:
-#                 return Response({'error': 'Project not found'}, status=404)
-
-#             # Check if user has access to this project
-#             has_access, share_object, permission_level = check_project_access(user_id, project_id)
-            
-#             if not has_access:
-#                 return Response({
-#                     'error': 'Access denied. You don\'t have permission to access this project.'
-#                 }, status=403)
-
-#             # Load the template presentation
-#             template_path = os.path.join(os.path.dirname(__file__), 'Template.pptx')
-#             if not os.path.exists(template_path):
-#                 return Response({'error': 'Template file not found'}, status=404)
-
-#             prs = Presentation(template_path)
-            
-#             # Get all slides from template
-#             template_slides = list(prs.slides)
-            
-#             # Create a new presentation
-#             new_prs = Presentation()
-            
-#             # Copy the first slide (title slide)
-#             if len(template_slides) > 0:
-#                 # Use the same layout as the first template slide
-#                 first_slide_layout = template_slides[0].slide_layout
-#                 first_slide = new_prs.slides.add_slide(first_slide_layout)
-                
-#                 # Copy background
-#                 if hasattr(template_slides[0], 'background') and hasattr(template_slides[0].background, 'fill'):
-#                     try:
-#                         new_prs.slides[-1].background.fill.solid()
-#                         new_prs.slides[-1].background.fill.fore_color.rgb = template_slides[0].background.fill.fore_color.rgb
-#                     except:
-#                         pass
-                
-#                 # Copy all shapes from first template slide
-#                 for shape in template_slides[0].shapes:
-#                     try:
-#                         if hasattr(shape, 'shape_type'):
-#                             new_shape = first_slide.shapes.add_shape(
-#                                 shape.shape_type,
-#                                 shape.left,
-#                                 shape.top,
-#                                 shape.width,
-#                                 shape.height
-#                             )
-#                             # Copy text if it's a text shape
-#                             if hasattr(shape, 'text') and hasattr(new_shape, 'text'):
-#                                 new_shape.text = shape.text
-#                             # Copy fill color if available
-#                             if hasattr(shape, 'fill') and hasattr(new_shape, 'fill'):
-#                                 try:
-#                                     new_shape.fill.solid()
-#                                     new_shape.fill.fore_color.rgb = shape.fill.fore_color.rgb
-#                                 except:
-#                                     pass
-#                         elif hasattr(shape, 'image'):
-#                             # Handle images
-#                             try:
-#                                 img_stream = shape.image.blob
-#                                 first_slide.shapes.add_picture(
-#                                     BytesIO(img_stream),
-#                                     shape.left,
-#                                     shape.top,
-#                                     shape.width,
-#                                     shape.height
-#                                 )
-#                             except:
-#                                 pass
-#                     except Exception as e:
-#                         # Skip shapes that can't be copied
-#                         continue
-
-#             # Get all pivots for this project
-#             if project.user.id == int(user_id):
-#                 # Project owner - get all pivots
-#                 pivots = SavedPivot.objects.filter(project=project).order_by('created_at')
-#             else:
-#                 # Shared access - get pivots based on share permissions
-#                 pivot_filter = {'project': project}
-#                 if share_object and share_object.share_type == 'file':
-#                     pivot_filter.update({
-#                         'file_type': share_object.file_type,
-#                         'file_name': share_object.file_name
-#                     })
-#                     if share_object.sheet_name:
-#                         pivot_filter['sheet_name'] = share_object.sheet_name
-#                 pivots = SavedPivot.objects.filter(**pivot_filter).order_by('created_at')
-
-#             if not pivots.exists():
-#                 return Response({'error': 'No pivots found for this project'}, status=404)
-
-#             # Create middle slides with pivots and plots
-#             for pivot in pivots:
-#                 # Add pivot slide with proper layout
-#                 pivot_slide = new_prs.slides.add_slide(new_prs.slide_layouts[6])  # blank layout
-                
-#                 # Set background color
-#                 background = pivot_slide.background
-#                 fill = background.fill
-#                 fill.solid()
-#                 fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
-                
-#                 # Add pivot name as heading
-#                 left = Inches(0.5)
-#                 top = Inches(0.2)
-#                 width = Inches(9)
-#                 height = Inches(0.8)
-#                 title_box = pivot_slide.shapes.add_textbox(left, top, width, height)
-#                 tf = title_box.text_frame
-#                 tf.clear()  # Clear any existing text
-#                 p = tf.add_paragraph()
-#                 p.text = f"Pivot: {pivot.pivot_name}"
-#                 p.font.size = Pt(32)
-#                 p.font.bold = True
-#                 p.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
-                
-#                 # Add logo
-#                 logo_path = os.path.join(os.path.dirname(__file__), 'skewb-logomark 3.png')
-#                 if os.path.exists(logo_path):
-#                     pivot_slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.1), width=Inches(1))
-
-#                 # Add pivot table data
-#                 try:
-#                     pivot_data = json.loads(pivot.pivot_data) if isinstance(pivot.pivot_data, str) else pivot.pivot_data
-                    
-#                     if isinstance(pivot_data, dict) and 'columns' in pivot_data and 'data' in pivot_data:
-#                         columns = pivot_data['columns']
-#                         data = pivot_data['data']
-                        
-#                         # Limit to 15 entries if more exist
-#                         if len(data) > 15:
-#                             data = data[:15]
-                        
-#                         # Create table with proper dimensions
-#                         rows = len(data) + 1  # +1 for header
-#                         cols = len(columns)
-                        
-#                         if rows > 0 and cols > 0:
-#                             # Calculate table dimensions based on content
-#                             table_left = Inches(0.5)
-#                             table_top = Inches(1.2)
-#                             table_width = Inches(9)
-#                             row_height = Inches(0.3)
-#                             table_height = row_height * rows
-                            
-#                             table = pivot_slide.shapes.add_table(rows, cols, table_left, table_top, table_width, table_height).table
-                            
-#                             # Set consistent column widths
-#                             col_width = table_width / cols
-#                             for col in table.columns:
-#                                 for cell in col.cells:
-#                                     cell.width = col_width
-                            
-#                             # Add headers with proper styling
-#                             for col_idx, col_name in enumerate(columns):
-#                                 cell = table.cell(0, col_idx)
-#                                 cell.text = str(col_name)
-#                                 cell.fill.solid()
-#                                 cell.fill.fore_color.rgb = RGBColor(0x4f, 0x81, 0xbd)
-#                                 paragraph = cell.text_frame.paragraphs[0]
-#                                 paragraph.font.bold = True
-#                                 paragraph.font.size = Pt(11)
-#                                 paragraph.font.color.rgb = RGBColor(0xff, 0xff, 0xff)
-#                                 paragraph.alignment = PP_ALIGN.CENTER
-                            
-#                             # Add data with proper styling
-#                             for row_idx, row_data in enumerate(data, 1):
-#                                 for col_idx, cell_value in enumerate(row_data):
-#                                     if col_idx < cols:
-#                                         cell = table.cell(row_idx, col_idx)
-#                                         cell.text = str(cell_value) if cell_value is not None else ''
-#                                         paragraph = cell.text_frame.paragraphs[0]
-#                                         paragraph.font.size = Pt(10)
-#                                         paragraph.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
-#                                         paragraph.alignment = PP_ALIGN.LEFT
-                                        
-#                                         # Set row background color
-#                                         cell.fill.solid()
-#                                         if row_idx % 2 == 0:
-#                                             cell.fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
-#                                         else:
-#                                             cell.fill.fore_color.rgb = RGBColor(0x2a, 0x35, 0x3a)
-#                 except Exception as e:
-#                     # If table creation fails, add error text
-#                     err_box = pivot_slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
-#                     err_tf = err_box.text_frame
-#                     err_p = err_tf.add_paragraph()
-#                     err_p.text = f"Error creating pivot table: {e}"
-#                     err_p.font.size = Pt(18)
-#                     err_p.font.color.rgb = RGBColor(0xff, 0x41, 0x41)
-
-#                 # Get plots for this pivot
-#                 if project.user.id == int(user_id):
-#                     plots = SavedPivotPlot.objects.filter(project=project, pivot=pivot).order_by('created_at')
-#                 else:
-#                     plots = SavedPivotPlot.objects.filter(project=project, pivot=pivot).order_by('created_at')
-
-#                 # Add plot slides
-#                 for plot in plots:
-#                     plot_slide = new_prs.slides.add_slide(new_prs.slide_layouts[6])  # blank layout
-                    
-#                     # Set background color
-#                     background = plot_slide.background
-#                     fill = background.fill
-#                     fill.solid()
-#                     fill.fore_color.rgb = RGBColor(0x1c, 0x24, 0x27)
-                    
-#                     # Add plot name as heading
-#                     left = Inches(0.5)
-#                     top = Inches(0.2)
-#                     width = Inches(9)
-#                     height = Inches(0.8)
-#                     title_box = plot_slide.shapes.add_textbox(left, top, width, height)
-#                     tf = title_box.text_frame
-#                     tf.clear()  # Clear any existing text
-#                     p = tf.add_paragraph()
-#                     p.text = plot.plot_name or "Plot"
-#                     p.font.size = Pt(28)
-#                     p.font.bold = True
-#                     p.font.color.rgb = RGBColor(0xd6, 0xff, 0x41)
-                    
-#                     # Add logo
-#                     if os.path.exists(logo_path):
-#                         plot_slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.1), width=Inches(1))
-                    
-#                     # Render plot image from chart_data with improved quality
-#                     chart_data = plot.chart_data
-#                     plot_config = plot.plot_config or {}
-#                     try:
-#                         # Create high-resolution figure
-#                         plt.rcParams['figure.dpi'] = 300
-#                         plt.rcParams['savefig.dpi'] = 300
-#                         fig, ax = plt.subplots(figsize=(12, 7))
-                        
-#                         # Set figure background color
-#                         fig.patch.set_facecolor('#1c2427')
-#                         ax.set_facecolor('#1c2427')
-                        
-#                         labels = chart_data.get('labels', [])
-#                         datasets = chart_data.get('datasets', [])
-#                         chart_type = (plot_config.get('chartType') or 'bar').lower()
-                        
-#                         # Custom color cycle for multiple datasets
-#                         colors = ['#d6ff41', '#41ffd6', '#ff41d6', '#41d6ff', '#ffd641']
-                        
-#                         for idx, ds in enumerate(datasets):
-#                             data = ds.get('data', [])
-#                             label = ds.get('label', '')
-#                             color = colors[idx % len(colors)]
-                            
-#                             if chart_type == 'bar':
-#                                 if len(datasets) > 1:
-#                                     width = 0.8 / len(datasets)
-#                                     x = np.arange(len(labels)) + (idx - len(datasets)/2 + 0.5) * width
-#                                     ax.bar(x, data, width, label=label, color=color)
-#                                 else:
-#                                     ax.bar(labels, data, label=label, color=color)
-#                             elif chart_type == 'line':
-#                                 ax.plot(labels, data, label=label, color=color, linewidth=2, marker='o')
-#                             elif chart_type == 'pie':
-#                                 ax.pie(data, labels=labels, autopct='%1.1f%%', colors=colors)
-                        
-#                         # Style the plot
-#                         ax.set_title(plot.plot_name or "Plot", color="#d6ff41", fontsize=20, pad=20)
-#                         if chart_type != 'pie':
-#                             ax.tick_params(axis='both', colors='#d6ff41', labelsize=10)
-#                             ax.spines['bottom'].set_color('#d6ff41')
-#                             ax.spines['left'].set_color('#d6ff41')
-#                             ax.spines['top'].set_color('#d6ff41')
-#                             ax.spines['right'].set_color('#d6ff41')
-                            
-#                             # Rotate x-axis labels if they are too long
-#                             if max(len(str(label)) for label in labels) > 10:
-#                                 plt.xticks(rotation=45, ha='right')
-                        
-#                         # Add legend with custom styling
-#                         if chart_type != 'pie' and len(datasets) > 1:
-#                             legend = ax.legend(loc='upper right', facecolor='#1c2427', edgecolor='#d6ff41')
-#                             for text in legend.get_texts():
-#                                 text.set_color('#d6ff41')
-                        
-#                         # Adjust layout and save
-#                         plt.tight_layout()
-                        
-#                         # Save to BytesIO with high quality
-#                         buf = BytesIO()
-#                         plt.savefig(buf, format='png', 
-#                                   bbox_inches='tight', 
-#                                   facecolor=fig.get_facecolor(),
-#                                   edgecolor='none',
-#                                   pad_inches=0.1,
-#                                   dpi=300)
-#                         plt.close(fig)
-#                         buf.seek(0)
-                        
-#                         # Add image to slide with proper positioning
-#                         img_left = Inches(0.5)
-#                         img_top = Inches(1.2)
-#                         img_width = Inches(9)
-#                         img_height = Inches(5.5)
-#                         plot_slide.shapes.add_picture(buf, img_left, img_top, img_width, img_height)
-                        
-#                     except Exception as e:
-#                         # If plot rendering fails, add error text
-#                         err_box = plot_slide.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1))
-#                         err_tf = err_box.text_frame
-#                         err_p = err_tf.add_paragraph()
-#                         err_p.text = f"Error rendering plot: {e}"
-#                         err_p.font.size = Pt(18)
-#                         err_p.font.color.rgb = RGBColor(0xff, 0x41, 0x41)
-
-#             # Copy the last slide from template
-#             if len(template_slides) > 1:
-#                 # Use the same layout as the last template slide
-#                 last_slide_layout = template_slides[-1].slide_layout
-#                 last_slide = new_prs.slides.add_slide(last_slide_layout)
-                
-#                 # Copy background
-#                 if hasattr(template_slides[-1], 'background') and hasattr(template_slides[-1].background, 'fill'):
-#                     try:
-#                         new_prs.slides[-1].background.fill.solid()
-#                         new_prs.slides[-1].background.fill.fore_color.rgb = template_slides[-1].background.fill.fore_color.rgb
-#                     except:
-#                         pass
-                
-#                 # Copy all shapes from last template slide
-#                 for shape in template_slides[-1].shapes:
-#                     try:
-#                         if hasattr(shape, 'shape_type'):
-#                             new_shape = last_slide.shapes.add_shape(
-#                                 shape.shape_type,
-#                                 shape.left,
-#                                 shape.top,
-#                                 shape.width,
-#                                 shape.height
-#                             )
-#                             # Copy text if it's a text shape
-#                             if hasattr(shape, 'text') and hasattr(new_shape, 'text'):
-#                                 new_shape.text = shape.text
-#                             # Copy fill color if available
-#                             if hasattr(shape, 'fill') and hasattr(new_shape, 'fill'):
-#                                 try:
-#                                     new_shape.fill.solid()
-#                                     new_shape.fill.fore_color.rgb = shape.fill.fore_color.rgb
-#                                 except:
-#                                     pass
-#                         elif hasattr(shape, 'image'):
-#                             # Handle images
-#                             try:
-#                                 img_stream = shape.image.blob
-#                                 last_slide.shapes.add_picture(
-#                                     BytesIO(img_stream),
-#                                     shape.left,
-#                                     shape.top,
-#                                     shape.width,
-#                                     shape.height
-#                                 )
-#                             except:
-#                                 pass
-#                     except Exception as e:
-#                         # Skip shapes that can't be copied
-#                         continue
-
-#             # Save to a temporary file and return as response
-#             with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
-#                 new_prs.save(tmp.name)
-#                 tmp.seek(0)
-#                 response = HttpResponse(tmp.read(), content_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
-#                 response['Content-Disposition'] = f'attachment; filename="report_{project.name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pptx"'
-#                 return response
-
-#         except Exception as e:
-#             return Response({'error': str(e)}, status=500)
-
 
 class GetSheets(APIView):
     """
@@ -6277,20 +6211,37 @@ class GetSheets(APIView):
 
 
 def get_logging_user(request, fallback_user=None):
-    if hasattr(request, 'user') and getattr(request.user, 'is_authenticated', False):
-        return request.user
-    if fallback_user is not None:
-        return fallback_user
+    """
+    Get user for logging purposes with priority order:
+    1. user_id from request payload (highest priority)
+    2. user_id from query parameters
+    3. authenticated request.user
+    4. fallback_user
+    """
+    # Priority 1: user_id from request payload
     user_id = None
-    if hasattr(request, 'data', ) and isinstance(request.data, dict):
+    if hasattr(request, 'data') and isinstance(request.data, dict):
         user_id = request.data.get('user_id')
+    
+    # Priority 2: user_id from query parameters
     if not user_id and hasattr(request, 'query_params'):
         user_id = request.query_params.get('user_id')
+    
+    # If we found a user_id, try to get the user
     if user_id:
         try:
             return User.objects.get(id=user_id)
         except Exception:
-            return None
+            pass  # Continue to next priority if user not found
+    
+    # Priority 3: authenticated request.user
+    if hasattr(request, 'user') and getattr(request.user, 'is_authenticated', False):
+        return request.user
+    
+    # Priority 4: fallback_user
+    if fallback_user is not None:
+        return fallback_user
+    
     return None
 
 class GetUserEmails(APIView):
@@ -6298,18 +6249,55 @@ class GetUserEmails(APIView):
         try:
             # Get all users and extract their email IDs
             users = User.objects.all()
-            email_list = list(users.values_list('email', flat=True))
+            emails = [user.email for user in users]
+            return Response({'emails': emails}, status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+
+class TestUserDetection(APIView):
+    """Test endpoint to verify user detection in API logging"""
+    def post(self, request):
+        try:
+            from .views import get_logging_user
+            
+            # Test user detection
+            user = get_logging_user(request, None)
+            
+            # Test project-based user detection
+            project_user = None
+            if hasattr(request, 'data') and isinstance(request.data, dict):
+                project_id = request.data.get('project_id')
+                if project_id:
+                    from .models import Projects
+                    try:
+                        project = Projects.objects.get(id=project_id)
+                        project_user = project.user
+                    except Projects.DoesNotExist:
+                        pass
             
             return Response({
-                'success': True,
-                'emails': email_list,
-                'count': len(email_list)
+                'detected_user': {
+                    'id': user.id if user else None,
+                    'username': user.username if user else None,
+                    'email': user.email if user else None
+                } if user else None,
+                'project_user': {
+                    'id': project_user.id if project_user else None,
+                    'username': project_user.username if project_user else None,
+                    'email': project_user.email if project_user else None
+                } if project_user else None,
+                'request_data': request.data if hasattr(request, 'data') else {},
+                'request_user': {
+                    'id': request.user.id if hasattr(request, 'user') and request.user else None,
+                    'username': request.user.username if hasattr(request, 'user') and request.user else None,
+                    'email': request.user.email if hasattr(request, 'user') and request.user else None,
+                    'is_authenticated': getattr(request.user, 'is_authenticated', False) if hasattr(request, 'user') and request.user else False
+                } if hasattr(request, 'user') and request.user else None
             }, status=200)
+            
         except Exception as e:
-            return Response({
-                'success': False,
-                'error': str(e)
-            }, status=500)
+            return Response({'error': str(e)}, status=500)
 
 
 class SparkSessionMonitor(APIView):
@@ -6366,6 +6354,257 @@ class SparkSessionMonitor(APIView):
                 'error': str(e),
                 'status': 'failed'
             }, status=500)
+
+
+class GetAPILogs(APIView):
+    """
+    API endpoint to retrieve API logs with filtering and pagination
+    """
+    def post(self, request):
+        try:
+            # Extract filter parameters
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            endpoint = request.data.get('endpoint')
+            method = request.data.get('method')
+            response_status = request.data.get('response_status')
+            start_date = request.data.get('start_date')
+            end_date = request.data.get('end_date')
+            page = request.data.get('page', 1)
+            page_size = request.data.get('page_size', 50)
+            
+            # Import APILog model
+            from .models import APILog
+            from django.core.paginator import Paginator
+            from django.db.models import Q
+            from datetime import datetime
+            
+            # Build query
+            queryset = APILog.objects.all()
+            
+            if user_id:
+                # Get the username from User model and filter by user field
+                try:
+                    user = User.objects.get(id=user_id)
+                    username = user.username or user.email
+                    queryset = queryset.filter(user=username)
+                except User.DoesNotExist:
+                    # If user doesn't exist, return empty queryset
+                    queryset = APILog.objects.none()
+            
+            if project_id:
+                queryset = queryset.filter(project_id=project_id)
+            
+            if endpoint:
+                queryset = queryset.filter(endpoint__icontains=endpoint)
+            
+            if method:
+                queryset = queryset.filter(method__iexact=method)
+            
+            if response_status:
+                queryset = queryset.filter(response_status=response_status)
+            
+            if start_date:
+                try:
+                    start_datetime = datetime.strptime(start_date, '%Y-%m-%d')
+                    queryset = queryset.filter(request_timestamp__gte=start_datetime)
+                except ValueError:
+                    pass
+            
+            if end_date:
+                try:
+                    end_datetime = datetime.strptime(end_date, '%Y-%m-%d')
+                    queryset = queryset.filter(request_timestamp__lte=end_datetime)
+                except ValueError:
+                    pass
+            
+            # Paginate results
+            paginator = Paginator(queryset, page_size)
+            page_obj = paginator.get_page(page)
+            
+            # Prepare response data
+            logs_data = []
+            for log in page_obj:
+                logs_data.append({
+                    'id': log.id,
+                    'user': log.user,  # Now user is just a string (username)
+                    'endpoint': log.endpoint,
+                    'method': log.method,
+                    'ip_address': log.ip_address,
+                    'user_agent': log.user_agent,
+                    'request_payload': log.request_payload,
+                    'request_headers': log.request_headers,
+                    'request_params': log.request_params,
+                    'request_files': log.request_files,
+                    'response_status': log.response_status,
+                    'response_data': log.response_data,
+                    'response_headers': log.response_headers,
+                    'request_timestamp': log.request_timestamp.isoformat() if log.request_timestamp else None,
+                    'response_timestamp': log.response_timestamp.isoformat() if log.response_timestamp else None,
+                    'duration_ms': log.duration_ms,
+                    'error_message': log.error_message,
+                    'error_traceback': log.error_traceback,
+                    'project_id': log.project_id,
+                    'file_type': log.file_type,
+                    'file_name': log.file_name,
+                    'sheet_name': log.sheet_name,
+                    'is_success': log.is_success,
+                    'is_error': log.is_error
+                })
+            
+            return Response({
+                'logs': logs_data,
+                'pagination': {
+                    'current_page': page_obj.number,
+                    'total_pages': paginator.num_pages,
+                    'total_count': paginator.count,
+                    'has_next': page_obj.has_next(),
+                    'has_previous': page_obj.has_previous()
+                }
+            }, status=200)
+            
+        except Exception as e:
+            return Response({'error': f'Failed to retrieve API logs: {str(e)}'}, status=500)
+
+
+class GetAPILogStats(APIView):
+    """
+    API endpoint to get statistics about API logs
+    """
+    def post(self, request):
+        try:
+            from .models import APILog
+            from django.db.models import Count, Avg, Q
+            from datetime import datetime, timedelta
+            
+            # Get date range
+            days = request.data.get('days', 7)
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+            
+            # Filter logs by date range
+            queryset = APILog.objects.filter(
+                request_timestamp__gte=start_date,
+                request_timestamp__lte=end_date
+            )
+            
+            # Calculate statistics
+            total_requests = queryset.count()
+            successful_requests = queryset.filter(response_status__gte=200, response_status__lt=300).count()
+            error_requests = queryset.filter(Q(response_status__gte=400) | Q(error_message__isnull=False)).count()
+            
+            # Average response time
+            avg_response_time = queryset.filter(duration_ms__isnull=False).aggregate(
+                avg_duration=Avg('duration_ms')
+            )['avg_duration'] or 0
+            
+            # Most common endpoints
+            top_endpoints = queryset.values('endpoint').annotate(
+                count=Count('id')
+            ).order_by('-count')[:10]
+            
+            # Most common error status codes
+            error_statuses = queryset.filter(response_status__gte=400).values('response_status').annotate(
+                count=Count('id')
+            ).order_by('-count')[:10]
+            
+            # Top users by request count
+            top_users = queryset.filter(user__isnull=False).values(
+                'user'
+            ).annotate(
+                count=Count('id')
+            ).order_by('-count')[:10]
+            
+            # Method distribution
+            method_distribution = queryset.values('method').annotate(
+                count=Count('id')
+            ).order_by('-count')
+            
+            return Response({
+                'period': {
+                    'start_date': start_date.isoformat(),
+                    'end_date': end_date.isoformat(),
+                    'days': days
+                },
+                'overview': {
+                    'total_requests': total_requests,
+                    'successful_requests': successful_requests,
+                    'error_requests': error_requests,
+                    'success_rate': (successful_requests / total_requests * 100) if total_requests > 0 else 0,
+                    'avg_response_time_ms': round(avg_response_time, 2)
+                },
+                'top_endpoints': list(top_endpoints),
+                'error_statuses': list(error_statuses),
+                'top_users': list(top_users),
+                'method_distribution': list(method_distribution)
+            }, status=200)
+            
+        except Exception as e:
+            return Response({'error': f'Failed to retrieve API stats: {str(e)}'}, status=500)
+
+
+class DeleteAPILogs(APIView):
+    """
+    API endpoint to delete old API logs
+    """
+    def post(self, request):
+        try:
+            from .models import APILog
+            from datetime import datetime, timedelta
+            
+            # Get parameters
+            days_old = request.data.get('days_old', 30)
+            delete_all = request.data.get('delete_all', False)
+            
+            if delete_all:
+                # Delete all logs
+                deleted_count = APILog.objects.count()
+                APILog.objects.all().delete()
+            else:
+                # Delete logs older than specified days
+                cutoff_date = datetime.now() - timedelta(days=days_old)
+                deleted_count = APILog.objects.filter(
+                    request_timestamp__lt=cutoff_date
+                ).count()
+                APILog.objects.filter(
+                    request_timestamp__lt=cutoff_date
+                ).delete()
+            
+            return Response({
+                'message': f'Successfully deleted {deleted_count} API log entries',
+                'deleted_count': deleted_count
+            }, status=200)
+            
+        except Exception as e:
+            return Response({'error': f'Failed to delete API logs: {str(e)}'}, status=500)
+
+
+class TestAPILogging(APIView):
+    """
+    Test endpoint to verify API logging is working
+    """
+    def post(self, request):
+        try:
+            # Extract test data
+            test_data = request.data.get('test_data', {})
+            
+            # Log the API call manually to ensure it works
+            from .log_utils import log_api_request_from_view
+            from django.utils import timezone
+            
+            response = Response({
+                'message': 'API logging test successful',
+                'received_data': test_data,
+                'timestamp': timezone.now().isoformat()
+            }, status=200)
+            
+            # Log the API call
+            log_api_request_from_view(request, response, start_time=timezone.now())
+            
+            return response
+            
+        except Exception as e:
+            return Response({'error': f'Test failed: {str(e)}'}, status=500)
 
 
 

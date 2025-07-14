@@ -5,6 +5,10 @@ from django.contrib.auth.hashers import make_password
 import os
 from django.conf import settings
 from django.core.serializers.json import DjangoJSONEncoder
+from django.utils import timezone
+from datetime import timedelta
+import random
+import string
 
 class User(models.Model):
     email = models.EmailField(unique=True)
@@ -20,7 +24,43 @@ class User(models.Model):
 
     def __str__(self):
         return self.username
+
+class OTPToken(models.Model):
+    user = models.ForeignKey('User', on_delete=models.CASCADE)
+    otp = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    is_used = models.BooleanField(default=False)
     
+    def __str__(self):
+        return f"OTP for {self.user.username} - {self.otp}"
+    
+    def is_expired(self):
+        return timezone.now() > self.expires_at
+    
+    def is_valid(self):
+        return not self.is_used and not self.is_expired()
+    
+    @classmethod
+    def generate_otp(cls):
+        """Generate a 6-digit OTP"""
+        return ''.join(random.choices(string.digits, k=6))
+    
+    @classmethod
+    def create_for_user(cls, user):
+        """Create a new OTP token for a user"""
+        # Delete any existing unused OTPs for this user
+        cls.objects.filter(user=user, is_used=False).delete()
+        
+        # Create new OTP
+        otp = cls.generate_otp()
+        expires_at = timezone.now() + timedelta(minutes=10)  # OTP expires in 10 minutes
+        
+        return cls.objects.create(
+            user=user,
+            otp=otp,
+            expires_at=expires_at
+        )
 
 
 class Projects(models.Model):
@@ -197,3 +237,64 @@ class UserActionLog(models.Model):
 
     def __str__(self):
         return f"{self.user} - {self.action} at {self.timestamp}"
+
+class APILog(models.Model):
+    """
+    Comprehensive API logging model to store request and response information
+    """
+    # Basic request information
+    user = models.ForeignKey('User', on_delete=models.SET_NULL, null=True, blank=True)
+    endpoint = models.CharField(max_length=255)  # API endpoint path
+    method = models.CharField(max_length=10)  # HTTP method (GET, POST, etc.)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True, null=True)
+    
+    # Request details
+    request_payload = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    request_headers = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    request_params = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    request_files = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    request_body = models.TextField(blank=True, null=True)  # Raw request body
+    request_content_type = models.CharField(max_length=100, blank=True, null=True)  # Content type
+    
+    # Response details
+    response_status = models.IntegerField()  # HTTP status code
+    response_data = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    response_headers = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    
+    # Timing and metadata
+    request_timestamp = models.DateTimeField(auto_now_add=True)
+    response_timestamp = models.DateTimeField(null=True, blank=True)
+    duration_ms = models.IntegerField(null=True, blank=True)  # Response time in milliseconds
+    
+    # Error information
+    error_message = models.TextField(blank=True, null=True)
+    error_traceback = models.TextField(blank=True, null=True)
+    
+    # Additional context
+    project_id = models.IntegerField(null=True, blank=True)  # If applicable
+    file_type = models.CharField(max_length=50, blank=True, null=True)  # If applicable
+    file_name = models.CharField(max_length=255, blank=True, null=True)  # If applicable
+    sheet_name = models.CharField(max_length=255, blank=True, null=True)  # If applicable
+    
+    class Meta:
+        ordering = ['-request_timestamp']
+        indexes = [
+            models.Index(fields=['user', 'request_timestamp']),
+            models.Index(fields=['endpoint', 'method']),
+            models.Index(fields=['response_status']),
+            models.Index(fields=['project_id']),
+        ]
+    
+    def __str__(self):
+        return f"{self.method} {self.endpoint} - {self.user} - {self.response_status} - {self.request_timestamp}"
+    
+    @property
+    def is_success(self):
+        """Check if the API call was successful (2xx status codes)"""
+        return 200 <= self.response_status < 300
+    
+    @property
+    def is_error(self):
+        """Check if the API call resulted in an error (4xx or 5xx status codes)"""
+        return self.response_status >= 400

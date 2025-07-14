@@ -18,17 +18,25 @@ JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
 HADOOP_HOME = r"C:\hadoop"
 PYSPARK_PYTHON = sys.executable
 
-# Set environment variables
-os.environ["JAVA_HOME"] = JAVA_HOME
-os.environ["HADOOP_HOME"] = HADOOP_HOME
-os.environ["PATH"] += f";{os.path.join(HADOOP_HOME, 'bin')}"
-os.environ["PYSPARK_PYTHON"] = PYSPARK_PYTHON
-os.environ["SPARK_LOCAL_IP"] = "localhost"
+# # Set environment variables
+# os.environ["JAVA_HOME"] = JAVA_HOME
+# os.environ["HADOOP_HOME"] = HADOOP_HOME
+# os.environ["PATH"] += f";{os.path.join(HADOOP_HOME, 'bin')}"
+# os.environ["PYSPARK_PYTHON"] = PYSPARK_PYTHON
+# os.environ["SPARK_LOCAL_IP"] = "localhost"
 
 # Create local Spark temp dir if it doesn't exist
 SPARK_LOCAL_DIRS = os.path.join(os.getcwd(), "spark-temp")
 os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
 os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
+
+# --- Linux/Server ---
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-11-openjdk-amd64"
+os.environ["HADOOP_HOME"] = "/opt/hadoop"
+os.environ["SPARK_HOME"] = "/opt/spark"
+os.environ["PATH"] += f":/opt/hadoop/bin:/opt/spark/bin"
+os.environ["SPARK_LOCAL_DIRS"] = "/home/prashant/Dashboard-backend/spark-temp"
+os.environ["PYSPARK_PYTHON"] = sys.executable
 
 # Initialize findspark
 findspark.init()
@@ -75,10 +83,16 @@ class SparkSessionManager:
     
     def _create_session_config(self) -> Dict[str, str]:
         """Create Spark configuration."""
+        # jar_paths = [
+        #     r"C:\spark-jars\spark-excel_2.12-3.3.1_0.18.7.jar",
+        #     r"C:\spark-jars\poi-5.2.3.jar",
+        #     r"C:\spark-jars\poi-ooxml-5.2.3.jar"
+        # ]
+
         jar_paths = [
-            r"C:\spark-jars\spark-excel_2.12-3.3.1_0.18.7.jar",
-            r"C:\spark-jars\poi-5.2.3.jar",
-            r"C:\spark-jars\poi-ooxml-5.2.3.jar"
+            "/opt/spark-jars/spark-excel_2.12-3.3.1_0.18.7.jar",
+            "/opt/spark-jars/poi-5.2.3.jar",
+            "/opt/spark-jars/poi-ooxml-5.2.3.jar"
         ]
         
         # Check JARs exist
@@ -90,8 +104,8 @@ class SparkSessionManager:
         
         return {
             "spark.jars": jars_str,
-            "spark.driver.memory": "12g",
-            "spark.executor.memory": "12g",
+            "spark.driver.memory": "2g",
+            "spark.executor.memory": "2g",
             "spark.sql.execution.arrow.pyspark.enabled": "true",
             "spark.hadoop.io.native.lib.available": "false",
             "spark.sql.shuffle.partitions": "16",
@@ -108,7 +122,14 @@ class SparkSessionManager:
             "spark.sql.files.openCostInBytes": "4194304",
             "spark.sql.files.minPartitionNum": "1",
             "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
-            "spark.kryoserializer.buffer.max": "1024m"
+            "spark.kryoserializer.buffer.max": "1024m",
+            # Add timeout configurations for large files
+            "spark.rpc.askTimeout": "300s",
+            "spark.rpc.lookupTimeout": "300s",
+            "spark.network.timeout": "300s",
+            "spark.executor.heartbeatInterval": "60s",
+            "spark.sql.broadcastTimeout": "300s",
+            "spark.sql.execution.timeout": "300s"
         }
     
     def _create_spark_session(self, session_id: str) -> SparkSession:
