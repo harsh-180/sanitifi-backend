@@ -25,3 +25,5 @@ statsmodels
 python-dotenv>=1.0.0
 findspark
 django-extensions
+ydata-profiling>=4.0.0
+django-sslserver-v2

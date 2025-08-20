@@ -57,7 +57,7 @@ import pyarrow
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from django.core.files.storage import default_storage
-from .spark_utils import get_spark_session
+from .spark_utils import get_spark_session, spark_session_context, validate_spark_session
 import threading
 import json
 from django.http import FileResponse
@@ -86,6 +86,7 @@ import math
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 GOOGLE_SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -93,23 +94,36 @@ GOOGLE_SCOPES = [
 ]
 
 def get_gsheet_service():
-    # Get service account info from environment variable
+    import json
     service_account_info = os.getenv('GOOGLE_SERVICE_ACCOUNT_INFO')
     if not service_account_info:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_INFO environment variable not set")
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_INFO not set")
     
     try:
-        # Parse the JSON string from environment variable
         service_account_dict = json.loads(service_account_info)
+
+        # Fix private key formatting
+        private_key = service_account_dict['private_key']
+        if "\\n" in private_key:
+            private_key = private_key.replace('\\n', '\n').strip()
+        service_account_dict['private_key'] = private_key
+
         creds = service_account.Credentials.from_service_account_info(
-            service_account_dict, scopes=GOOGLE_SCOPES)
+            service_account_dict, 
+            scopes=[
+                'https://www.googleapis.com/auth/spreadsheets',
+                'https://www.googleapis.com/auth/drive'
+            ]
+        )
+
         sheets_service = build('sheets', 'v4', credentials=creds)
         drive_service = build('drive', 'v3', credentials=creds)
+
         return sheets_service, drive_service
-    except json.JSONDecodeError:
-        raise ValueError("Invalid JSON in GOOGLE_SERVICE_ACCOUNT_INFO environment variable")
+
     except Exception as e:
-        raise ValueError(f"Error initializing Google Sheets service: {str(e)}")
+        raise ValueError(f"Auth failed: {str(e)}")
+
 
 def make_json_safe(obj):
     if isinstance(obj, dict):
@@ -203,10 +217,10 @@ class MergeFile(APIView):
         # file_type = file_name.split("\\")[0]
         file_name=file_name.split("\\")[1]
 
-        print('Starting merge process...')
-        print(f'Project ID: {project_id}')
-        print(f'File Name: {file_name}')
-        print(f'Sheet Name: {sheet_name}')
+        # print('Starting merge process...')
+        # print(f'Project ID: {project_id}')
+        # print(f'File Name: {file_name}')
+        # print(f'Sheet Name: {sheet_name}')
         
         # Clean up file_name if it contains media path
         if file_name and (file_name.startswith("media\\") or file_name.startswith("media/")):
@@ -215,14 +229,14 @@ class MergeFile(APIView):
         # Ensure project exists
         try:
             project = Projects.objects.get(id=project_id)
-            print(f'User ID: {project.user.id}')
+            # print(f'User ID: {project.user.id}')
         except Projects.DoesNotExist:
             return Response({'error': 'Project not found'}, status=404)
 
         try:
             # Correct KPI directory
             base_folder = os.path.join(settings.MEDIA_ROOT, f'user_{project.user.id}/project_{project.id}/{file_type}')
-            print(f'Base folder: {base_folder}')
+            # print(f'Base folder: {base_folder}')
             
             # Determine the correct file path
             if os.path.isdir(os.path.join(base_folder, file_name)):
@@ -233,7 +247,7 @@ class MergeFile(APIView):
                 original_file_path = os.path.join(base_folder, file_name, sheet_name)
             
             original_file_path = os.path.normpath(original_file_path)
-            print(f'Original file path -> {original_file_path}')
+            # print(f'Original file path -> {original_file_path}')
             
             # Check if the file exists
             if not os.path.exists(original_file_path):
@@ -245,9 +259,9 @@ class MergeFile(APIView):
             original_df = pd.read_csv(original_file_path) if original_file_path.endswith('.csv') else pd.read_excel(original_file_path)
             merge_df = pd.read_excel(merge_file)
 
-            print('Original File Columns:', original_df.columns.tolist())
-            print('Merge File Columns:', merge_df.columns.tolist())
-            print("3");
+            # print('Original File Columns:', original_df.columns.tolist())
+            # print('Merge File Columns:', merge_df.columns.tolist())
+            # print("3");
 
             # Standardizing column names (strip + lowercase)
             original_df.columns = original_df.columns.str.strip()
@@ -265,7 +279,7 @@ class MergeFile(APIView):
 
             common_columns = [col.strip() for col in common_columns]
 
-            print('Common Columns for Merging:', common_columns)
+            # print('Common Columns for Merging:', common_columns)
 
             # Validate all common columns exist in both
             for col in common_columns:
@@ -278,7 +292,7 @@ class MergeFile(APIView):
             for col in common_columns:
                 original_df[col] = original_df[col].fillna('').astype(str)
                 merge_df[col] = merge_df[col].fillna('').astype(str)
-                print(f"Converted column '{col}' to string")
+                # print(f"Converted column '{col}' to string")
 
             # ---- MODIFIED MERGE LOGIC START ----
 
@@ -349,9 +363,10 @@ class MergeFile(APIView):
             subprocess.run(["git", "add", file_path_relative], cwd=project_folder)
             commit_message = f"merge - {user.id}/{project_id}/{file_subfolder}/{sheet_name}"
             subprocess.run(["git", "commit", "-m", commit_message], cwd=project_folder)
-            print(f"Git commit done for {file_path_relative}")
+            # print(f"Git commit done for {file_path_relative}")
         except Exception as e:
-            print(f"Git commit failed: {str(e)}")
+            # print(f"Git commit failed: {str(e)}")
+            pass
 
 
 class Save(APIView):
@@ -364,12 +379,12 @@ class Save(APIView):
             file_type = request.data.get("file_type")  # Expected: "media" or "kpi"
             data_stage = request.data.get("data_stage")  # Expected: "cleaned" or other stages
 
-            print("\nReceived Save Request with Payload:")
-            print(f"  - sheet_name: {sheet_name}")
-            print(f"  - project_id: {project_id}")
-            print(f"  - file_name: {file_name}")
-            print(f"  - file_type: {file_type}")
-            print(f"  - data_stage: {data_stage}")
+            # print("\nReceived Save Request with Payload:")
+            # print(f"  - sheet_name: {sheet_name}")
+            # print(f"  - project_id: {project_id}")
+            # print(f"  - file_name: {file_name}")
+            # print(f"  - file_type: {file_type}")
+            # print(f"  - data_stage: {data_stage}")
 
             # Log the file download event
             user = get_logging_user(request, None)
@@ -377,7 +392,7 @@ class Save(APIView):
             # Validate project existence
             try:
                 project = Projects.objects.get(id=project_id)
-                print(f"Project found: user_{project.user.id}/project_{project.id}")
+                # print(f"Project found: user_{project.user.id}/project_{project.id}")
             except Projects.DoesNotExist:
                 return Response({"error": "Project not found"}, status=404)
 
@@ -393,30 +408,47 @@ class Save(APIView):
                 file_name = file_name.replace("media\\", "").replace("media/", "")
 
             # Validate file_type
-            if file_type not in ["media", "kpi"]:
-                return Response({"error": "Invalid file_type. Must be 'media' or 'kpi'"}, status=400)
+            if file_type not in ["media", "kpi", "concatenated"]:
+                return Response({"error": "Invalid file_type. Must be 'media', 'kpi', or 'concatenated'"}, status=400)
 
             # Construct correct file path inside project folder using file_type directly
-            file_path = os.path.join(
-                settings.MEDIA_ROOT,
-                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
-            )
-            file_path = os.path.normpath(file_path)  # Normalize path
-            print(f"Checking file at: {file_path}")
+            if file_type == 'concatenated':
+                # Search all subfolders for the sheet_name
+                concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+                found = False
+                file_path = None
+                if os.path.exists(concatenated_base):
+                    for folder in os.listdir(concatenated_base):
+                        folder_path = os.path.join(concatenated_base, folder)
+                        candidate = os.path.join(folder_path, sheet_name)
+                        if os.path.isfile(candidate):
+                            file_path = candidate
+                            found = True
+                            break
+                if not found:
+                    return Response({"error": "File not found in concatenated folder"}, status=404)
+            else:
+                # Regular file type handling
+                file_path = os.path.join(
+                    settings.MEDIA_ROOT,
+                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+                )
+                file_path = os.path.normpath(file_path)  # Normalize path
+                print(f"Checking file at: {file_path}")
 
-            # Check if the file exists
-            if not os.path.exists(file_path):
-                print(f"File not found: {file_path}")
+                # Check if the file exists
+                if not os.path.exists(file_path):
+                    print(f"File not found: {file_path}")
 
-                # Debugging - List actual files in the directory
-                directory = os.path.dirname(file_path)
-                if os.path.exists(directory):
-                    print(f"Listing files in {directory}:")
-                    print(os.listdir(directory))  # Print all files in the directory
-                else:
-                    print(f"Directory does not exist: {directory}")
+                    # Debugging - List actual files in the directory
+                    directory = os.path.dirname(file_path)
+                    if os.path.exists(directory):
+                        print(f"Listing files in {directory}:")
+                        print(os.listdir(directory))  # Print all files in the directory
+                    else:
+                        print(f"Directory does not exist: {directory}")
 
-                return Response({"error": "File not found", "expected_path": file_path}, status=404)
+                    return Response({"error": "File not found", "expected_path": file_path}, status=404)
 
             # Extract file extension and validate
             file_extension = os.path.splitext(sheet_name)[-1].lower()
@@ -443,7 +475,13 @@ class Save(APIView):
                 # Read the requested sheet
                 df = pd.read_excel(file_path, sheet_name=sheet_name, engine="openpyxl")
             elif file_extension == ".csv":
-                df = pd.read_csv(file_path)  # Let pandas infer types
+                try:
+                    df = pd.read_csv(file_path, encoding='utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        df = pd.read_csv(file_path, encoding='latin1')
+                    except UnicodeDecodeError:
+                        df = pd.read_csv(file_path, encoding='cp1252')
 
             # Convert numeric-like columns back to numeric format
             for col in df.select_dtypes(include=["object"]).columns:
@@ -488,11 +526,29 @@ class Mapping(APIView):
             project = Projects.objects.get(id=project_id)
         except Projects.DoesNotExist:
             return Response({"error": "Project not found"}, status=404)
-        file_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/{file_type}")
-        original_file_path = os.path.join(file_folder, file_name, sheet_name)
-        original_file_path = os.path.normpath(original_file_path)
-        if not os.path.exists(original_file_path):
-            return Response({"error": "File not found in KPI folder"}, status=404)
+        # Handle concatenated file type
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+            found = False
+            original_file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        original_file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({"error": "File not found in concatenated folder"}, status=404)
+        else:
+            # Regular file type handling
+            file_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/{file_type}")
+            original_file_path = os.path.join(file_folder, file_name, sheet_name)
+            original_file_path = os.path.normpath(original_file_path)
+            if not os.path.exists(original_file_path):
+                return Response({"error": "File not found in KPI folder"}, status=404)
         file_ext = os.path.splitext(sheet_name)[1].lower()
         file_size_mb = os.path.getsize(original_file_path) / (1024 * 1024)
         try:
@@ -533,27 +589,25 @@ class Mapping(APIView):
                     # Process column mappings with proper column escaping
                     column_mappings_dict = json.loads(column_mappings) if isinstance(column_mappings, str) else column_mappings
                     
-                    for original_col, mapping_col in column_mappings_dict.items():
-                        if original_col in df.columns and mapping_col in mapping_df.columns:
-                            # Create mapping DataFrame
-                            mapping_col_index = mapping_df.columns.get_loc(mapping_col)
-                            next_col_index = mapping_col_index + 1
-                            
-                            if next_col_index < len(mapping_df.columns):
-                                next_col_name = mapping_df.columns[next_col_index]
-                                mapping_spark = spark.createDataFrame(mapping_df[[mapping_col, next_col_name]])
-                                mapping_spark = mapping_spark.withColumnRenamed(mapping_col, "key").withColumnRenamed(next_col_name, "value")
-                                
-                                # Escape column names that contain spaces or special characters
-                                escaped_original_col = f"`{original_col}`" if ' ' in original_col or any(char in original_col for char in ['-', '.', '/', '\\']) else original_col
-                                escaped_new_col = f"`{original_col}_New`" if ' ' in f"{original_col}_New" or any(char in f"{original_col}_New" for char in ['-', '.', '/', '\\']) else f"{original_col}_New"
-                                
-                                # Perform the join with proper column escaping
-                                df = df.join(mapping_spark, df[original_col] == mapping_spark["key"], "left") \
-                                       .withColumn(escaped_new_col, expr(f"coalesce(value, {escaped_original_col})")) \
-                                       .drop("key", "value")
-                            else:
-                                print(f"Warning: No next column exists after '{mapping_col}' in mapping_df")
+                    for original_col, mapping_cols in column_mappings_dict.items():
+                        if original_col in df.columns and mapping_cols in mapping_df.columns:
+                            mapping_key = mapping_cols
+                            mapping_columns = []
+                            found_key = False
+                            for col in mapping_df.columns:
+                                if found_key:
+                                    if not col or str(col).startswith("Unnamed"):
+                                        break
+                                    mapping_columns.append(col)
+                                if col == mapping_key:
+                                    found_key = True
+                            if not mapping_columns:
+                                continue
+                            mapping_spark = spark.createDataFrame(mapping_df[[mapping_key] + mapping_columns])
+                            df = df.join(mapping_spark, df[mapping_key] == mapping_spark[mapping_key], "left")
+                            from pyspark.sql import functions as F
+                            for col in mapping_columns:
+                                df = df.withColumn(col, F.coalesce(df[col], F.lit("NA")))
                     
                     # Fill NA values
                     df = df.na.fill("NA")
@@ -568,7 +622,13 @@ class Mapping(APIView):
                 if file_ext in ['.xlsx', '.xls']:
                     df = pd.read_excel(original_file_path)
                 elif file_ext == '.csv':
-                    df = pd.read_csv(original_file_path)
+                    try:
+                        df = pd.read_csv(original_file_path, encoding='utf-8')
+                    except UnicodeDecodeError:
+                        try:
+                            df = pd.read_csv(original_file_path, encoding='latin1')
+                        except UnicodeDecodeError:
+                            df = pd.read_csv(original_file_path, encoding='cp1252')
                 else:
                     return Response({"error": "Unsupported file type. Only .csv, .xls, .xlsx allowed."}, status=400)
                 mapping_df = pd.read_excel(mapping_file)
@@ -577,20 +637,23 @@ class Mapping(APIView):
                         column_mappings = json.loads(column_mappings)
                     except json.JSONDecodeError:
                         return Response({"error": "Invalid JSON format for column_mappings"}, status=400)
-                for original_col, mapping_col in column_mappings.items():
-                    try:
-                        new_col_name = f"{original_col}_New"
-                        if original_col in df.columns and mapping_col in mapping_df.columns:
-                            mapping_col_index = mapping_df.columns.get_loc(mapping_col)
-                            next_col_index = mapping_col_index + 1
-                            if next_col_index < len(mapping_df.columns):
-                                next_col_name = mapping_df.columns[next_col_index]
-                                mapping_dict = dict(zip(mapping_df[mapping_col], mapping_df[next_col_name]))
-                                df[new_col_name] = df[original_col].map(mapping_dict).fillna(df[original_col])
-                            else:
-                                print(f"Warning: No next column exists after '{mapping_col}' in mapping_df")
-                    except Exception as e:
-                        return Response({"error": f"Error processing column mapping: {str(e)}"}, status=500)
+                for original_col, mapping_cols in column_mappings.items():
+                    if original_col in df.columns and mapping_cols in mapping_df.columns:
+                        mapping_key = mapping_cols
+                        mapping_columns = []
+                        found_key = False
+                        for col in list(mapping_df.columns):
+                            if found_key:
+                                if not col or str(col).startswith("Unnamed"):
+                                    break
+                                mapping_columns.append(col)
+                            if col == mapping_key:
+                                found_key = True
+                        if not mapping_columns:
+                            continue  # nothing to map
+                        df = df.merge(mapping_df[[mapping_key] + mapping_columns], how='left', on=mapping_key)
+                        for col in mapping_columns:
+                            df[col].fillna("NA", inplace=True)
                 df.replace([np.inf, -np.inf], np.nan, inplace=True)
                 df.fillna("NA", inplace=True)
                 if file_ext in ['.xlsx', '.xls']:
@@ -667,10 +730,29 @@ class Melting(APIView):
             return Response({"error": "Project not found"}, status=404)
         user = project.user
         project_base_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user.id}/project_{project_id}")
-        file_folder = os.path.join(project_base_folder, file_type)
-        original_file_path = os.path.join(file_folder, file_name, sheet_name)
-        if not os.path.exists(original_file_path):
-            return Response({"error": f"Original file not found in {file_type} folder"}, status=404)
+        
+        # Handle concatenated file type
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(project_base_folder, "concatenated")
+            found = False
+            original_file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        original_file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({"error": "Original file not found in concatenated folder"}, status=404)
+        else:
+            # Regular file type handling
+            file_folder = os.path.join(project_base_folder, file_type)
+            original_file_path = os.path.join(file_folder, file_name, sheet_name)
+            if not os.path.exists(original_file_path):
+                return Response({"error": f"Original file not found in {file_type} folder"}, status=404)
         file_size_mb = os.path.getsize(original_file_path) / (1024 * 1024)
         try:
             if file_size_mb > 50:
@@ -796,10 +878,19 @@ class SheetInfo(APIView):
             project_id = request.data.get('project_id')
             sheet_name = request.data.get('sheet_name')
 
-            file_name = os.path.basename(file_name)
-
+            # Validate required fields first
             if not all([file_type, file_name, project_id, sheet_name]):
-                return Response({"error": "Missing required fields"}, status=400)
+                missing_fields = []
+                if not file_type: missing_fields.append('file_type')
+                if not file_name: missing_fields.append('file_name')
+                if not project_id: missing_fields.append('project_id')
+                if not sheet_name: missing_fields.append('sheet_name')
+                return Response({
+                    "error": f"Missing required fields: {', '.join(missing_fields)}"
+                }, status=400)
+
+            # Now safe to process file_name
+            file_name = os.path.basename(file_name)
 
             # Get project
             try:
@@ -838,11 +929,17 @@ class SheetInfo(APIView):
                 try:
                     df = pd.read_csv(file_path, encoding='utf-8')
                 except UnicodeDecodeError:
-                    df = pd.read_csv(file_path, encoding='latin1')
+                    try:
+                        df = pd.read_csv(file_path, encoding='latin1')
+                    except UnicodeDecodeError:
+                        df = pd.read_csv(file_path, encoding='cp1252')
             elif file_extension in ['.xlsx', '.xls']:
                 df = pd.read_excel(file_path)
             else:
                 return Response({"error": "Unsupported file format"}, status=400)
+
+            # Store original data as strings for format detection
+            original_df = df.astype(str)
 
             # Replace infinite values with None
             df = df.replace([np.inf, -np.inf], np.nan)
@@ -857,7 +954,23 @@ class SheetInfo(APIView):
 
                 # Get unique values safely
                 unique_values = column_data.dropna().unique()
-                unique_values_list = make_json_safe(unique_values.tolist()[:100])  # limit to 100 unique elements
+                
+                # Check if this is a numeric column and format accordingly
+                try:
+                    numeric_data = pd.to_numeric(column_data, errors='coerce')
+                    if not numeric_data.isnull().all():
+                        # Format numeric unique values to 2 decimal places
+                        def format_numeric_unique(val):
+                            if pd.notna(val):
+                                formatted = '{:.2f}'.format(float(val))
+                                return float(formatted)
+                            return val
+                        
+                        unique_values_list = [format_numeric_unique(val) for val in unique_values.tolist()[:100]]
+                    else:
+                        unique_values_list = make_json_safe(unique_values.tolist()[:100])
+                except:
+                    unique_values_list = make_json_safe(unique_values.tolist()[:100])
 
                 column_info[column] = {
                     "null_count": int(total_empty),
@@ -876,11 +989,19 @@ class SheetInfo(APIView):
                         max_val = numeric_data.max()
                         mean_val = numeric_data.mean()
                         
+                        def format_decimal(val):
+                            if pd.notna(val):
+                                # Format to 2 decimal places and convert back to float
+                                formatted = '{:.2f}'.format(float(val))
+                                # Convert to float to remove trailing zeros
+                                return float(formatted)
+                            return None
+                        
                         column_info[column].update({
                             "type": "numeric",
-                            "min": make_json_safe(min_val),
-                            "max": make_json_safe(max_val),
-                            "average": make_json_safe(mean_val),
+                            "min": format_decimal(min_val),
+                            "max": format_decimal(max_val),
+                            "average": format_decimal(mean_val),
                             "unique_values": int(numeric_data.nunique())
                         })
                         continue
@@ -889,6 +1010,9 @@ class SheetInfo(APIView):
 
                 # Check if datetime
                 try:
+                    # First, try to detect the format from the original string data
+                    original_column_data = original_df[column]
+                    date_format = self.detect_date_format(original_column_data)
                     date_data = pd.to_datetime(column_data, errors='coerce', dayfirst=False)
                     if not date_data.isnull().all():
                         granularity = 'daily'
@@ -917,12 +1041,36 @@ class SheetInfo(APIView):
                             missing_dates = sorted(expected_dates - existing_dates)
                             missing_formatted = [d.strftime('%Y-%m-%d') for d in missing_dates]
 
+                        # Format unique_elements in detected date format
+                        format_map = {
+                            'yyyy-mm-dd': '%Y-%m-%d',
+                            'yyyy/mm/dd': '%Y/%m/%d',
+                            'yyyy/dd/mm': '%Y/%d/%m',
+                            'mm/dd/yyyy': '%m/%d/%Y',
+                            'dd/mm/yyyy': '%d/%m/%Y',
+                            'mm-dd-yyyy': '%m-%d-%Y',
+                            'dd-mm-yyyy': '%d-%m-%Y',
+                            'mm.dd.yyyy': '%m.%d.%Y',
+                            'dd.mm.yyyy': '%d.%m.%Y',
+                            'yyyy.mm.dd': '%Y.%m.%d',
+                        }
+                        fmt_key = date_format.lower()
+                        strftime_fmt = format_map.get(fmt_key, '%Y-%m-%d')
+                        unique_dates = pd.Series(date_data_clean.unique())
+                        try:
+                            unique_elements = unique_dates.dt.strftime(strftime_fmt).tolist()
+                        except Exception:
+                            unique_elements = unique_dates.dt.strftime('%Y-%m-%d').tolist()
+
                         column_info[column].update({
                             "type": "datetime",
                             "granularity": granularity,
+                            "date_format": date_format,
                             "min_date": date_data_clean.min().strftime('%Y-%m-%d %H:%M:%S'),
                             "max_date": date_data_clean.max().strftime('%Y-%m-%d %H:%M:%S'),
-                            "missing_dates": missing_formatted
+                            "missing_dates": missing_formatted,
+                            "unique_elements": unique_elements,
+                            "unique_values": len(unique_elements)
                         })
                         continue
                 except:
@@ -949,6 +1097,73 @@ class SheetInfo(APIView):
         except Exception as e:
             return Response({"error": f"Error analyzing sheet: {str(e)}"}, status=500)
 
+    def detect_date_format(self, date_series):
+        """
+        Detect the date format from a series of date strings.
+        Returns the most common format found in the data.
+        """
+        import re
+        from collections import Counter
+        
+        # Common date patterns
+        patterns = {
+            'MM/DD/YYYY': r'^\d{1,2}/\d{1,2}/\d{4}',
+            'DD/MM/YYYY': r'^\d{1,2}/\d{1,2}/\d{4}',
+            'YYYY-MM-DD': r'^\d{4}-\d{1,2}-\d{1,2}',
+            'YYYY/MM/DD': r'^\d{4}/\d{1,2}/\d{1,2}',
+            'YYYY/DD/MM': r'^\d{4}/\d{1,2}/\d{1,2}',
+            'MM-DD-YYYY': r'^\d{1,2}-\d{1,2}-\d{4}',
+            'DD-MM-YYYY': r'^\d{1,2}-\d{1,2}-\d{4}',
+            'MM.DD.YYYY': r'^\d{1,2}\.\d{1,2}\.\d{4}',
+            'DD.MM.YYYY': r'^\d{1,2}\.\d{1,2}\.\d{4}',
+            'YYYY.MM.DD': r'^\d{4}\.\d{1,2}\.\d{1,2}',
+        }
+        
+        # Convert to string and get unique values
+        date_strings = date_series.astype(str).unique()
+        format_counts = Counter()
+        
+        for date_str in date_strings:
+            if pd.isna(date_str) or date_str == 'nan' or date_str == '':
+                continue
+                
+            # Try to match each pattern
+            for format_name, pattern in patterns.items():
+                if re.match(pattern, date_str):
+                    # For ambiguous patterns (like MM/DD vs DD/MM), we need additional logic
+                    if format_name in ['MM/DD/YYYY', 'DD/MM/YYYY']:
+                        # Check if month > 12 to determine if it's DD/MM
+                        parts = date_str.split('/')
+                        if len(parts) == 3:
+                            first_part = int(parts[0])
+                            second_part = int(parts[1])
+                            if first_part > 12 and second_part <= 12:
+                                format_counts['DD/MM/YYYY'] += 1
+                            elif first_part <= 12 and second_part > 12:
+                                format_counts['MM/DD/YYYY'] += 1
+                            else:
+                                # Ambiguous case, assume MM/DD/YYYY as it's more common
+                                format_counts['MM/DD/YYYY'] += 1
+                    elif format_name in ['YYYY/MM/DD', 'YYYY/DD/MM']:
+                        # Check if second part > 12 to determine if it's YYYY/DD/MM
+                        parts = date_str.split('/')
+                        if len(parts) == 3:
+                            second_part = int(parts[1])
+                            if second_part > 12:
+                                format_counts['YYYY/DD/MM'] += 1
+                            else:
+                                format_counts['YYYY/MM/DD'] += 1
+                    else:
+                        format_counts[format_name] += 1
+                    break
+        
+        # Return the most common format, or a default if none found
+        if format_counts:
+            return format_counts.most_common(1)[0][0]
+        else:
+            return "Unknown"
+
+
 class CleaningColumns(APIView):
     def post(self, request):
         file_type = request.data.get('file_type')
@@ -974,13 +1189,32 @@ class CleaningColumns(APIView):
 
         user = project.user
         project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user.id}/project_{project.id}")
-        csv_folder_path = os.path.join(project_folder, file_type, file_name)
-        csv_file_path = os.path.join(csv_folder_path, sheet_name)
+        
+        # Handle concatenated file type
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(project_folder, "concatenated")
+            found = False
+            csv_file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        csv_file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({'error': 'CSV file not found in concatenated folder'}, status=404)
+        else:
+            # Regular file type handling
+            csv_folder_path = os.path.join(project_folder, file_type, file_name)
+            csv_file_path = os.path.join(csv_folder_path, sheet_name)
+            
+            if not default_storage.exists(csv_file_path):
+                return Response({'error': 'CSV file not found'}, status=404)
 
-        if not default_storage.exists(csv_file_path):
-            return Response({'error': 'CSV file not found'}, status=404)
-
-        local_path = os.path.join(settings.MEDIA_ROOT, csv_file_path)
+        local_path = os.path.join(settings.MEDIA_ROOT, csv_file_path) if not file_type == 'concatenated' else csv_file_path
         file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
 
         try:
@@ -1082,6 +1316,7 @@ class CleaningColumns(APIView):
                 user = project.user
             ip = request.META.get('REMOTE_ADDR')
             log_user_action(user, "clean_file", details=f"Cleaned file: {file_name}, sheet: {sheet_name}, type: {file_type}", ip_address=ip)
+
             return Response({
                 'message': 'CSV file cleaned successfully',
                 'cleaned_sheet': {
@@ -1151,6 +1386,7 @@ class CleaningColumns(APIView):
         return df
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class FileUploadView(APIView):
     def post(self, request):
         file_type = request.data.get('file_type')
@@ -1389,6 +1625,7 @@ class FileUploadView(APIView):
         
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class SignupView(APIView):
     def post(self, request):
         username = request.data.get('username')
@@ -1422,6 +1659,7 @@ class SignupView(APIView):
         }, status=201)
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class SigninView(APIView):
     def post(self, request):
         username = request.data.get('username')
@@ -1464,7 +1702,7 @@ class SigninView(APIView):
                 Your login verification code is: {otp_token.otp}
                 This code will expire in 10 minutes.
                 If you didn't request this code, please ignore this email.
-                
+
                 Best regards,
                 Sanitify, Skewb AI
                 '''
@@ -1500,6 +1738,8 @@ class SigninView(APIView):
             return Response({'error': 'Invalid credentials'}, status=401)
     
 
+
+@method_decorator(csrf_exempt, name='dispatch')
 class VerifyOTPView(APIView):
     def post(self, request):
         user_id = request.data.get('user_id')
@@ -1549,6 +1789,9 @@ class VerifyOTPView(APIView):
             'access': str(refresh.access_token),
             'message': 'Login successful'
         })
+
+
+@method_decorator(csrf_exempt, name='dispatch')
 class UploadProject(APIView):
     def post(self, request):
         user_id = request.data.get('user_id')
@@ -1585,9 +1828,8 @@ class UploadProject(APIView):
         spark_needed = False
         all_files = [(file, 'kpi') for file in kpi_files] + [(file, 'media') for file in media_files]
         
-        # Optimized file size checking - avoid writing files twice
+        # Check file sizes to determine if Spark is needed
         for file, _ in all_files:
-            # Get file size from Django's file object without writing to disk
             file.seek(0, 2)  # Seek to end
             file_size_bytes = file.tell()
             file.seek(0)  # Reset to beginning
@@ -1628,34 +1870,59 @@ class UploadProject(APIView):
             file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
             file_extension = os.path.splitext(file.name)[1].lower()
 
-            # Handle CSV files directly without conversion
+            # Handle CSV files
             if file_extension == '.csv':
-                # For CSV files, just copy them directly without conversion
-                csv_path = os.path.join(file_folder, file.name)
-                if temp_path != csv_path:
-                    import shutil
-                    shutil.copy2(temp_path, csv_path)
-                    os.remove(temp_path)
+                if file_size_mb < 50:
+                    # Pandas processing for small CSV
+                    df = pd.read_csv(temp_path)
+                    # Round numeric values to 2 decimal places
+                    for col in df.columns:
+                        try:
+                            df[col] = pd.to_numeric(df[col], errors='ignore')
+                            if df[col].dtype == 'float64':
+                                df[col] = df[col].round(2)
+                        except:
+                            pass
+                    df.to_csv(temp_path, index=False)
+                else:
+                    # Spark processing for large CSV
+                    from pyspark.sql.functions import col, round
+                    from pyspark.sql.types import DoubleType, FloatType, DecimalType
+                    
+                    with spark_session_context() as spark:
+                        df = spark.read.csv(temp_path, header=True)
+                        # Round numeric columns to 2 decimal places
+                        for field in df.schema.fields:
+                            if isinstance(field.dataType, (DoubleType, FloatType, DecimalType)):
+                                df = df.withColumn(field.name, round(col(field.name), 2))
+                        df.write.csv(temp_path, header=True, mode='overwrite')
                 
                 commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{file.name}"
-                subprocess.run(["git", "add", csv_path], cwd=project_folder)
+                subprocess.run(["git", "add", temp_path], cwd=project_folder)
                 subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
                 
-            # Handle Excel files with conversion to CSV
+            # Handle Excel files
             elif file_extension in ['.xlsx', '.xls']:
                 if file_size_mb < 50:
+                    # Pandas processing for small Excel
                     with pd.ExcelFile(temp_path) as xls:
                         for sheet_name in xls.sheet_names:
                             df = xls.parse(sheet_name, dtype=str)
+                            # Round numeric values to 2 decimal places
+                            for col in df.columns:
+                                try:
+                                    df[col] = pd.to_numeric(df[col], errors='ignore')
+                                    if df[col].dtype == 'float64':
+                                        df[col] = df[col].round(2)
+                                except:
+                                    pass
                             sheet_path = os.path.join(file_folder, f"{sheet_name}.csv")
                             df.to_csv(sheet_path, index=False)
                             commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
                             subprocess.run(["git", "add", sheet_path], cwd=project_folder)
                             subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
                 else:
-                    # Use the new robust Spark session management for large files
-                    from .spark_utils import spark_session_context, validate_spark_session
-                    
+                    # Spark processing for large Excel
                     try:
                         xls = pd.ExcelFile(temp_path, engine='openpyxl')
                         sheet_names = xls.sheet_names
@@ -1667,50 +1934,88 @@ class UploadProject(APIView):
                         output_path = os.path.join(file_folder, f"{sheet_name}.csv")
                         commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
                         
-                        with spark_session_context() as spark:
-                            # Validate session before use
-                            if not validate_spark_session(spark):
-                                raise Exception("Invalid Spark session. Please try again.")
-                            
+                        try:
+                            with spark_session_context() as spark:
+                                if not validate_spark_session(spark):
+                                    raise Exception("Invalid Spark session. Please try again.")
+                                
+                                try:
+                                    from pyspark.sql.functions import col, round
+                                    from pyspark.sql.types import DoubleType, FloatType, DecimalType
+                                    
+                                    df = spark.read \
+                                        .format("com.crealytics.spark.excel") \
+                                        .option("dataAddress", f"'{sheet_name}'!A1") \
+                                        .option("header", "true") \
+                                        .option("inferSchema", "false") \
+                                        .option("maxRowsInMemory", 50000) \
+                                        .option("maxColumns", 20000) \
+                                        .option("treatEmptyValuesAsNulls", "true") \
+                                        .option("workbookPassword", None) \
+                                        .load(temp_path)
+                                    
+                                    # Round numeric columns to 2 decimal places
+                                    for field in df.schema.fields:
+                                        if isinstance(field.dataType, (DoubleType, FloatType, DecimalType)):
+                                            df = df.withColumn(field.name, round(col(field.name), 2))
+                                    
+                                    df = df.cache()
+                                    df.toPandas().to_csv(output_path, index=False)
+                                    df.unpersist()
+                                    
+                                    subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                    
+                                except Exception as e:
+                                    if "RecordFormatException" in str(e):
+                                        import warnings
+                                        warnings.filterwarnings("ignore", category=UserWarning)
+                                        try:
+                                            xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                                            df = xls.parse(sheet_name, dtype=str)
+                                            # Round numeric values to 2 decimal places
+                                            for col in df.columns:
+                                                try:
+                                                    df[col] = pd.to_numeric(df[col], errors='ignore')
+                                                    if df[col].dtype == 'float64':
+                                                        df[col] = df[col].round(2)
+                                                except:
+                                                    pass
+                                            df.to_csv(output_path, index=False)
+                                            subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                            subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                            print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
+                                        except Exception as pe:
+                                            print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
+                                            raise
+                                    else:
+                                        print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
+                                        raise
+                        except Exception as e:
+                            print(f"❌ Failed to process sheet {sheet_name}: {e}")
+                            # Try pandas fallback directly
                             try:
-                                df = spark.read \
-                                    .format("com.crealytics.spark.excel") \
-                                    .option("dataAddress", f"'{sheet_name}'!A1") \
-                                    .option("header", "true") \
-                                    .option("inferSchema", "false") \
-                                    .option("maxRowsInMemory", 50000) \
-                                    .option("maxColumns", 20000) \
-                                    .option("treatEmptyValuesAsNulls", "true") \
-                                    .option("workbookPassword", None) \
-                                    .load(temp_path)
-                                
-                                # Cache for better performance
-                                df = df.cache()
-                                df.toPandas().to_csv(output_path, index=False)
-                                df.unpersist()  # Free memory
-                                
+                                import warnings
+                                warnings.filterwarnings("ignore", category=UserWarning)
+                                xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                                df = xls.parse(sheet_name, dtype=str)
+                                # Round numeric values to 2 decimal places
+                                for col in df.columns:
+                                    try:
+                                        df[col] = pd.to_numeric(df[col], errors='ignore')
+                                        if df[col].dtype == 'float64':
+                                            df[col] = df[col].round(2)
+                                    except:
+                                        pass
+                                df.to_csv(output_path, index=False)
                                 subprocess.run(["git", "add", output_path], cwd=project_folder)
                                 subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                                
-                            except Exception as e:
-                                if "RecordFormatException" in str(e):
-                                    import warnings
-                                    warnings.filterwarnings("ignore", category=UserWarning)
-                                    try:
-                                        xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                                        df = xls.parse(sheet_name, dtype=str)
-                                        df.to_csv(output_path, index=False)
-                                        subprocess.run(["git", "add", output_path], cwd=project_folder)
-                                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                                        print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
-                                    except Exception as pe:
-                                        print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
-                                        raise
-                                else:
-                                    print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
-                                    raise
+                                print(f"✅ Pandas fallback successful for sheet: {sheet_name}")
+                            except Exception as pe:
+                                print(f"❌ All processing methods failed for {sheet_name}: {pe}")
+                                raise
                     
-                    # Use optimized thread pool for parallel processing
+                    # Process sheets in parallel
                     with ThreadPoolExecutor(max_workers=min(8, len(sheet_names))) as executor:
                         futures = [executor.submit(convert_sheet, sheet) for sheet in sheet_names]
                         for f in futures:
@@ -1723,11 +2028,13 @@ class UploadProject(APIView):
             updated_list.append(file_basename)
             setattr(project, id_field, file_id)
 
+        # Process all KPI files
         updated_kpi_files = []
         for file in kpi_files:
             process_file(file, 'kpi')
             updated_kpi_files.append(os.path.splitext(file.name)[0])
 
+        # Process all Media files
         updated_media_files = []
         for file in media_files:
             process_file(file, 'media')
@@ -1747,7 +2054,7 @@ class UploadProject(APIView):
         }, status=201)
 
 
-
+@method_decorator(csrf_exempt, name='dispatch')
 class UserProjectsView(APIView):
     def post(self, request):
         user_id = request.data.get('user_id')
@@ -2454,12 +2761,30 @@ class UndoRedoSheet(APIView):
 
         # Use project owner's folder for git operations
         project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project_owner_id}/project_{project_id}")
-        sheet_path = os.path.join(project_folder, file_type, file_name, f"{sheet_name}")
-
-        sheet_path=os.path.normpath(sheet_path)
-        print(f"Debug - sheet_path: {sheet_path}")
-        if not os.path.exists(sheet_path):
-            return Response({"error": "Sheet file not found"}, status=404)
+        
+        # Handle concatenated file type
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(project_folder, "concatenated")
+            found = False
+            sheet_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        sheet_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({"error": "Sheet file not found in concatenated folder"}, status=404)
+        else:
+            # Regular file type handling
+            sheet_path = os.path.join(project_folder, file_type, file_name, f"{sheet_name}")
+            sheet_path = os.path.normpath(sheet_path)
+            print(f"Debug - sheet_path: {sheet_path}")
+            if not os.path.exists(sheet_path):
+                return Response({"error": "Sheet file not found"}, status=404)
 
         try:
             print("1")
@@ -2646,293 +2971,293 @@ class PivotEDAAnalysis(APIView):
         return {}
 
 
-class DownloadEDAExcel(APIView):
-    parser_classes = [JSONParser]
+# class DownloadEDAExcel(APIView):
+#     parser_classes = [JSONParser]
 
-    def post(self, request):
-        eda_results = request.data.get('eda_results')
-        personalized_plots = request.data.get('personalized_plots')
-        if not eda_results:
-            return Response({'error': 'No EDA results provided'}, status=400)
+#     def post(self, request):
+#         eda_results = request.data.get('eda_results')
+#         personalized_plots = request.data.get('personalized_plots')
+#         if not eda_results:
+#             return Response({'error': 'No EDA results provided'}, status=400)
 
-        wb = Workbook()
-        ws_summary = wb.active
-        ws_summary.title = 'Summary'
+#         wb = Workbook()
+#         ws_summary = wb.active
+#         ws_summary.title = 'Summary'
 
-        # Write basic info
-        basic_info = eda_results.get('basic_info') or eda_results.get('summary', {}).get('dataset_info', {})
-        if basic_info:
-            ws_summary.append(['Metric', 'Value'])
-            for k, v in basic_info.items():
-                if isinstance(v, dict):
-                    continue
-                ws_summary.append([k, v])
+#         # Write basic info
+#         basic_info = eda_results.get('basic_info') or eda_results.get('summary', {}).get('dataset_info', {})
+#         if basic_info:
+#             ws_summary.append(['Metric', 'Value'])
+#             for k, v in basic_info.items():
+#                 if isinstance(v, dict):
+#                     continue
+#                 ws_summary.append([k, v])
 
-        # Write missing values
-        missing_values = eda_results.get('missing_values') or eda_results.get('data_quality')
-        if missing_values:
-            ws_missing = wb.create_sheet('Missing Values')
-            ws_missing.append(['Column', 'Missing Count', 'Missing %'])
-            for col, stats in missing_values.items():
-                ws_missing.append([col, stats.get('missing_count') or stats.get('count'), stats.get('missing_percentage') or stats.get('percentage')])
-            # Add bar chart for missing values
-            chart = BarChart()
-            chart.title = 'Missing Values by Column'
-            chart.x_axis.title = 'Column'
-            chart.y_axis.title = 'Missing Count'
-            data = Reference(ws_missing, min_col=2, min_row=1, max_row=ws_missing.max_row, max_col=2)
-            cats = Reference(ws_missing, min_col=1, min_row=2, max_row=ws_missing.max_row)
-            chart.add_data(data, titles_from_data=True)
-            chart.set_categories(cats)
-            ws_missing.add_chart(chart, 'E2')
+#         # Write missing values
+#         missing_values = eda_results.get('missing_values') or eda_results.get('data_quality')
+#         if missing_values:
+#             ws_missing = wb.create_sheet('Missing Values')
+#             ws_missing.append(['Column', 'Missing Count', 'Missing %'])
+#             for col, stats in missing_values.items():
+#                 ws_missing.append([col, stats.get('missing_count') or stats.get('count'), stats.get('missing_percentage') or stats.get('percentage')])
+#             # Add bar chart for missing values
+#             chart = BarChart()
+#             chart.title = 'Missing Values by Column'
+#             chart.x_axis.title = 'Column'
+#             chart.y_axis.title = 'Missing Count'
+#             data = Reference(ws_missing, min_col=2, min_row=1, max_row=ws_missing.max_row, max_col=2)
+#             cats = Reference(ws_missing, min_col=1, min_row=2, max_row=ws_missing.max_row)
+#             chart.add_data(data, titles_from_data=True)
+#             chart.set_categories(cats)
+#             ws_missing.add_chart(chart, 'E2')
 
-        # Write numerical stats
-        numerical_stats = eda_results.get('numerical_stats') or eda_results.get('detailed_analysis', {}).get('numerical')
-        if numerical_stats:
-            ws_num = wb.create_sheet('Numerical Stats')
-            ws_num.append(['Column', 'Mean', 'Median', 'Std', 'Variance', 'Min', 'Max'])
-            for col, stats in numerical_stats.items():
-                ws_num.append([
-                    col,
-                    stats.get('mean'),
-                    stats.get('median'),
-                    stats.get('std'),
-                    stats.get('variance'),
-                    stats.get('min'),
-                    stats.get('max'),
-                ])
-            # Add histogram/bar chart for each numerical column with histogram data
-            for col, stats in numerical_stats.items():
-                if 'histogram' in stats:
-                    hist = stats['histogram']
-                    ws_hist = wb.create_sheet(f'{col} Histogram')
-                    ws_hist.append(['Bin', 'Count'])
-                    for bin_val, count in zip(hist['bins'], hist['counts']):
-                        ws_hist.append([bin_val, count])
-                    chart = BarChart()
-                    chart.title = f'Histogram of {col}'
-                    chart.x_axis.title = 'Bin'
-                    chart.y_axis.title = 'Count'
-                    data = Reference(ws_hist, min_col=2, min_row=1, max_row=ws_hist.max_row, max_col=2)
-                    cats = Reference(ws_hist, min_col=1, min_row=2, max_row=ws_hist.max_row)
-                    chart.add_data(data, titles_from_data=True)
-                    chart.set_categories(cats)
-                    ws_hist.add_chart(chart, 'E2')
+#         # Write numerical stats
+#         numerical_stats = eda_results.get('numerical_stats') or eda_results.get('detailed_analysis', {}).get('numerical')
+#         if numerical_stats:
+#             ws_num = wb.create_sheet('Numerical Stats')
+#             ws_num.append(['Column', 'Mean', 'Median', 'Std', 'Variance', 'Min', 'Max'])
+#             for col, stats in numerical_stats.items():
+#                 ws_num.append([
+#                     col,
+#                     stats.get('mean'),
+#                     stats.get('median'),
+#                     stats.get('std'),
+#                     stats.get('variance'),
+#                     stats.get('min'),
+#                     stats.get('max'),
+#                 ])
+#             # Add histogram/bar chart for each numerical column with histogram data
+#             for col, stats in numerical_stats.items():
+#                 if 'histogram' in stats:
+#                     hist = stats['histogram']
+#                     ws_hist = wb.create_sheet(f'{col} Histogram')
+#                     ws_hist.append(['Bin', 'Count'])
+#                     for bin_val, count in zip(hist['bins'], hist['counts']):
+#                         ws_hist.append([bin_val, count])
+#                     chart = BarChart()
+#                     chart.title = f'Histogram of {col}'
+#                     chart.x_axis.title = 'Bin'
+#                     chart.y_axis.title = 'Count'
+#                     data = Reference(ws_hist, min_col=2, min_row=1, max_row=ws_hist.max_row, max_col=2)
+#                     cats = Reference(ws_hist, min_col=1, min_row=2, max_row=ws_hist.max_row)
+#                     chart.add_data(data, titles_from_data=True)
+#                     chart.set_categories(cats)
+#                     ws_hist.add_chart(chart, 'E2')
 
-        # Write categorical stats
-        categorical_stats = eda_results.get('categorical_stats') or eda_results.get('detailed_analysis', {}).get('categorical')
-        if categorical_stats:
-            ws_cat = wb.create_sheet('Categorical Stats')
-            ws_cat.append(['Column', 'Unique Values', 'Top Category', 'Top Count'])
-            for col, stats in categorical_stats.items():
-                top_cat = None
-                top_count = None
-                if 'top_categories' in stats:
-                    top_items = list(stats['top_categories'].items())
-                    if top_items:
-                        top_cat, top_count = top_items[0]
-                ws_cat.append([
-                    col,
-                    stats.get('unique_values'),
-                    top_cat,
-                    top_count
-                ])
-            # Pie chart for each categorical column with top_categories
-            for col, stats in categorical_stats.items():
-                if 'top_categories' in stats:
-                    ws_pie = wb.create_sheet(f'{col} Pie')
-                    ws_pie.append(['Category', 'Count'])
-                    for cat, count in stats['top_categories'].items():
-                        ws_pie.append([cat, count])
-                    chart = PieChart()
-                    chart.title = f'Pie Chart of {col}'
-                    data = Reference(ws_pie, min_col=2, min_row=1, max_row=ws_pie.max_row, max_col=2)
-                    labels = Reference(ws_pie, min_col=1, min_row=2, max_row=ws_pie.max_row)
-                    chart.add_data(data, titles_from_data=True)
-                    chart.set_categories(labels)
-                    ws_pie.add_chart(chart, 'E2')
+#         # Write categorical stats
+#         categorical_stats = eda_results.get('categorical_stats') or eda_results.get('detailed_analysis', {}).get('categorical')
+#         if categorical_stats:
+#             ws_cat = wb.create_sheet('Categorical Stats')
+#             ws_cat.append(['Column', 'Unique Values', 'Top Category', 'Top Count'])
+#             for col, stats in categorical_stats.items():
+#                 top_cat = None
+#                 top_count = None
+#                 if 'top_categories' in stats:
+#                     top_items = list(stats['top_categories'].items())
+#                     if top_items:
+#                         top_cat, top_count = top_items[0]
+#                 ws_cat.append([
+#                     col,
+#                     stats.get('unique_values'),
+#                     top_cat,
+#                     top_count
+#                 ])
+#             # Pie chart for each categorical column with top_categories
+#             for col, stats in categorical_stats.items():
+#                 if 'top_categories' in stats:
+#                     ws_pie = wb.create_sheet(f'{col} Pie')
+#                     ws_pie.append(['Category', 'Count'])
+#                     for cat, count in stats['top_categories'].items():
+#                         ws_pie.append([cat, count])
+#                     chart = PieChart()
+#                     chart.title = f'Pie Chart of {col}'
+#                     data = Reference(ws_pie, min_col=2, min_row=1, max_row=ws_pie.max_row, max_col=2)
+#                     labels = Reference(ws_pie, min_col=1, min_row=2, max_row=ws_pie.max_row)
+#                     chart.add_data(data, titles_from_data=True)
+#                     chart.set_categories(labels)
+#                     ws_pie.add_chart(chart, 'E2')
 
-        # Write correlation matrix
-        correlation = eda_results.get('correlation') or eda_results.get('detailed_analysis', {}).get('correlations')
-        if correlation:
-            ws_corr = wb.create_sheet('Correlations')
-            cols = list(correlation.keys())
-            ws_corr.append([''] + cols)
-            for row in cols:
-                ws_corr.append([row] + [correlation[row].get(col, '') for col in cols])
-            # Add heatmap as a bar chart for the first row (Excel doesn't support heatmaps natively)
-            chart = BarChart()
-            chart.title = 'Correlation (First Variable)'
-            chart.x_axis.title = 'Variable'
-            chart.y_axis.title = 'Correlation'
-            data = Reference(ws_corr, min_col=2, min_row=1, max_row=2, max_col=len(cols)+1)
-            cats = Reference(ws_corr, min_col=2, min_row=1, max_row=1, max_col=len(cols)+1)
-            chart.add_data(data, titles_from_data=True)
-            chart.set_categories(cats)
-            ws_corr.add_chart(chart, 'E10')
+#         # Write correlation matrix
+#         correlation = eda_results.get('correlation') or eda_results.get('detailed_analysis', {}).get('correlations')
+#         if correlation:
+#             ws_corr = wb.create_sheet('Correlations')
+#             cols = list(correlation.keys())
+#             ws_corr.append([''] + cols)
+#             for row in cols:
+#                 ws_corr.append([row] + [correlation[row].get(col, '') for col in cols])
+#             # Add heatmap as a bar chart for the first row (Excel doesn't support heatmaps natively)
+#             chart = BarChart()
+#             chart.title = 'Correlation (First Variable)'
+#             chart.x_axis.title = 'Variable'
+#             chart.y_axis.title = 'Correlation'
+#             data = Reference(ws_corr, min_col=2, min_row=1, max_row=2, max_col=len(cols)+1)
+#             cats = Reference(ws_corr, min_col=2, min_row=1, max_row=1, max_col=len(cols)+1)
+#             chart.add_data(data, titles_from_data=True)
+#             chart.set_categories(cats)
+#             ws_corr.add_chart(chart, 'E10')
 
-        # --- Add personalized plots if present ---
-        if personalized_plots:
-            for idx, plot in enumerate(personalized_plots):
-                chart_type = plot.get('chartType', 'bar').lower()
-                chart_data = plot.get('chartData', {})
-                labels = chart_data.get('labels', [])
-                datasets = chart_data.get('datasets', [])
-                sheet_title = f'Personalized Plot {idx+1}'
-                ws = wb.create_sheet(title=sheet_title[:31])
-                # Write header
-                ws.append(['Label'] + [ds.get('label', f'Data{i+1}') for i, ds in enumerate(datasets)])
-                # Write data
-                for i, label in enumerate(labels):
-                    row = [label]
-                    for ds in datasets:
-                        data = ds.get('data', [])
-                        row.append(data[i] if i < len(data) else None)
-                    ws.append(row)
-                # Add chart for all datasets
-                if labels and datasets:
-                    data_len = len(labels)
-                    data_ref = Reference(ws, min_col=2, min_row=1, max_row=data_len+1, max_col=1+len(datasets))
-                    cats_ref = Reference(ws, min_col=1, min_row=2, max_row=data_len+1)
-                    if chart_type == 'line':
-                        chart = LineChart()
-                    else:
-                        chart = BarChart()
-                        chart.type = "col"
-                        if chart_type == 'stacked':
-                            chart.grouping = 'stacked'
-                        elif chart_type in ['stacked100', 'stacked_100', '100stacked', '100%stacked']:
-                            chart.grouping = 'percentStacked'
-                    chart.title = sheet_title
-                    chart.x_axis.title = 'Label'
-                    chart.y_axis.title = 'Value'
-                    chart.add_data(data_ref, titles_from_data=True)
-                    chart.set_categories(cats_ref)
-                    ws.add_chart(chart, f"E2")
+#         # --- Add personalized plots if present ---
+#         if personalized_plots:
+#             for idx, plot in enumerate(personalized_plots):
+#                 chart_type = plot.get('chartType', 'bar').lower()
+#                 chart_data = plot.get('chartData', {})
+#                 labels = chart_data.get('labels', [])
+#                 datasets = chart_data.get('datasets', [])
+#                 sheet_title = f'Personalized Plot {idx+1}'
+#                 ws = wb.create_sheet(title=sheet_title[:31])
+#                 # Write header
+#                 ws.append(['Label'] + [ds.get('label', f'Data{i+1}') for i, ds in enumerate(datasets)])
+#                 # Write data
+#                 for i, label in enumerate(labels):
+#                     row = [label]
+#                     for ds in datasets:
+#                         data = ds.get('data', [])
+#                         row.append(data[i] if i < len(data) else None)
+#                     ws.append(row)
+#                 # Add chart for all datasets
+#                 if labels and datasets:
+#                     data_len = len(labels)
+#                     data_ref = Reference(ws, min_col=2, min_row=1, max_row=data_len+1, max_col=1+len(datasets))
+#                     cats_ref = Reference(ws, min_col=1, min_row=2, max_row=data_len+1)
+#                     if chart_type == 'line':
+#                         chart = LineChart()
+#                     else:
+#                         chart = BarChart()
+#                         chart.type = "col"
+#                         if chart_type == 'stacked':
+#                             chart.grouping = 'stacked'
+#                         elif chart_type in ['stacked100', 'stacked_100', '100stacked', '100%stacked']:
+#                             chart.grouping = 'percentStacked'
+#                     chart.title = sheet_title
+#                     chart.x_axis.title = 'Label'
+#                     chart.y_axis.title = 'Value'
+#                     chart.add_data(data_ref, titles_from_data=True)
+#                     chart.set_categories(cats_ref)
+#                     ws.add_chart(chart, f"E2")
 
-        # Save to a temporary file and return as response
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-            wb.save(tmp.name)
-            tmp.seek(0)
-            response = HttpResponse(tmp.read(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            response['Content-Disposition'] = 'attachment; filename="eda_report.xlsx"'
-            return response
+#         # Save to a temporary file and return as response
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+#             wb.save(tmp.name)
+#             tmp.seek(0)
+#             response = HttpResponse(tmp.read(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+#             response['Content-Disposition'] = 'attachment; filename="eda_report.xlsx"'
+#             return response
 
 
-class DownloadEDAPPTX(APIView):
-    parser_classes = [JSONParser]
+# class DownloadEDAPPTX(APIView):
+#     parser_classes = [JSONParser]
 
-    def post(self, request):
-        eda_results = request.data.get('eda_results')
-        personalized_plots = request.data.get('personalized_plots')
-        if not eda_results:
-            return Response({'error': 'No EDA results provided'}, status=400)
+#     def post(self, request):
+#         eda_results = request.data.get('eda_results')
+#         personalized_plots = request.data.get('personalized_plots')
+#         if not eda_results:
+#             return Response({'error': 'No EDA results provided'}, status=400)
 
-        prs = Presentation()
-        title_slide_layout = prs.slide_layouts[0]
-        slide = prs.slides.add_slide(title_slide_layout)
-        slide.shapes.title.text = "EDA Report"
-        slide.placeholders[1].text = "Generated by Sanitifi"
+#         prs = Presentation()
+#         title_slide_layout = prs.slide_layouts[0]
+#         slide = prs.slides.add_slide(title_slide_layout)
+#         slide.shapes.title.text = "EDA Report"
+#         slide.placeholders[1].text = "Generated by Sanitifi"
 
-        # Numerical plots (histograms)
-        numerical_stats = eda_results.get('numerical_stats') or eda_results.get('detailed_analysis', {}).get('numerical')
-        if numerical_stats:
-            for col, stats in numerical_stats.items():
-                hist = stats.get('histogram')
-                if hist and hist.get('bins') and hist.get('counts'):
-                    slide = prs.slides.add_slide(prs.slide_layouts[5])
-                    slide.shapes.title.text = f"Histogram: {col}"
-                    chart_data = CategoryChartData()
-                    bins = [str(b) for b in hist['bins'][:-1]]
-                    chart_data.categories = bins
-                    chart_data.add_series('Count', hist['counts'])
-                    x, y, cx, cy = Inches(1), Inches(1.5), Inches(8), Inches(4)
-                    chart = slide.shapes.add_chart(
-                        XL_CHART_TYPE.COLUMN_CLUSTERED, x, y, cx, cy, chart_data
-                    ).chart
-                    chart.has_legend = False
-                    chart.value_axis.has_major_gridlines = True
-                    chart.category_axis.tick_labels.font.size = Pt(10)
-                    chart.value_axis.tick_labels.font.size = Pt(10)
+#         # Numerical plots (histograms)
+#         numerical_stats = eda_results.get('numerical_stats') or eda_results.get('detailed_analysis', {}).get('numerical')
+#         if numerical_stats:
+#             for col, stats in numerical_stats.items():
+#                 hist = stats.get('histogram')
+#                 if hist and hist.get('bins') and hist.get('counts'):
+#                     slide = prs.slides.add_slide(prs.slide_layouts[5])
+#                     slide.shapes.title.text = f"Histogram: {col}"
+#                     chart_data = CategoryChartData()
+#                     bins = [str(b) for b in hist['bins'][:-1]]
+#                     chart_data.categories = bins
+#                     chart_data.add_series('Count', hist['counts'])
+#                     x, y, cx, cy = Inches(1), Inches(1.5), Inches(8), Inches(4)
+#                     chart = slide.shapes.add_chart(
+#                         XL_CHART_TYPE.COLUMN_CLUSTERED, x, y, cx, cy, chart_data
+#                     ).chart
+#                     chart.has_legend = False
+#                     chart.value_axis.has_major_gridlines = True
+#                     chart.category_axis.tick_labels.font.size = Pt(10)
+#                     chart.value_axis.tick_labels.font.size = Pt(10)
 
-        # Categorical plots (pie charts)
-        categorical_stats = eda_results.get('categorical_stats') or eda_results.get('detailed_analysis', {}).get('categorical')
-        if categorical_stats:
-            for col, stats in categorical_stats.items():
-                top_cats = stats.get('top_categories') or stats.get('value_counts')
-                if top_cats:
-                    slide = prs.slides.add_slide(prs.slide_layouts[5])
-                    slide.shapes.title.text = f"Pie Chart: {col}"
-                    chart_data = CategoryChartData()
-                    chart_data.categories = list(top_cats.keys())
-                    chart_data.add_series('Count', list(top_cats.values()))
-                    x, y, cx, cy = Inches(1), Inches(1.5), Inches(8), Inches(4)
-                    chart = slide.shapes.add_chart(
-                        XL_CHART_TYPE.PIE, x, y, cx, cy, chart_data
-                    ).chart
-                    chart.has_legend = True
-                    chart.legend.font.size = Pt(10)
+#         # Categorical plots (pie charts)
+#         categorical_stats = eda_results.get('categorical_stats') or eda_results.get('detailed_analysis', {}).get('categorical')
+#         if categorical_stats:
+#             for col, stats in categorical_stats.items():
+#                 top_cats = stats.get('top_categories') or stats.get('value_counts')
+#                 if top_cats:
+#                     slide = prs.slides.add_slide(prs.slide_layouts[5])
+#                     slide.shapes.title.text = f"Pie Chart: {col}"
+#                     chart_data = CategoryChartData()
+#                     chart_data.categories = list(top_cats.keys())
+#                     chart_data.add_series('Count', list(top_cats.values()))
+#                     x, y, cx, cy = Inches(1), Inches(1.5), Inches(8), Inches(4)
+#                     chart = slide.shapes.add_chart(
+#                         XL_CHART_TYPE.PIE, x, y, cx, cy, chart_data
+#                     ).chart
+#                     chart.has_legend = True
+#                     chart.legend.font.size = Pt(10)
 
-        # --- Add personalized plots if present ---
-        if personalized_plots:
-            for idx, plot in enumerate(personalized_plots):
-                chart_type = plot.get('plot_config', {}).get('chartType', 'bar').lower()
-                chart_data = plot.get('chart_data', {})
-                labels = chart_data.get('labels', [])
-                datasets = chart_data.get('datasets', [])
+#         # --- Add personalized plots if present ---
+#         if personalized_plots:
+#             for idx, plot in enumerate(personalized_plots):
+#                 chart_type = plot.get('plot_config', {}).get('chartType', 'bar').lower()
+#                 chart_data = plot.get('chart_data', {})
+#                 labels = chart_data.get('labels', [])
+#                 datasets = chart_data.get('datasets', [])
                 
-                # Get chart title from plot config or use default
-                chart_title = plot.get('plot_config', {}).get('selectedY', f'Personalized Plot {idx+1}')
+#                 # Get chart title from plot config or use default
+#                 chart_title = plot.get('plot_config', {}).get('selectedY', f'Personalized Plot {idx+1}')
                 
-                slide = prs.slides.add_slide(prs.slide_layouts[5])
-                slide.shapes.title.text = chart_title
+#                 slide = prs.slides.add_slide(prs.slide_layouts[5])
+#                 slide.shapes.title.text = chart_title
                 
-                chart_data_obj = CategoryChartData()
-                chart_data_obj.categories = labels
+#                 chart_data_obj = CategoryChartData()
+#                 chart_data_obj.categories = labels
                 
-                # Add each dataset as a series
-                for ds in datasets:
-                    series_name = ds.get('label', 'Data')
-                    series_data = ds.get('data', [])
-                    chart_data_obj.add_series(series_name, series_data)
+#                 # Add each dataset as a series
+#                 for ds in datasets:
+#                     series_name = ds.get('label', 'Data')
+#                     series_data = ds.get('data', [])
+#                     chart_data_obj.add_series(series_name, series_data)
                 
-                # Choose chart type based on plot_config
-                if chart_type == 'line':
-                    chart_type_obj = XL_CHART_TYPE.LINE
-                elif chart_type == 'stacked':
-                    chart_type_obj = XL_CHART_TYPE.COLUMN_STACKED
-                elif chart_type in ['stacked100', 'stacked_100', '100stacked', '100%stacked']:
-                    chart_type_obj = XL_CHART_TYPE.COLUMN_STACKED_100
-                else:
-                    chart_type_obj = XL_CHART_TYPE.COLUMN_CLUSTERED
+#                 # Choose chart type based on plot_config
+#                 if chart_type == 'line':
+#                     chart_type_obj = XL_CHART_TYPE.LINE
+#                 elif chart_type == 'stacked':
+#                     chart_type_obj = XL_CHART_TYPE.COLUMN_STACKED
+#                 elif chart_type in ['stacked100', 'stacked_100', '100stacked', '100%stacked']:
+#                     chart_type_obj = XL_CHART_TYPE.COLUMN_STACKED_100
+#                 else:
+#                     chart_type_obj = XL_CHART_TYPE.COLUMN_CLUSTERED
                 
-                x_pos, y_pos, cx, cy = Inches(1), Inches(1.5), Inches(8), Inches(4)
-                chart = slide.shapes.add_chart(
-                    chart_type_obj, x_pos, y_pos, cx, cy, chart_data_obj
-                ).chart
+#                 x_pos, y_pos, cx, cy = Inches(1), Inches(1.5), Inches(8), Inches(4)
+#                 chart = slide.shapes.add_chart(
+#                     chart_type_obj, x_pos, y_pos, cx, cy, chart_data_obj
+#                 ).chart
                 
-                # Configure chart appearance
-                chart.has_legend = True
-                chart.value_axis.has_major_gridlines = True
-                chart.category_axis.tick_labels.font.size = Pt(10)
-                chart.value_axis.tick_labels.font.size = Pt(10)
+#                 # Configure chart appearance
+#                 chart.has_legend = True
+#                 chart.value_axis.has_major_gridlines = True
+#                 chart.category_axis.tick_labels.font.size = Pt(10)
+#                 chart.value_axis.tick_labels.font.size = Pt(10)
                 
-                # Add axis titles
-                chart.category_axis.has_title = True
-                chart.value_axis.has_title = True
-                chart.category_axis.axis_title.text_frame.text = plot.get('plot_config', {}).get('selectedX', 'Label')
-                chart.value_axis.axis_title.text_frame.text = plot.get('plot_config', {}).get('selectedY', 'Value')
+#                 # Add axis titles
+#                 chart.category_axis.has_title = True
+#                 chart.value_axis.has_title = True
+#                 chart.category_axis.axis_title.text_frame.text = plot.get('plot_config', {}).get('selectedX', 'Label')
+#                 chart.value_axis.axis_title.text_frame.text = plot.get('plot_config', {}).get('selectedY', 'Value')
                 
-                # Set chart title
-                chart.chart_title.text_frame.text = chart_title
+#                 # Set chart title
+#                 chart.chart_title.text_frame.text = chart_title
 
-        # Save to a temporary file and return as response
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
-            prs.save(tmp.name)
-            tmp.seek(0)
-            response = HttpResponse(tmp.read(), content_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
-            response['Content-Disposition'] = 'attachment; filename="eda_report.pptx"'
-            return response
+#         # Save to a temporary file and return as response
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
+#             prs.save(tmp.name)
+#             tmp.seek(0)
+#             response = HttpResponse(tmp.read(), content_type='application/vnd.openxmlformats-officedocument.presentationml.presentation')
+#             response['Content-Disposition'] = 'attachment; filename="eda_report.pptx"'
+#             return response
 
 
 class SheetCommitGraph(APIView):
@@ -2968,8 +3293,27 @@ class SheetCommitGraph(APIView):
 
         # Use project owner's folder for git operations
         project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project_owner_id}/project_{project_id}")
-        sheet_path = os.path.join(project_folder, file_type, file_name, f"{sheet_name}")
-        sheet_path = os.path.normpath(sheet_path)
+        
+        # Handle concatenated file type
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(project_folder, "concatenated")
+            found = False
+            sheet_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        sheet_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({"error": "Sheet file not found in concatenated folder"}, status=404)
+        else:
+            # Regular file type handling
+            sheet_path = os.path.join(project_folder, file_type, file_name, f"{sheet_name}")
+            sheet_path = os.path.normpath(sheet_path)
 
         # Get commit log with parents and hashes
         result = subprocess.run(
@@ -3030,27 +3374,59 @@ class AddDateColumns(APIView):
             except Projects.DoesNotExist:
                 return Response({'error': 'Project not found'}, status=404)
 
-            file_path = os.path.join(
-                settings.MEDIA_ROOT,
-                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
-            )
-            file_path = os.path.normpath(file_path)
+            # Validate file path
+            if file_type == 'concatenated':
+                # Search all subfolders for the sheet_name
+                concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+                found = False
+                file_path = None
+                if os.path.exists(concatenated_base):
+                    for folder in os.listdir(concatenated_base):
+                        folder_path = os.path.join(concatenated_base, folder)
+                        candidate = os.path.join(folder_path, sheet_name)
+                        if os.path.isfile(candidate):
+                            file_path = candidate
+                            found = True
+                            break
+                if not found:
+                    return Response({'error': 'File not found in concatenated folder'}, status=404)
+            else:
+                # Regular file type handling
+                file_path = os.path.join(
+                    settings.MEDIA_ROOT,
+                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+                )
+                file_path = os.path.normpath(file_path)
 
-            if not os.path.exists(file_path):
-                return Response({'error': 'File not found'}, status=404)
+                if not os.path.exists(file_path):
+                    return Response({'error': 'File not found'}, status=404)
 
             file_extension = os.path.splitext(sheet_name)[1].lower()
             if file_extension == '.csv':
-                df = pd.read_csv(file_path)
+                try:
+                    df = pd.read_csv(file_path, encoding='utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        df = pd.read_csv(file_path, encoding='latin1')
+                    except UnicodeDecodeError:
+                        df = pd.read_csv(file_path, encoding='cp1252')
             elif file_extension in ['.xlsx', '.xls']:
                 df = pd.read_excel(file_path)
             else:
                 return Response({'error': 'Unsupported file format'}, status=400)
 
+            # Store original data as strings for format detection
+            original_df = df.astype(str)
+
             added_columns = []
             for col in datetime_columns:
                 if col in df.columns:
                     df[col] = df[col].astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
+                    
+                    # Detect date format from original data
+                    original_column_data = original_df[col]
+                    date_format = self.detect_date_format(original_column_data)
+                    
                     date_series = pd.to_datetime(df[col], errors='coerce')
 
                     year_col = f'{col}_year'
@@ -3064,7 +3440,18 @@ class AddDateColumns(APIView):
                         df[month_col] = date_series.dt.month
                         added_columns.append(month_col)
                     if month_year_col not in df.columns:
-                        df[month_year_col] = date_series.dt.strftime('%Y-%m')
+                        # Use format based on detected date format
+                        if date_format == 'MM/DD/YYYY':
+                            df[month_year_col] = date_series.dt.strftime('%m/%Y')
+                        elif date_format == 'DD/MM/YYYY':
+                            df[month_year_col] = date_series.dt.strftime('%m/%Y')
+                        elif date_format == 'YYYY/MM/DD':
+                            df[month_year_col] = date_series.dt.strftime('%Y/%m')
+                        elif date_format == 'YYYY/DD/MM':
+                            df[month_year_col] = date_series.dt.strftime('%Y/%m')
+                        else:
+                            # Default to ISO format
+                            df[month_year_col] = date_series.dt.strftime('%Y-%m')
                         added_columns.append(month_year_col)
                 else:
                     return Response({'error': f'Column {col} not found in sheet.'}, status=400)
@@ -3135,28 +3522,122 @@ class AddDateColumns(APIView):
         except Exception as e:
             return Response({'error': str(e)}, status=500)
 
+    def detect_date_format(self, date_series):
+        """
+        Detect the date format from a series of date strings.
+        Returns the most common format found in the data.
+        """
+        import re
+        from collections import Counter
+        
+        # Common date patterns
+        patterns = {
+            'MM/DD/YYYY': r'^\d{1,2}/\d{1,2}/\d{4}',
+            'DD/MM/YYYY': r'^\d{1,2}/\d{1,2}/\d{4}',
+            'YYYY-MM-DD': r'^\d{4}-\d{1,2}-\d{1,2}',
+            'YYYY/MM/DD': r'^\d{4}/\d{1,2}/\d{1,2}',
+            'YYYY/DD/MM': r'^\d{4}/\d{1,2}/\d{1,2}',
+            'MM-DD-YYYY': r'^\d{1,2}-\d{1,2}-\d{4}',
+            'DD-MM-YYYY': r'^\d{1,2}-\d{1,2}-\d{4}',
+            'MM.DD.YYYY': r'^\d{1,2}\.\d{1,2}\.\d{4}',
+            'DD.MM.YYYY': r'^\d{1,2}\.\d{1,2}\.\d{4}',
+            'YYYY.MM.DD': r'^\d{4}\.\d{1,2}\.\d{1,2}',
+        }
+        
+        # Convert to string and get unique values
+        date_strings = date_series.astype(str).unique()
+        format_counts = Counter()
+        
+        for date_str in date_strings:
+            if pd.isna(date_str) or date_str == 'nan' or date_str == '':
+                continue
+                
+            # Try to match each pattern
+            for format_name, pattern in patterns.items():
+                if re.match(pattern, date_str):
+                    # For ambiguous patterns (like MM/DD vs DD/MM), we need additional logic
+                    if format_name in ['MM/DD/YYYY', 'DD/MM/YYYY']:
+                        # Check if month > 12 to determine if it's DD/MM
+                        parts = date_str.split('/')
+                        if len(parts) == 3:
+                            first_part = int(parts[0])
+                            second_part = int(parts[1])
+                            if first_part > 12 and second_part <= 12:
+                                format_counts['DD/MM/YYYY'] += 1
+                            elif first_part <= 12 and second_part > 12:
+                                format_counts['MM/DD/YYYY'] += 1
+                            else:
+                                # Ambiguous case, assume MM/DD/YYYY as it's more common
+                                format_counts['MM/DD/YYYY'] += 1
+                    elif format_name in ['YYYY/MM/DD', 'YYYY/DD/MM']:
+                        # Check if second part > 12 to determine if it's YYYY/DD/MM
+                        parts = date_str.split('/')
+                        if len(parts) == 3:
+                            second_part = int(parts[1])
+                            if second_part > 12:
+                                format_counts['YYYY/DD/MM'] += 1
+                            else:
+                                format_counts['YYYY/MM/DD'] += 1
+                    else:
+                        format_counts[format_name] += 1
+                    break
+        
+        # Return the most common format, or a default if none found
+        if format_counts:
+            return format_counts.most_common(1)[0][0]
+        else:
+            return "Unknown"
+
 
 class CreateGoogleSheet(APIView):
     def post(self, request):
+        import pandas as pd
+        import os
+        from googleapiclient.errors import HttpError
+
         file_type = request.data.get('file_type')
         file_name = request.data.get('file_name')
         project_id = request.data.get('project_id')
         sheet_name = request.data.get('sheet_name')
+
         if not all([file_type, file_name, project_id, sheet_name]):
             return Response({'error': 'Missing required fields'}, status=400)
+
         file_name = os.path.basename(file_name)
+
         try:
             project = Projects.objects.get(id=project_id)
         except Projects.DoesNotExist:
             return Response({'error': 'Project not found'}, status=404)
-        file_path = os.path.join(
-            settings.MEDIA_ROOT,
-            f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
-        )
-        file_path = os.path.normpath(file_path)
-        if not os.path.exists(file_path):
-            return Response({'error': 'File not found'}, status=404)
+
+        # Validate file path
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+            found = False
+            file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({'error': 'File not found in concatenated folder'}, status=404)
+        else:
+            # Regular file type handling
+            file_path = os.path.normpath(os.path.join(
+                settings.MEDIA_ROOT,
+                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+            ))
+
+            if not os.path.exists(file_path):
+                return Response({'error': 'File not found'}, status=404)
+
         file_extension = os.path.splitext(sheet_name)[1].lower()
+
         try:
             if file_extension == '.csv':
                 try:
@@ -3167,57 +3648,65 @@ class CreateGoogleSheet(APIView):
                 df = pd.read_excel(file_path)
             else:
                 return Response({'error': 'Unsupported file format'}, status=400)
+
             data = [df.columns.tolist()] + df.astype(str).values.tolist()
+
             sheets_service, drive_service = get_gsheet_service()
-            # Use a unique key for this file/sheet
+            SHARED_FOLDER_ID = '1QJWYqQ9bs2gv_JVqGcbJSlh21evK6PT0'
+
+            # ✅ Step 1: Create Google Sheet in service account's Drive
+            file_metadata = {
+                'name': f'EditData_{sheet_name}',
+                'mimeType': 'application/vnd.google-apps.spreadsheet'
+            }
+
+            created_file = drive_service.files().create(
+                body=file_metadata,
+                fields='id, parents',
+                supportsAllDrives=True
+            ).execute()
+
+            spreadsheet_id = created_file.get('id')
+
+            # ✅ Step 2: Move the file into your target folder
+            drive_service.files().update(
+                fileId=spreadsheet_id,
+                addParents=SHARED_FOLDER_ID,
+                removeParents='root',
+                fields='id, parents',
+                supportsAllDrives=True
+            ).execute()
+
+            # ✅ Step 3: Upload data to the first sheet
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range="Sheet1!A1",
+                valueInputOption="RAW",
+                body={"values": data}
+            ).execute()
+
+            # ✅ Step 4: Make the sheet public editable (optional)
+            drive_service.permissions().create(
+                fileId=spreadsheet_id,
+                body={"role": "writer", "type": "anyone"},
+                supportsAllDrives=True
+            ).execute()
+
+            # ✅ Step 5: Save to the project mapping
             sheet_key = f"{file_type}|{file_name}|{sheet_name}"
             google_sheet_ids = project.google_sheet_ids or {}
-            spreadsheet_id = google_sheet_ids.get(sheet_key)
-            if spreadsheet_id:
-                # Sheet already exists, update its data
-                try:
-                    sheets_service.spreadsheets().values().update(
-                        spreadsheetId=spreadsheet_id,
-                        range="Sheet1!A1",
-                        valueInputOption="RAW",
-                        body={"values": data}
-                    ).execute()
-                    # Make sure permissions are still correct (in case sheet was created before this logic)
-                    try:
-                        drive_service.permissions().create(
-                            fileId=spreadsheet_id,
-                            body={"role": "writer", "type": "anyone"},
-                        ).execute()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    # If update fails (e.g., sheet deleted), create a new one
-                    spreadsheet_id = None
-            if not spreadsheet_id:
-                # Create new Google Sheet, upload data, and store mapping
-                spreadsheet = sheets_service.spreadsheets().create(
-                    body={"properties": {"title": f"EditData_{sheet_name}"}},
-                    fields="spreadsheetId"
-                ).execute()
-                spreadsheet_id = spreadsheet.get('spreadsheetId')
-                sheets_service.spreadsheets().values().update(
-                    spreadsheetId=spreadsheet_id,
-                    range="Sheet1!A1",
-                    valueInputOption="RAW",
-                    body={"values": data}
-                ).execute()
-                drive_service.permissions().create(
-                    fileId=spreadsheet_id,
-                    body={"role": "writer", "type": "anyone"},
-                ).execute()
-                # Save mapping
-                google_sheet_ids[sheet_key] = spreadsheet_id
-                project.google_sheet_ids = google_sheet_ids
-                project.save()
+            google_sheet_ids[sheet_key] = spreadsheet_id
+            project.google_sheet_ids = google_sheet_ids
+            project.save()
+
             sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
             return Response({"sheet_url": sheet_url, "sheet_id": spreadsheet_id}, status=200)
+
+        except HttpError as e:
+            return Response({'error': f'Google API error: {e}'}, status=500)
         except Exception as e:
-            return Response({'error': f'Google Sheets error: {str(e)}'}, status=500)
+            return Response({'error': f'Unexpected error: {str(e)}'}, status=500)
+
 
 class UpdateFromGoogleSheet(APIView):
     def post(self, request):
@@ -3233,11 +3722,29 @@ class UpdateFromGoogleSheet(APIView):
             project = Projects.objects.get(id=project_id)
         except Projects.DoesNotExist:
             return Response({'error': 'Project not found'}, status=404)
-        file_path = os.path.join(
-            settings.MEDIA_ROOT,
-            f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
-        )
-        file_path = os.path.normpath(file_path)
+        # Validate file path
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+            found = False
+            file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({'error': 'File not found in concatenated folder'}, status=404)
+        else:
+            # Regular file type handling
+            file_path = os.path.join(
+                settings.MEDIA_ROOT,
+                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+            )
+            file_path = os.path.normpath(file_path)
         file_extension = os.path.splitext(sheet_name)[1].lower()
         try:
             sheets_service, _ = get_gsheet_service()
@@ -3549,9 +4056,25 @@ class DeleteFile(APIView):
                 import shutil
                 shutil.rmtree(file_path)
 
+            # Remove file reference from the database
+            updated = False
+            if file_type == 'kpi' and isinstance(project.kpi_file, list):
+                # Remove by basename or full path
+                project.kpi_file = [f for f in project.kpi_file if os.path.basename(f) != file_name and f != file_name]
+                updated = True
+            elif file_type == 'media' and isinstance(project.media_file, list):
+                project.media_file = [f for f in project.media_file if os.path.basename(f) != file_name and f != file_name]
+                updated = True
+            elif file_type == 'concatenated' and hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list):
+                project.concatenated_file = [f for f in project.concatenated_file if os.path.basename(f) != file_name and f != file_name]
+                updated = True
+            if updated:
+                project.save()
+
             return Response({'message': 'File or folder deleted successfully'}, status=200)
         except Exception as e:
             return Response({'error': str(e)}, status=500)
+
 
 class TimeoutException(Exception):
     pass
@@ -3631,18 +4154,35 @@ class CustomScriptRun(APIView):
                 return Response({'error': 'Project not found'}, status=404)
 
             # Validate file path
-            file_path = os.path.join(
-                settings.MEDIA_ROOT,
-                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
-            )
-            file_path = os.path.normpath(file_path)
+            if file_type == 'concatenated':
+                # Search all subfolders for the sheet_name
+                concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+                found = False
+                file_path = None
+                if os.path.exists(concatenated_base):
+                    for folder in os.listdir(concatenated_base):
+                        folder_path = os.path.join(concatenated_base, folder)
+                        candidate = os.path.join(folder_path, sheet_name)
+                        if os.path.isfile(candidate):
+                            file_path = candidate
+                            found = True
+                            break
+                if not found:
+                    return Response({'error': 'File not found in concatenated folder'}, status=404)
+            else:
+                # Regular file type handling
+                file_path = os.path.join(
+                    settings.MEDIA_ROOT,
+                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+                )
+                file_path = os.path.normpath(file_path)
 
-            # Security check to prevent directory traversal
-            if not file_path.startswith(os.path.normpath(settings.MEDIA_ROOT)):
-                return Response({'error': 'Invalid file path'}, status=400)
+                # Security check to prevent directory traversal
+                if not file_path.startswith(os.path.normpath(settings.MEDIA_ROOT)):
+                    return Response({'error': 'Invalid file path'}, status=400)
 
-            if not os.path.exists(file_path):
-                return Response({'error': 'File not found'}, status=404)
+                if not os.path.exists(file_path):
+                    return Response({'error': 'File not found'}, status=404)
 
             # Read the file
             file_extension = os.path.splitext(sheet_name)[1].lower()
@@ -3772,7 +4312,7 @@ class CustomScriptRun(APIView):
                         # Commit the changes
                         try:
                             subprocess.run(["git", "add", "."], cwd=project_folder, check=True)
-                            subprocess.run(["git", "commit", "-m", f"Script execution: {sheet_name}"], cwd=project_folder, check=True)
+                            subprocess.run(["git", "commit", "-m", f"Script execution: {file_type}/{file_name}/{sheet_name}"], cwd=project_folder, check=True)
                         except Exception as e:
                             print(f"Error committing to git: {str(e)}")
 
@@ -3947,7 +4487,10 @@ class ConcatenateSheets(APIView):
                     try:
                         df = pd.read_csv(sheet_path, encoding='utf-8')
                     except UnicodeDecodeError:
-                        df = pd.read_csv(sheet_path, encoding='latin1')
+                        try:
+                            df = pd.read_csv(sheet_path, encoding='latin1')
+                        except UnicodeDecodeError:
+                            df = pd.read_csv(sheet_path, encoding='cp1252')
                 elif file_extension in ['.xlsx', '.xls']:
                     df = pd.read_excel(sheet_path)
                 else:
@@ -4044,9 +4587,9 @@ class SavePlot(APIView):
                 }, status=400)
 
             # Validate file_type
-            if file_type not in ['kpi', 'media']:
+            if file_type not in ['kpi', 'media', 'concatenated']:
                 return Response({
-                    'error': 'Invalid file_type. Must be either "kpi" or "media"'
+                    'error': 'Invalid file_type. Must be either "kpi", "media", or "concatenated"'
                 }, status=400)
 
             # Check if user has access to this project/file
@@ -4425,9 +4968,9 @@ class SaveReportPivot(APIView):
                 }, status=400)
 
             # Validate file_type
-            if file_type not in ['kpi', 'media']:
+            if file_type not in ['kpi', 'media', 'concatenated']:
                 return Response({
-                    'error': 'Invalid file_type. Must be either "kpi" or "media"'
+                    'error': 'Invalid file_type. Must be either "kpi", "media", or "concatenated"'
                 }, status=400)
 
             # Check if user has access to this project/file
@@ -4579,6 +5122,8 @@ class FetchReportPivot(APIView):
 
         except Exception as e:
             return Response({'error': str(e)}, status=500)
+
+
 
 class DeleteReportPivot(APIView):
     parser_classes = [JSONParser]
@@ -6012,7 +6557,6 @@ class GetProjectSharedAccess(APIView):
                 'message': f'Error getting project shared access: {str(e)}'
             }, status=500)
 
-
 class GetSheets(APIView):
     """
     API endpoint to get sheets from a specific file in a project.
@@ -6181,7 +6725,7 @@ class GetSheets(APIView):
                     }
                     
                 except Exception as e:
-                    print(f"Error reading CSV file {csv_file}: {str(e)}")
+                    # print(f"Error reading CSV file {csv_file}: {str(e)}")
                     continue
 
             if not sheets_data:
@@ -6605,6 +7149,7 @@ class TestAPILogging(APIView):
             
         except Exception as e:
             return Response({'error': f'Test failed: {str(e)}'}, status=500)
+
 
 
 

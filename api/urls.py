@@ -24,11 +24,9 @@ urlpatterns = [
     path('auth/projects/delete', views.DeleteProject.as_view(), name='projects'),
     path('update/', views.UpdateProject.as_view(), name='update_project'),
     path('info/', views.SheetInfo.as_view(), name='sheet_info'),
-    #path('eda/', views.EnhancedEDAAnalysis.as_view(), name='eda_analysis'),
-    # path('eda-personalized/', views.PersonalizedEDAAnalysis.as_view(), name='personalized_eda_analysis'),
     path('pivot-eda/', views.PivotEDAAnalysis.as_view(), name='pivot_eda_analysis'),
-    path('download-eda-excel/', views.DownloadEDAExcel.as_view(), name='download_eda_excel'),
-    path('download-eda-pptx/', views.DownloadEDAPPTX.as_view(), name='download_eda_pptx'),
+    # path('download-eda-excel/', views.DownloadEDAExcel.as_view(), name='download_eda_excel'),
+    # path('download-eda-pptx/', views.DownloadEDAPPTX.as_view(), name='download_eda_pptx'),
     # path('download-personalized-eda-excel/', views.DownloadPersonalizedEDAExcel.as_view(), name='download_personalized_eda_excel'),
     # path('download-personalized-eda-pptx/', views.DownloadPersonalizedEDAPPTX.as_view(), name='download_personalized_eda_pptx'),
     path('sheet-commit-graph/', views.SheetCommitGraph.as_view(), name='sheet_commit_graph'),
@@ -75,6 +73,25 @@ urlpatterns = [
     path('logs/api/delete/', views.DeleteAPILogs.as_view(), name='delete_api_logs'),
     path('test-api-logging/', views.TestAPILogging.as_view(), name='test_api_logging'),
     path('new-api/example/', apis.ExampleNewAPI.as_view(), name='example_new_api'),
+    
+    # EDA Plot APIs
+    path('save-eda-plot/', apis.SaveEDAPlot.as_view(), name='save_eda_plot'),
+    path('fetch-eda-plots/', apis.FetchEDAPlots.as_view(), name='fetch_eda_plots'),
+    path('update-eda-plot/<int:plot_id>/', apis.UpdateEDAPlot.as_view(), name='update_eda_plot'),
+    path('delete-eda-plot/<int:plot_id>/', apis.DeleteEDAPlot.as_view(), name='delete_eda_plot'),
+    path('get-eda-plot-details/', apis.GetEDAPlotDetails.as_view(), name='get_eda_plot_details'),
+    path('get-enhanced-plot-data/', apis.GetEnhancedPlotData.as_view(), name='get_enhanced_plot_data'),
+    
+    # EDA Format APIs
+    path('save-eda-format/', apis.SaveEDAFormat.as_view(), name='save_eda_format'),
+    path('fetch-eda-formats/', apis.FetchEDAFormats.as_view(), name='fetch_eda_formats'),
+    path('apply-eda-format/', apis.ApplyEDAFormat.as_view(), name='apply_eda_format'),
+    path('delete-eda-format/<int:format_id>/', apis.DeleteEDAFormat.as_view(), name='delete_eda_format'),
+    path('get-eda-format-details/', apis.GetEDAFormatDetails.as_view(), name='get_eda_format_details'),
+    
+    # EDA Plot Download API
+    path('download-eda-plots-excel/', apis.DownloadEDAPlotsExcel.as_view(), name='download_eda_plots_excel'),
+    
+    # Logging API
+    path('logging/', apis.LoggingAPI.as_view(), name='logging_api'),
 ]+ static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-
-# Add new API routes from apis.py below this line

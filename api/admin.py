@@ -18,6 +18,8 @@ class UserActionLogModel(admin.ModelAdmin):
     list_filter=['action','timestamp']
     search_fields=['user__username','user__email','action','details']
     readonly_fields=['timestamp']
+    actions = ['delete_selected']  # Enables the default delete action
+    list_per_page = 200
 
 class APILogModel(admin.ModelAdmin):
     list_display=['id','method','endpoint','user_display','response_status','request_timestamp','duration_ms']

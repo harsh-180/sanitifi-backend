@@ -176,6 +176,102 @@ class SavedPivotPlot(models.Model):
     def __str__(self):
         return f"{self.plot_name} - {self.pivot.pivot_name} - {self.user.username}"
 
+class EDAPlot(models.Model):
+    """
+    Model to store EDA (Exploratory Data Analysis) plots
+    """
+    PLOT_TYPES = [
+        ('histogram', 'Histogram'),
+        ('boxplot', 'Box Plot'),
+        ('scatter', 'Scatter Plot'),
+        ('correlation', 'Correlation Matrix'),
+        ('missing_values', 'Missing Values'),
+        ('distribution', 'Distribution Plot'),
+        ('heatmap', 'Heatmap'),
+        ('bar', 'Bar Chart'),
+        ('line', 'Line Chart'),
+        ('pie', 'Pie Chart'),
+        ('custom', 'Custom Plot'),
+    ]
+    
+    user = models.ForeignKey('User', on_delete=models.CASCADE)
+    project = models.ForeignKey('Projects', on_delete=models.CASCADE)
+    plot_name = models.CharField(max_length=255, default='EDA Plot')
+    plot_type = models.CharField(max_length=20, choices=PLOT_TYPES, default='custom')
+    
+    # Data source information
+    file_type = models.CharField(max_length=50, blank=True, null=True)  # 'kpi', 'media', 'concatenated'
+    file_name = models.CharField(max_length=255, blank=True, null=True)
+    sheet_name = models.CharField(max_length=255, blank=True, null=True)
+    
+    # Plot configuration and data
+    plot_config = models.JSONField(default=dict)  # Stores plot configuration (xAxes, yAxis, yAxes, chartType, etc.)
+    chart_data = models.JSONField(default=dict)  # Stores the actual chart data
+    chart_options = models.JSONField(default=dict)  # Stores chart styling and options
+    
+    # EDA-specific metadata
+    eda_analysis_type = models.CharField(max_length=100, blank=True, null=True)  # e.g., 'numerical_analysis', 'categorical_analysis'
+    columns_analyzed = models.JSONField(default=list)  # List of columns used in the analysis
+    data_summary = models.JSONField(default=dict)  # Summary statistics of the data used
+    
+    # Additional metadata
+    description = models.TextField(blank=True, null=True)
+    tags = models.JSONField(default=list)  # For categorizing plots
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+        unique_together = ('user', 'project', 'plot_name')
+
+    def __str__(self):
+        return f"{self.plot_name} - {self.plot_type} - {self.user.username}"
+    
+    def get_y_axes(self):
+        """
+        Get Y-axes configuration, supporting both old (yAxis) and new (yAxes) formats
+        """
+        plot_config = self.plot_config or {}
+        
+        # Check for new format first (yAxes array)
+        if 'yAxes' in plot_config and plot_config['yAxes']:
+            return plot_config['yAxes']
+        
+        # Fall back to old format (single yAxis)
+        if 'yAxis' in plot_config and plot_config['yAxis']:
+            return [plot_config['yAxis']]
+        
+        return []
+    
+    def get_x_axes(self):
+        """
+        Get X-axes configuration
+        """
+        plot_config = self.plot_config or {}
+        return plot_config.get('xAxes', [])
+    
+    def get_chart_type(self):
+        """
+        Get chart type
+        """
+        plot_config = self.plot_config or {}
+        return plot_config.get('chartType', 'bar')
+    
+    def get_aggregation_method(self):
+        """
+        Get aggregation method
+        """
+        plot_config = self.plot_config or {}
+        return plot_config.get('aggregationMethod', 'sum')
+    
+    def get_date_grouping(self):
+        """
+        Get date grouping configuration
+        """
+        plot_config = self.plot_config or {}
+        return plot_config.get('dateGrouping', 'raw')
+
 # Project Sharing Models
 class ProjectShare(models.Model):
     SHARE_TYPES = [
@@ -298,3 +394,135 @@ class APILog(models.Model):
     def is_error(self):
         """Check if the API call resulted in an error (4xx or 5xx status codes)"""
         return self.response_status >= 400
+
+
+class EDAFormat(models.Model):
+    """
+    Model to store EDA (Exploratory Data Analysis) format/flow templates
+    """
+    FORMAT_TYPES = [
+        ('single_plot', 'Single Plot'),
+        ('multi_plot', 'Multi Plot'),
+        ('dashboard', 'Dashboard'),
+        ('analysis_flow', 'Analysis Flow'),
+    ]
+    
+    user = models.ForeignKey('User', on_delete=models.CASCADE)
+    format_name = models.CharField(max_length=255)
+    format_type = models.CharField(max_length=20, choices=FORMAT_TYPES, default='single_plot')
+    
+    # Format configuration
+    format_config = models.JSONField(default=dict)  # Stores plot templates and layout
+    required_columns = models.JSONField(default=list)  # Columns required for this format
+    optional_columns = models.JSONField(default=list)  # Optional columns
+    column_patterns = models.JSONField(default=dict)  # Flexible column matching patterns
+    sample_data_structure = models.JSONField(default=dict)  # Sample data structure for validation
+    
+    # Metadata
+    description = models.TextField(blank=True, null=True)
+    tags = models.JSONField(default=list)  # For categorizing formats
+    category = models.CharField(max_length=100, blank=True, null=True)
+    
+    # Usage tracking
+    usage_count = models.IntegerField(default=0)
+    last_used = models.DateTimeField(null=True, blank=True)
+    
+    # Version and status
+    version = models.CharField(max_length=20, default='1.0')
+    is_active = models.BooleanField(default=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-updated_at']
+        unique_together = ('user', 'format_name')
+    
+    def __str__(self):
+        return f"{self.format_name} ({self.format_type}) - {self.user.username}"
+    
+    def check_column_compatibility(self, available_columns):
+        """
+        Check if the available columns are compatible with this format
+        Returns: (is_compatible, missing_columns, matched_columns)
+        """
+        if not self.required_columns:
+            return True, [], available_columns
+        
+        missing_columns = []
+        matched_columns = []
+        
+        for required_col in self.required_columns:
+            # Try exact match first
+            if required_col in available_columns:
+                matched_columns.append(required_col)
+                continue
+            
+            # Try pattern matching
+            if required_col in self.column_patterns:
+                pattern_config = self.column_patterns[required_col]
+                pattern_type = pattern_config.get('type', 'exact')
+                pattern_value = pattern_config.get('value', '')
+                
+                found_match = False
+                for col in available_columns:
+                    if pattern_type == 'contains' and pattern_value.lower() in col.lower():
+                        matched_columns.append(col)
+                        found_match = True
+                        break
+                    elif pattern_type == 'regex':
+                        import re
+                        try:
+                            regex = re.compile(pattern_value, re.IGNORECASE)
+                            if regex.search(col):
+                                matched_columns.append(col)
+                                found_match = True
+                                break
+                        except re.error:
+                            continue
+                
+                if not found_match:
+                    missing_columns.append(required_col)
+            else:
+                missing_columns.append(required_col)
+        
+        is_compatible = len(missing_columns) == 0
+        return is_compatible, missing_columns, matched_columns
+    
+    def increment_usage(self):
+        """Increment usage count and update last used timestamp"""
+        self.usage_count += 1
+        self.last_used = timezone.now()
+        self.save(update_fields=['usage_count', 'last_used'])
+    
+    def get_plot_configs(self):
+        """
+        Get plot configurations from format_config, supporting multiple Y-axes
+        """
+        format_config = self.format_config or {}
+        plots = format_config.get('plots', [])
+        
+        # Ensure each plot has both yAxis and yAxes for compatibility
+        for plot in plots:
+            plot_config = plot.get('plot_config', {})
+            
+            # Handle Y-axes configuration
+            if 'yAxes' in plot_config and plot_config['yAxes']:
+                # New format with multiple Y-axes
+                y_axes = plot_config['yAxes']
+                y_axis = y_axes[0] if y_axes else None
+            elif 'yAxis' in plot_config and plot_config['yAxis']:
+                # Old format with single Y-axis
+                y_axis = plot_config['yAxis']
+                y_axes = [y_axis]
+            else:
+                # No Y-axis specified
+                y_axis = None
+                y_axes = []
+            
+            # Update plot_config to ensure both formats are available
+            plot_config['yAxis'] = y_axis
+            plot_config['yAxes'] = y_axes
+            plot['plot_config'] = plot_config
+        
+        return plots

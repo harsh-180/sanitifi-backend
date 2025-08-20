@@ -14,9 +14,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Environment Setup
-JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
-HADOOP_HOME = r"C:\hadoop"
-PYSPARK_PYTHON = sys.executable
+# JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
+# HADOOP_HOME = r"C:\hadoop"
+# PYSPARK_PYTHON = sys.executable
 
 # # Set environment variables
 # os.environ["JAVA_HOME"] = JAVA_HOME
@@ -25,21 +25,25 @@ PYSPARK_PYTHON = sys.executable
 # os.environ["PYSPARK_PYTHON"] = PYSPARK_PYTHON
 # os.environ["SPARK_LOCAL_IP"] = "localhost"
 
-# Create local Spark temp dir if it doesn't exist
-SPARK_LOCAL_DIRS = os.path.join(os.getcwd(), "spark-temp")
-os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
-os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
-
-# --- Linux/Server ---
-os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-11-openjdk-amd64"
+# --- Linux/Server Environment Setup ---
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
 os.environ["HADOOP_HOME"] = "/opt/hadoop"
 os.environ["SPARK_HOME"] = "/opt/spark"
 os.environ["PATH"] += f":/opt/hadoop/bin:/opt/spark/bin"
-os.environ["SPARK_LOCAL_DIRS"] = "/home/prashant/Dashboard-backend/spark-temp"
 os.environ["PYSPARK_PYTHON"] = sys.executable
 
+# Create local Spark temp dir if it doesn't exist
+SPARK_LOCAL_DIRS = "/home/prashant/Dashboard-backend/spark-temp"
+os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
+os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
+
 # Initialize findspark
-findspark.init()
+try:
+    findspark.init()
+    logger.info("findspark initialized successfully")
+except Exception as e:
+    logger.warning(f"findspark initialization failed: {e}")
+    # Continue anyway, as this might not be critical
 
 class SparkSessionManager:
     """
@@ -95,20 +99,34 @@ class SparkSessionManager:
             "/opt/spark-jars/poi-ooxml-5.2.3.jar"
         ]
         
-        # Check JARs exist
-        missing_jars = [jar for jar in jar_paths if not Path(jar).exists()]
+        # Check JARs exist and log status
+        missing_jars = []
+        for jar in jar_paths:
+            if not Path(jar).exists():
+                missing_jars.append(jar)
+                logger.warning(f"Missing JAR file: {jar}")
+            else:
+                logger.info(f"Found JAR file: {jar}")
+        
         if missing_jars:
-            raise FileNotFoundError(f"Missing required JAR files: {missing_jars}")
+            logger.error(f"Missing required JAR files: {missing_jars}")
+            # For now, continue without JARs - this will limit Excel functionality
+            # but allow basic Spark operations
+            jars_str = ""
+            logger.warning("Continuing without Excel support JARs")
+        else:
+            jars_str = ",".join(jar_paths)
+            logger.info(f"Using JAR files: {jars_str}")
         
-        jars_str = ",".join(jar_paths)
-        
-        return {
-            "spark.jars": jars_str,
-            "spark.driver.memory": "2g",
-            "spark.executor.memory": "2g",
+        config = {
+            "spark.driver.memory": "4g",
+            "spark.executor.memory": "4g",
+            "spark.driver.maxResultSize": "2g",
             "spark.sql.execution.arrow.pyspark.enabled": "true",
             "spark.hadoop.io.native.lib.available": "false",
-            "spark.sql.shuffle.partitions": "16",
+            "spark.sql.shuffle.partitions": "64",
+            "spark.memory.fraction": "0.6",
+            "spark.memory.storageFraction": "0.3",
             "spark.ui.showConsoleProgress": "true",
             "spark.sql.sources.commitProtocolClass": "org.apache.spark.sql.execution.datasources.SQLHadoopMapReduceCommitProtocol",
             "spark.driver.extraJavaOptions": "-Djava.net.preferIPv4Stack=true -XX:+UseG1GC -XX:MaxGCPauseMillis=200",
@@ -123,7 +141,6 @@ class SparkSessionManager:
             "spark.sql.files.minPartitionNum": "1",
             "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
             "spark.kryoserializer.buffer.max": "1024m",
-            # Add timeout configurations for large files
             "spark.rpc.askTimeout": "300s",
             "spark.rpc.lookupTimeout": "300s",
             "spark.network.timeout": "300s",
@@ -131,31 +148,42 @@ class SparkSessionManager:
             "spark.sql.broadcastTimeout": "300s",
             "spark.sql.execution.timeout": "300s"
         }
+        
+        # Only add JARs if they exist
+        if jars_str:
+            config["spark.jars"] = jars_str
+        
+        return config
+
     
     def _create_spark_session(self, session_id: str) -> SparkSession:
         """Create a new Spark session."""
-        config = self._create_session_config()
-        
-        builder = SparkSession.builder \
-            .appName(f"ExcelProcessor-{session_id}") \
-            .master("local[*]")
-        
-        # Apply all configurations
-        for key, value in config.items():
-            builder = builder.config(key, value)
-        
-        session = builder.getOrCreate()
-        
-        # Store session metadata
-        self._session_metadata[session_id] = {
-            'created_at': time.time(),
-            'last_used': time.time(),
-            'thread_id': threading.get_ident(),
-            'status': 'active'
-        }
-        
-        logger.info(f"Created new Spark session: {session_id} (version: {session.version})")
-        return session
+        try:
+            config = self._create_session_config()
+            
+            builder = SparkSession.builder \
+                .appName(f"ExcelProcessor-{session_id}") \
+                .master("local[*]")
+            
+            # Apply all configurations
+            for key, value in config.items():
+                builder = builder.config(key, value)
+            
+            session = builder.getOrCreate()
+            
+            # Store session metadata
+            self._session_metadata[session_id] = {
+                'created_at': time.time(),
+                'last_used': time.time(),
+                'thread_id': threading.get_ident(),
+                'status': 'active'
+            }
+            
+            logger.info(f"Created new Spark session: {session_id} (version: {session.version})")
+            return session
+        except Exception as e:
+            logger.error(f"Failed to create Spark session {session_id}: {e}")
+            raise
     
     def _stop_session(self, session_id: str):
         """Stop a specific session."""
@@ -243,7 +271,7 @@ class SparkSessionManager:
             }
             
             for session_id, metadata in self._session_metadata.items():
-                info['sessions'][session_id] = {
+                info['sessions'][session_id] = {    
                     'created_at': metadata['created_at'],
                     'last_used': metadata['last_used'],
                     'age_seconds': time.time() - metadata['created_at'],
@@ -261,7 +289,11 @@ def get_spark_session() -> SparkSession:
     Get a Spark session with proper lifecycle management.
     This is the main function to use throughout the application.
     """
-    return _session_manager.get_or_create_session()
+    try:
+        return _session_manager.get_or_create_session()
+    except Exception as e:
+        logger.error(f"Failed to get Spark session: {e}")
+        raise
 
 @contextmanager
 def spark_session_context():

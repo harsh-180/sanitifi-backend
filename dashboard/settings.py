@@ -39,6 +39,8 @@ ALLOWED_HOSTS = ['*']
 
 CORS_ALLOW_ALL_ORIGINS = True
 
+
+
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
@@ -63,6 +65,7 @@ SIMPLE_JWT = {
 # Application definition
 
 INSTALLED_APPS = [
+    "sslserver",
     'corsheaders',
     'django.contrib.admin',
     'django.contrib.auth',
@@ -86,8 +89,15 @@ CSRF_TRUSTED_ORIGINS = [
 # SESSION_COOKIE_SAMESITE = None
 # SESSION_COOKIE_SECURE = False
 
-# CORS_ALLOW_CREDENTIALS = True
-
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "https://sanitifi.skewb.ai",  # Add your deployed frontend domain
+]
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:5173",
+    "https://sanitifi.skewb.ai",
+]
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
@@ -173,6 +183,10 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Security settings for iframe embedding
+X_FRAME_OPTIONS = 'SAMEORIGIN'  # Allow iframe embedding from same origin
+SECURE_CROSS_ORIGIN_OPENER_POLICY = None
 
 AUTHENTICATION_BACKENDS = [
     'api.auth.CustomAuthBackend',  # Path to your custom auth backend
