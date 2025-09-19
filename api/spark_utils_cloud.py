@@ -22,8 +22,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Databricks Configuration
-DATABRICKS_WORKSPACE_URL = "https://dbc-e8343889-d484.cloud.databricks.com"
-DATABRICKS_ACCESS_TOKEN = "dapif48954324906a0154a5e96e4e6856645"
+DATABRICKS_WORKSPACE_URL = os.getenv("DATABRICKS_WORKSPACE_URL", "https://dbc-e8343889-d484.cloud.databricks.com")
+DATABRICKS_ACCESS_TOKEN = os.getenv("DATABRICKS_ACCESS_TOKEN")
 
 # Environment Setup (same as original spark_utils.py)
 JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
@@ -57,6 +57,10 @@ class CloudSparkManager:
     def __init__(self):
         self.workspace_url = DATABRICKS_WORKSPACE_URL
         self.access_token = DATABRICKS_ACCESS_TOKEN
+        
+        if not self.access_token:
+            raise ValueError("DATABRICKS_ACCESS_TOKEN environment variable is required but not set")
+        
         self.headers = {"Authorization": f"Bearer {self.access_token}"}
         
         # Test connection on initialization
@@ -503,7 +507,7 @@ if __name__ == "__main__":
     print("🚀 Integrated Spark Utils with Cloud Capabilities")
     print("=" * 60)
     print(f"Databricks Workspace: {DATABRICKS_WORKSPACE_URL}")
-    print(f"Access Token: {DATABRICKS_ACCESS_TOKEN[:10]}...")
+    print("Access Token: [Set via DATABRICKS_ACCESS_TOKEN environment variable]")
     print("\nAvailable functions:")
     print("- process_excel_cloud(file_path, sheet_name): Use Databricks cloud processing")
     print("- process_excel_integrated(file_path, sheet_name): Auto-select local/cloud")
