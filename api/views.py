@@ -1535,77 +1535,145 @@ class FileUploadView(APIView):
         if not os.path.exists(base_folder):
             return Response({'error': 'Folder not found'}, status=404)
 
-        # Collect all CSV files inside the folder
-        csv_files = []
+        # Collect all CSV and Excel files inside the folder
+        data_files = []
         for root, dirs, files in os.walk(base_folder):
             for file in files:
-                if file.endswith('.csv'):
-                    csv_files.append(os.path.join(root, file))
+                if file.endswith(('.csv', '.xlsx', '.xls')):
+                    data_files.append(os.path.join(root, file))
 
-        if not csv_files:
-            return Response({'error': 'No CSV files found inside the folder'}, status=404)
+        if not data_files:
+            return Response({'error': 'No data files (CSV/Excel) found inside the folder'}, status=404)
 
         sheets_data = {}
 
         try:
-            for csv_file in csv_files:
+            for data_file in data_files:
                 # Relativize the path for Django's default_storage
-                rel_csv_file = os.path.relpath(csv_file, settings.MEDIA_ROOT)
-
+                rel_data_file = os.path.relpath(data_file, settings.MEDIA_ROOT)
+                file_extension = os.path.splitext(data_file)[1].lower()
+                
                 # Determine file size
-                file_size_mb = os.path.getsize(csv_file) / (1024 * 1024)
+                file_size_mb = os.path.getsize(data_file) / (1024 * 1024)
 
-                # Open CSV file using default_storage in binary mode, wrap in TextIOWrapper for utf-8
-                try:
-                    with default_storage.open(rel_csv_file, 'rb') as f:
-                        csvfile = io.TextIOWrapper(f, encoding='utf-8')
-                        reader = csv.reader(csvfile)
-                        rows = list(reader)
-                except UnicodeDecodeError:
-                    with default_storage.open(rel_csv_file, 'rb') as f:
-                        csvfile = io.TextIOWrapper(f, encoding='latin1')
-                        reader = csv.reader(csvfile)
-                        rows = list(reader)
+                if file_extension == '.csv':
+                    # Process CSV file
+                    try:
+                        with default_storage.open(rel_data_file, 'rb') as f:
+                            csvfile = io.TextIOWrapper(f, encoding='utf-8')
+                            reader = csv.reader(csvfile)
+                            rows = list(reader)
+                    except UnicodeDecodeError:
+                        with default_storage.open(rel_data_file, 'rb') as f:
+                            csvfile = io.TextIOWrapper(f, encoding='latin1')
+                            reader = csv.reader(csvfile)
+                            rows = list(reader)
 
-                if not rows:
-                    continue  # Skip empty CSV files
+                    if not rows:
+                        continue  # Skip empty CSV files
 
-                columns = rows[0]  # Header
-                if file_size_mb < 50:
-                    data = rows[1:]  # All data rows
-                else:
-                    data = rows[1:1001]  # Top 1000 rows
+                    columns = rows[0]  # Header
+                    if file_size_mb < 50:
+                        data = rows[1:]  # All data rows
+                    else:
+                        data = rows[1:1001]  # Top 1000 rows
 
-                column_types = {}
+                    column_types = {}
 
-                # Common error values to ignore
-                error_values = {"#VALUE!", "#N/A", "#DIV/0!", "#REF!", "#NAME?", "#NULL!", "#NUM!"}
+                    # Common error values to ignore
+                    error_values = {"#VALUE!", "#N/A", "#DIV/0!", "#REF!", "#NAME?", "#NULL!", "#NUM!"}
 
-                for col_index, col_name in enumerate(columns):
-                    column_types[col_name] = "Unknown"
-                    for row in data:
-                        try:
-                            value = row[col_index]
-                            if value and value not in error_values:
-                                if value.replace('.', '', 1).isdigit():
-                                    if '.' in value:
-                                        column_types[col_name] = "float"
+                    for col_index, col_name in enumerate(columns):
+                        column_types[col_name] = "Unknown"
+                        for row in data:
+                            try:
+                                value = row[col_index]
+                                if value and value not in error_values:
+                                    if value.replace('.', '', 1).isdigit():
+                                        if '.' in value:
+                                            column_types[col_name] = "float"
+                                        else:
+                                            column_types[col_name] = "int"
                                     else:
-                                        column_types[col_name] = "int"
-                                else:
-                                    column_types[col_name] = "str"
-                                break
-                        except (IndexError, ValueError, TypeError):
-                            continue
+                                        column_types[col_name] = "str"
+                                    break
+                            except (IndexError, ValueError, TypeError):
+                                continue
 
-                # Use CSV file name as "sheet name"
-                sheet_name = os.path.basename(csv_file)
-                sheets_data[sheet_name] = {
-                    'columns': columns,
-                    'data': data,
-                    'column_types': column_types,
-                    'hidden': False  # CSV can't have hidden sheets
-                }
+                    # Use CSV file name as "sheet name"
+                    sheet_name = os.path.basename(data_file)
+                    sheets_data[sheet_name] = {
+                        'columns': columns,
+                        'data': data,
+                        'column_types': column_types,
+                        'hidden': False  # CSV can't have hidden sheets
+                    }
+                
+                elif file_extension in ['.xlsx', '.xls']:
+                    # Process Excel file using local Spark processing
+                    try:
+                        from .spark_utils import process_excel_with_fallback
+                        
+                        print(f"🚀 Processing Excel file locally with Spark: {os.path.basename(data_file)}")
+                        
+                        # Process the Excel file locally
+                        local_result = process_excel_with_fallback(data_file)
+                        
+                        if local_result['status'] == 'success':
+                            print(f"✅ Local processing successful for {os.path.basename(data_file)}")
+                            print(f"   Service: {local_result['service']}")
+                            print(f"   Rows: {local_result['total_rows']}, Columns: {local_result['total_columns']}")
+                            
+                            # Create data entry for locally processed files
+                            sheet_name = os.path.basename(data_file)
+                            if local_result['service'] == 'local_spark':
+                                # Use the actual data from Spark processing
+                                sheets_data[sheet_name] = {
+                                    'columns': local_result['columns'],
+                                    'data': local_result['sample_data'],
+                                    'column_types': local_result['column_types'],
+                                    'hidden': False,
+                                    'local_processed': True,
+                                    'total_rows': local_result['total_rows'],
+                                    'total_columns': local_result['total_columns']
+                                }
+                            else:
+                                # Pandas fallback data
+                                sheets_data[sheet_name] = {
+                                    'columns': local_result['columns'],
+                                    'data': local_result['sample_data'],
+                                    'column_types': local_result['column_types'],
+                                    'hidden': False,
+                                    'local_processed': True,
+                                    'pandas_fallback': True,
+                                    'total_rows': local_result['total_rows'],
+                                    'total_columns': local_result['total_columns']
+                                }
+                        else:
+                            print(f"❌ Local processing failed: {local_result['error']}")
+                            # Add error entry
+                            sheet_name = os.path.basename(data_file)
+                            sheets_data[sheet_name] = {
+                                'columns': ['Error'],
+                                'data': [[f"Local processing failed: {local_result['error']}"]],
+                                'column_types': {'Error': 'str'},
+                                'hidden': False,
+                                'local_processed': False,
+                                'error': local_result['error']
+                            }
+                            
+                    except Exception as e:
+                        print(f"❌ Failed to process Excel file {data_file}: {e}")
+                        # Add error entry
+                        sheet_name = os.path.basename(data_file)
+                        sheets_data[sheet_name] = {
+                            'columns': ['Error'],
+                            'data': [[f"Processing failed: {str(e)}"]],
+                            'column_types': {'Error': 'str'},
+                            'hidden': False,
+                            'local_processed': False,
+                            'error': str(e)
+                        }
             user = None
             if hasattr(request, 'user') and request.user.is_authenticated:
                 user = request.user
@@ -1614,14 +1682,34 @@ class FileUploadView(APIView):
             ip = request.META.get('REMOTE_ADDR')
             log_user_action(user, "file_data", details=f"File data retrieved successfully", ip_address=ip)
 
-            return Response({
-                'message': 'CSV file(s) data retrieved successfully',
+            # Ensure JSON-safe payload (replace NaN/Infinity with null/strings)
+            response_payload = {
+                'message': 'Data files (CSV/Excel) processed successfully',
                 'sheets_data': sheets_data,
                 'permission_level': permission_level
-            }, status=200)
+            }
+            try:
+                response_payload = make_json_safe(response_payload)
+            except Exception:
+                # Fallback: shallow sanitize common float issues
+                import math
+                def _sanitize(value):
+                    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                        return None
+                    return value
+                # Minimal recursive sanitization for dict/list structures
+                def _walk(obj):
+                    if isinstance(obj, dict):
+                        return {k: _walk(v) for k, v in obj.items()}
+                    if isinstance(obj, list):
+                        return [_walk(v) for v in obj]
+                    return _sanitize(obj)
+                response_payload = _walk(response_payload)
+
+            return Response(response_payload, status=200)
 
         except Exception as e:
-            return Response({'error': f'Error reading the CSV files: {str(e)}'}, status=500)
+            return Response({'error': f'Error processing the data files: {str(e)}'}, status=500)
         
 
 
@@ -1793,6 +1881,20 @@ class VerifyOTPView(APIView):
 
 @method_decorator(csrf_exempt, name='dispatch')
 class UploadProject(APIView):
+    def sanitize_filename(self, filename):
+        """Sanitize filename by removing/replacing problematic characters."""
+        import re
+        # Remove or replace problematic characters
+        sanitized = re.sub(r'[<>:"/\\|?*\'+]', '_', filename)
+        # Remove multiple consecutive underscores
+        sanitized = re.sub(r'_+', '_', sanitized)
+        # Remove leading/trailing underscores
+        sanitized = sanitized.strip('_')
+        # Ensure filename is not empty
+        if not sanitized:
+            sanitized = 'sanitized_file'
+        return sanitized
+
     def post(self, request):
         user_id = request.data.get('user_id')
         name = request.data.get('project_name')
@@ -1844,6 +1946,7 @@ class UploadProject(APIView):
         if spark_needed:
             spark = get_spark_session()
 
+        # First process_file function for KPI/Media file processing
         def process_file(file, file_type):
             print(f"Processing {file.name} ({file_type})...")
             if file_type == 'kpi':
@@ -1858,17 +1961,24 @@ class UploadProject(APIView):
                 base_subdir = 'media'
 
             file_id = (getattr(last_obj, id_field, 0) or 0) + 1
-            file_basename = os.path.splitext(os.path.basename(file.name))[0]
+            
+            # Sanitize the filename to avoid path issues
+            original_filename = file.name
+            sanitized_filename = self.sanitize_filename(original_filename)
+            file_basename = os.path.splitext(sanitized_filename)[0]
+            
+            # Create folder with sanitized name
             file_folder = os.path.join(project_folder, base_subdir, file_basename)
             os.makedirs(file_folder, exist_ok=True)
 
-            temp_path = os.path.join(file_folder, file.name)
+            # Use sanitized filename for temp path
+            temp_path = os.path.join(file_folder, sanitized_filename)
             with open(temp_path, 'wb') as f:
                 for chunk in file.chunks():
                     f.write(chunk)
 
             file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
-            file_extension = os.path.splitext(file.name)[1].lower()
+            file_extension = os.path.splitext(sanitized_filename)[1].lower()
 
             # Handle CSV files
             if file_extension == '.csv':
@@ -1895,9 +2005,21 @@ class UploadProject(APIView):
                         for field in df.schema.fields:
                             if isinstance(field.dataType, (DoubleType, FloatType, DecimalType)):
                                 df = df.withColumn(field.name, round(col(field.name), 2))
-                        df.write.csv(temp_path, header=True, mode='overwrite')
+                        # On Windows, Hadoop NativeIO can fail without winutils. Bypass Hadoop writer:
+                        # write via pandas to a temp file, then atomically replace the target.
+                        import shutil
+                        final_csv_path = temp_path
+                        tmp_csv_path = final_csv_path + ".tmp"
+                        pdf = df.toPandas()
+                        pdf.to_csv(tmp_csv_path, index=False)
+                        if os.path.exists(final_csv_path):
+                            try:
+                                os.remove(final_csv_path)
+                            except Exception:
+                                pass
+                        shutil.move(tmp_csv_path, final_csv_path)
                 
-                commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{file.name}"
+                commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sanitized_filename}"
                 subprocess.run(["git", "add", temp_path], cwd=project_folder)
                 subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
                 
@@ -1922,56 +2044,55 @@ class UploadProject(APIView):
                             subprocess.run(["git", "add", sheet_path], cwd=project_folder)
                             subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
                 else:
-                    # Spark processing for large Excel
+                    # Local processing for large Excel using Spark with fallback to pandas
                     try:
-                        xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                        sheet_names = xls.sheet_names
-                    except Exception as e:
-                        print(f"❌ Failed to extract sheet names: {e}")
-                        raise
-                    
-                    def convert_sheet(sheet_name):
-                        output_path = os.path.join(file_folder, f"{sheet_name}.csv")
-                        commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
+                        from .spark_utils import process_excel_with_fallback
                         
-                        try:
-                            with spark_session_context() as spark:
-                                if not validate_spark_session(spark):
-                                    raise Exception("Invalid Spark session. Please try again.")
-                                
+                        print(f"🚀 Processing large Excel file locally with Spark: {file.name}")
+                        
+                        # Process the Excel file locally
+                        local_result = process_excel_with_fallback(temp_path)
+                        
+                        if local_result['status'] == 'success':
+                            print(f"✅ Local processing successful for {file.name}")
+                            print(f"   Service: {local_result['service']}")
+                            print(f"   Rows: {local_result['total_rows']}, Columns: {local_result['total_columns']}")
+                            
+                            if local_result['service'] == 'local_spark':
+                                # Process with Spark - convert to CSV for each sheet
                                 try:
-                                    from pyspark.sql.functions import col, round
-                                    from pyspark.sql.types import DoubleType, FloatType, DecimalType
+                                    # For Spark processing, we'll create a summary CSV
+                                    summary_path = os.path.join(file_folder, "spark_processed_summary.csv")
+                                    with open(summary_path, 'w', newline='') as f:
+                                        writer = csv.writer(f)
+                                        writer.writerow(['Sheet', 'Rows', 'Columns', 'Status', 'Service'])
+                                        writer.writerow([
+                                            local_result['sheet_name'],
+                                            local_result['total_rows'],
+                                            local_result['total_columns'],
+                                            'Success',
+                                            'Local Spark'
+                                        ])
                                     
-                                    df = spark.read \
-                                        .format("com.crealytics.spark.excel") \
-                                        .option("dataAddress", f"'{sheet_name}'!A1") \
-                                        .option("header", "true") \
-                                        .option("inferSchema", "false") \
-                                        .option("maxRowsInMemory", 50000) \
-                                        .option("maxColumns", 20000) \
-                                        .option("treatEmptyValuesAsNulls", "true") \
-                                        .option("workbookPassword", None) \
-                                        .load(temp_path)
-                                    
-                                    # Round numeric columns to 2 decimal places
-                                    for field in df.schema.fields:
-                                        if isinstance(field.dataType, (DoubleType, FloatType, DecimalType)):
-                                            df = df.withColumn(field.name, round(col(field.name), 2))
-                                    
-                                    df = df.cache()
-                                    df.toPandas().to_csv(output_path, index=False)
-                                    df.unpersist()
-                                    
-                                    subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                    commit_msg = f"spark_processed - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/spark_processing"
+                                    subprocess.run(["git", "add", summary_path], cwd=project_folder)
                                     subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                    print(f"✅ Spark processing summary saved for {file.name}")
                                     
-                                except Exception as e:
-                                    if "RecordFormatException" in str(e):
-                                        import warnings
-                                        warnings.filterwarnings("ignore", category=UserWarning)
+                                except Exception as se:
+                                    print(f"❌ Failed to save Spark summary: {se}")
+                                    raise
+                            else:
+                                # Pandas fallback - process each sheet
+                                try:
+                                    xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                                    sheet_names = xls.sheet_names
+                                    
+                                    for sheet_name in sheet_names:
+                                        output_path = os.path.join(file_folder, f"{sheet_name}.csv")
+                                        commit_msg = f"pandas_fallback - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
+                                        
                                         try:
-                                            xls = pd.ExcelFile(temp_path, engine='openpyxl')
                                             df = xls.parse(sheet_name, dtype=str)
                                             # Round numeric values to 2 decimal places
                                             for col in df.columns:
@@ -1984,42 +2105,50 @@ class UploadProject(APIView):
                                             df.to_csv(output_path, index=False)
                                             subprocess.run(["git", "add", output_path], cwd=project_folder)
                                             subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                                            print(f"✅ Fallback to pandas successful for sheet: {sheet_name}")
+                                            print(f"✅ Pandas fallback successful for sheet: {sheet_name}")
                                         except Exception as pe:
                                             print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
                                             raise
-                                    else:
-                                        print(f"❌ Unexpected Spark error for {sheet_name}: {e}")
-                                        raise
-                        except Exception as e:
-                            print(f"❌ Failed to process sheet {sheet_name}: {e}")
-                            # Try pandas fallback directly
-                            try:
-                                import warnings
-                                warnings.filterwarnings("ignore", category=UserWarning)
-                                xls = pd.ExcelFile(temp_path, engine='openpyxl')
-                                df = xls.parse(sheet_name, dtype=str)
-                                # Round numeric values to 2 decimal places
-                                for col in df.columns:
-                                    try:
-                                        df[col] = pd.to_numeric(df[col], errors='ignore')
-                                        if df[col].dtype == 'float64':
-                                            df[col] = df[col].round(2)
-                                    except:
-                                        pass
-                                df.to_csv(output_path, index=False)
-                                subprocess.run(["git", "add", output_path], cwd=project_folder)
-                                subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
-                                print(f"✅ Pandas fallback successful for sheet: {sheet_name}")
-                            except Exception as pe:
-                                print(f"❌ All processing methods failed for {sheet_name}: {pe}")
-                                raise
-                    
-                    # Process sheets in parallel
-                    with ThreadPoolExecutor(max_workers=min(8, len(sheet_names))) as executor:
-                        futures = [executor.submit(convert_sheet, sheet) for sheet in sheet_names]
-                        for f in futures:
-                            f.result()
+                                except Exception as pe:
+                                    print(f"❌ Pandas fallback failed: {pe}")
+                                    raise
+                        else:
+                            print(f"❌ Local processing failed: {local_result['error']}")
+                            # Fallback to pandas for this sheet
+                            raise Exception(f"Local processing failed: {local_result['error']}")
+                            
+                    except Exception as e:
+                        print(f"❌ Local processing failed, falling back to pandas: {e}")
+                        
+                        # Fallback to pandas processing
+                        try:
+                            xls = pd.ExcelFile(temp_path, engine='openpyxl')
+                            sheet_names = xls.sheet_names
+                            
+                            for sheet_name in sheet_names:
+                                output_path = os.path.join(file_folder, f"{sheet_name}.csv")
+                                commit_msg = f"pandas_fallback - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sheet_name}"
+                                
+                                try:
+                                    df = xls.parse(sheet_name, dtype=str)
+                                    # Round numeric values to 2 decimal places
+                                    for col in df.columns:
+                                        try:
+                                            df[col] = pd.to_numeric(df[col], errors='ignore')
+                                            if df[col].dtype == 'float64':
+                                                df[col] = df[col].round(2)
+                                        except:
+                                            pass
+                                    df.to_csv(output_path, index=False)
+                                    subprocess.run(["git", "add", output_path], cwd=project_folder)
+                                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
+                                    print(f"✅ Pandas fallback successful for sheet: {sheet_name}")
+                                except Exception as pe:
+                                    print(f"❌ Pandas fallback failed for {sheet_name}: {pe}")
+                                    raise
+                        except Exception as pe:
+                            print(f"❌ All processing methods failed for {sanitized_filename}: {pe}")
+                            raise
             else:
                 # Unsupported file type
                 os.remove(temp_path)
@@ -2032,13 +2161,17 @@ class UploadProject(APIView):
         updated_kpi_files = []
         for file in kpi_files:
             process_file(file, 'kpi')
-            updated_kpi_files.append(os.path.splitext(file.name)[0])
+            # Use sanitized filename for the updated list
+            sanitized_name = self.sanitize_filename(file.name)
+            updated_kpi_files.append(os.path.splitext(sanitized_name)[0])
 
         # Process all Media files
         updated_media_files = []
         for file in media_files:
             process_file(file, 'media')
-            updated_media_files.append(os.path.splitext(file.name)[0])
+            # Use sanitized filename for the updated list
+            sanitized_name = self.sanitize_filename(file.name)
+            updated_media_files.append(os.path.splitext(sanitized_name)[0])
 
         project.save()
 
@@ -2214,6 +2347,7 @@ class UpdateProject(APIView):
         if spark_needed:
             spark = get_spark_session()
 
+        # Second process_file function for direct file processing
         def process_file(file, file_type):
             print(f"Processing {file.name} ({file_type})...")
             if file_type == 'kpi':
@@ -2228,28 +2362,35 @@ class UpdateProject(APIView):
                 base_subdir = 'media'
 
             file_id = (getattr(last_obj, id_field, 0) or 0) + 1
-            file_basename = os.path.splitext(os.path.basename(file.name))[0]
+            
+            # Sanitize the filename to avoid path issues
+            original_filename = file.name
+            sanitized_filename = self.sanitize_filename(original_filename)
+            file_basename = os.path.splitext(sanitized_filename)[0]
+            
+            # Create folder with sanitized name
             file_folder = os.path.join(project_folder, base_subdir, file_basename)
             os.makedirs(file_folder, exist_ok=True)
 
-            temp_path = os.path.join(file_folder, file.name)
+            # Use sanitized filename for temp path
+            temp_path = os.path.join(file_folder, sanitized_filename)
             with open(temp_path, 'wb') as f:
                 for chunk in file.chunks():
                     f.write(chunk)
 
             file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
-            file_extension = os.path.splitext(file.name)[1].lower()
+            file_extension = os.path.splitext(sanitized_filename)[1].lower()
 
             # Handle CSV files directly without conversion
             if file_extension == '.csv':
                 # For CSV files, just copy them directly without conversion
-                csv_path = os.path.join(file_folder, file.name)
+                csv_path = os.path.join(file_folder, sanitized_filename)
                 if temp_path != csv_path:
                     import shutil
                     shutil.copy2(temp_path, csv_path)
                     os.remove(temp_path)
                 
-                commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{file.name}"
+                commit_msg = f"updated - {project.user.id}/{project.id}/{base_subdir}/{file_basename}/{sanitized_filename}"
                 subprocess.run(["git", "add", csv_path], cwd=project_folder)
                 subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_folder)
                 
@@ -2338,12 +2479,16 @@ class UpdateProject(APIView):
         updated_kpi_files = []
         for file in kpi_files:
             process_file(file, 'kpi')
-            updated_kpi_files.append(os.path.splitext(file.name)[0])
+            # Use sanitized filename for the updated list
+            sanitized_name = self.sanitize_filename(file.name)
+            updated_kpi_files.append(os.path.splitext(sanitized_name)[0])
 
         updated_media_files = []
         for file in media_files:
             process_file(file, 'media')
-            updated_media_files.append(os.path.splitext(file.name)[0])
+            # Use sanitized filename for the updated list
+            sanitized_name = self.sanitize_filename(file.name)
+            updated_media_files.append(os.path.splitext(sanitized_name)[0])
 
         project.save()
 
@@ -2570,6 +2715,7 @@ class GetSpecificSheetCommits(APIView):
 
         except Exception as e:
             return Response({"error": str(e)}, status=500)
+
 
 class GetSpecificSheetCommitsArray(APIView):
     def post(self, request):
@@ -3833,6 +3979,365 @@ class UpdateFromGoogleSheet(APIView):
             return Response({'error': f'Google Sheets error: {str(e)}'}, status=500)
 
 
+class CreateOneDriveExcel(APIView):
+    def post(self, request):
+        import os
+        import io
+        import pandas as pd
+        import requests
+        from msal import ConfidentialClientApplication
+
+        file_type = request.data.get('file_type')
+        file_name = request.data.get('file_name')
+        project_id = request.data.get('project_id')
+        sheet_name = request.data.get('sheet_name')
+
+        if not all([file_type, file_name, project_id, sheet_name]):
+            return Response({'error': 'Missing required fields'}, status=400)
+
+        file_name = os.path.basename(file_name)
+
+        try:
+            project = Projects.objects.get(id=project_id)
+        except Projects.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=404)
+
+        # Validate file path
+        if file_type == 'concatenated':
+            concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+            found = False
+            file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({'error': 'File not found in concatenated folder'}, status=404)
+        else:
+            file_path = os.path.normpath(os.path.join(
+                settings.MEDIA_ROOT,
+                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+            ))
+            if not os.path.exists(file_path):
+                return Response({'error': 'File not found'}, status=404)
+
+        # Read local data
+        file_extension = os.path.splitext(sheet_name)[1].lower()
+        try:
+            if file_extension == '.csv':
+                try:
+                    df = pd.read_csv(file_path, encoding='utf-8')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(file_path, encoding='latin1')
+            elif file_extension in ['.xlsx', '.xls']:
+                df = pd.read_excel(file_path)
+            else:
+                return Response({'error': 'Unsupported file format'}, status=400)
+        except Exception as e:
+            return Response({'error': f'Failed to read source file: {str(e)}'}, status=500)
+
+        # Create an Excel workbook in memory
+        try:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Sheet1', index=False)
+            output.seek(0)
+            excel_bytes = output.read()
+        except Exception as e:
+            return Response({'error': f'Failed to generate Excel: {str(e)}'}, status=500)
+
+        # MS Graph auth (client credentials)
+        client_id = os.getenv('MS_CLIENT_ID')
+        client_secret = os.getenv('MS_CLIENT_SECRET')
+        tenant_id = os.getenv('MS_TENANT_ID')
+        graph_user = os.getenv('MS_GRAPH_USER_ID')  # can be userPrincipalName (email) or GUID
+
+        if not all([client_id, client_secret, tenant_id, graph_user]):
+            return Response({'error': 'Missing Microsoft Graph environment configuration'}, status=500)
+
+        try:
+            authority = f"https://login.microsoftonline.com/{tenant_id}"
+            app = ConfidentialClientApplication(client_id=client_id, authority=authority, client_credential=client_secret)
+            scopes = ["https://graph.microsoft.com/.default"]
+            token_result = app.acquire_token_silent(scopes=scopes, account=None) or app.acquire_token_for_client(scopes=scopes)
+            if 'access_token' not in token_result:
+                return Response({'error': f"MSAL auth failed: {token_result.get('error_description')}"}, status=500)
+            access_token = token_result['access_token']
+        except Exception as e:
+            return Response({'error': f'Failed to acquire Microsoft Graph token: {str(e)}'}, status=500)
+
+        # Upload the Excel file to OneDrive (root or configured folder path)
+        try:
+            dest_name = f"EditData_{os.path.splitext(os.path.basename(sheet_name))[0]}.xlsx"
+            folder_path = os.getenv('MS_ONEDRIVE_FOLDER_PATH', '')  # e.g., 'Shared/EditableSheets'
+            if folder_path:
+                upload_url = f"https://graph.microsoft.com/v1.0/users/{graph_user}/drive/root:/{folder_path}/{dest_name}:/content"
+            else:
+                upload_url = f"https://graph.microsoft.com/v1.0/users/{graph_user}/drive/root:/{dest_name}:/content"
+
+            resp = requests.put(
+                upload_url,
+                headers={
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                },
+                data=excel_bytes,
+                timeout=120
+            )
+            if resp.status_code not in (200, 201):
+                return Response({'error': f'Upload failed: {resp.status_code} {resp.text}'}, status=500)
+            item = resp.json()
+            item_id = item.get('id')
+            web_url = item.get('webUrl')
+
+            # Try to create an edit link (optional)
+            try:
+                link_resp = requests.post(
+                    f"https://graph.microsoft.com/v1.0/users/{graph_user}/drive/items/{item_id}/createLink",
+                    headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
+                    json={"type": "edit", "scope": os.getenv('MS_SHARE_LINK_SCOPE', 'anonymous')},
+                    timeout=60
+                )
+                if link_resp.status_code in (200, 201):
+                    link_data = link_resp.json()
+                    web_url = link_data.get('link', {}).get('webUrl') or web_url
+            except Exception:
+                pass
+
+            # Save to the project mapping (re-using google_sheet_ids store)
+            sheet_key = f"{file_type}|{file_name}|{sheet_name}"
+            google_sheet_ids = project.google_sheet_ids or {}
+            google_sheet_ids[sheet_key] = item_id
+            project.google_sheet_ids = google_sheet_ids
+            project.save()
+
+            return Response({"onedrive_url": web_url, "onedrive_item_id": item_id}, status=200)
+        except Exception as e:
+            return Response({'error': f'OneDrive upload error: {str(e)}'}, status=500)
+
+
+class UpdateFromOneDriveExcel(APIView):
+    def post(self, request):
+        import os
+        import io
+        import pandas as pd
+        import requests
+        from msal import ConfidentialClientApplication
+
+        file_type = request.data.get('file_type')
+        file_name = request.data.get('file_name')
+        project_id = request.data.get('project_id')
+        sheet_name = request.data.get('sheet_name')
+        onedrive_item_id = request.data.get('onedrive_item_id')
+
+        if not all([file_type, file_name, project_id, sheet_name, onedrive_item_id]):
+            return Response({'error': 'Missing required fields'}, status=400)
+
+        file_name = os.path.basename(file_name)
+
+        try:
+            project = Projects.objects.get(id=project_id)
+        except Projects.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=404)
+
+        # Build backend file path
+        if file_type == 'concatenated':
+            concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+            found = False
+            file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({'error': 'File not found in concatenated folder'}, status=404)
+        else:
+            file_path = os.path.normpath(os.path.join(
+                settings.MEDIA_ROOT,
+                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+            ))
+
+        file_extension = os.path.splitext(sheet_name)[1].lower()
+
+        # MS Graph auth
+        client_id = os.getenv('MS_CLIENT_ID')
+        client_secret = os.getenv('MS_CLIENT_SECRET')
+        tenant_id = os.getenv('MS_TENANT_ID')
+        graph_user = os.getenv('MS_GRAPH_USER_ID')
+
+        if not all([client_id, client_secret, tenant_id, graph_user]):
+            return Response({'error': 'Missing Microsoft Graph environment configuration'}, status=500)
+
+        try:
+            authority = f"https://login.microsoftonline.com/{tenant_id}"
+            app = ConfidentialClientApplication(client_id=client_id, authority=authority, client_credential=client_secret)
+            scopes = ["https://graph.microsoft.com/.default"]
+            token_result = app.acquire_token_silent(scopes=scopes, account=None) or app.acquire_token_for_client(scopes=scopes)
+            if 'access_token' not in token_result:
+                return Response({'error': f"MSAL auth failed: {token_result.get('error_description')}"}, status=500)
+            access_token = token_result['access_token']
+        except Exception as e:
+            return Response({'error': f'Failed to acquire Microsoft Graph token: {str(e)}'}, status=500)
+
+        # Prefer reading live worksheet values via Graph Excel APIs to capture latest edits
+        try:
+            session_id = None
+            # Create a workbook session for consistent reads
+            sess_resp = requests.post(
+                f"https://graph.microsoft.com/v1.0/users/{graph_user}/drive/items/{onedrive_item_id}/workbook/createSession",
+                headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
+                json={"persistChanges": False},
+                timeout=30
+            )
+            if sess_resp.status_code in (200, 201):
+                session_id = sess_resp.json().get('id')
+
+            common_headers = {'Authorization': f'Bearer {access_token}'}
+            if session_id:
+                common_headers['workbook-session-id'] = session_id
+
+            # 1) Get worksheets and pick the first one (prefer 'Sheet1')
+            ws_resp = requests.get(
+                f"https://graph.microsoft.com/v1.0/users/{graph_user}/drive/items/{onedrive_item_id}/workbook/worksheets",
+                headers=common_headers,
+                timeout=60
+            )
+            if ws_resp.status_code in (200, 201):
+                ws_json = ws_resp.json()
+                worksheets = ws_json.get('value', [])
+                target_sheet_name = None
+                if worksheets:
+                    names = [w.get('name') for w in worksheets if 'name' in w]
+                    if 'Sheet1' in names:
+                        target_sheet_name = 'Sheet1'
+                    elif len(names) > 0:
+                        target_sheet_name = names[0]
+
+                if target_sheet_name:
+                    used_range_resp = requests.get(
+                        f"https://graph.microsoft.com/v1.0/users/{graph_user}/drive/items/{onedrive_item_id}/workbook/worksheets('{target_sheet_name}')/usedRange(valuesOnly=true)?$select=values",
+                        headers=common_headers,
+                        timeout=120
+                    )
+                    if used_range_resp.status_code in (200, 201):
+                        used_json = used_range_resp.json()
+                        values = used_json.get('values', [])
+                        if values and len(values) >= 1:
+                            headers_row = values[0]
+                            rows = values[1:] if len(values) > 1 else []
+                            # Normalize row lengths to headers
+                            normalized_rows = [row + [None] * (len(headers_row) - len(row)) for row in rows]
+                            df = pd.DataFrame(normalized_rows, columns=headers_row)
+                        else:
+                            df = pd.DataFrame()
+                    else:
+                        raise Exception(f"usedRange API failed: {used_range_resp.status_code} {used_range_resp.text}")
+                else:
+                    raise Exception("No worksheets found in workbook")
+            else:
+                raise Exception(f"List worksheets failed: {ws_resp.status_code} {ws_resp.text}")
+
+            # Close session if created
+            if session_id:
+                try:
+                    requests.post(
+                        f"https://graph.microsoft.com/v1.0/users/{graph_user}/drive/items/{onedrive_item_id}/workbook/closeSession",
+                        headers={'Authorization': f'Bearer {access_token}', 'workbook-session-id': session_id},
+                        timeout=15
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            # Fallback path: download the file content and parse via openpyxl
+            try:
+                download_url = f"https://graph.microsoft.com/v1.0/users/{graph_user}/drive/items/{onedrive_item_id}/content"
+                resp = requests.get(download_url, headers={'Authorization': f'Bearer {access_token}'}, timeout=120)
+                if resp.status_code != 200:
+                    return Response({'error': f'Failed to download OneDrive file: {resp.status_code} {resp.text}'}, status=500)
+                excel_bytes = resp.content
+                df = pd.read_excel(io.BytesIO(excel_bytes), engine='openpyxl')
+            except Exception as e2:
+                return Response({'error': f'Failed to read OneDrive workbook: {str(e2)}'}, status=500)
+
+        # Save to backend file (csv or xlsx)
+        try:
+            if file_extension == '.csv':
+                df.to_csv(file_path, index=False, encoding='utf-8')
+            elif file_extension in ['.xlsx', '.xls']:
+                df.to_excel(file_path, index=False, engine='openpyxl')
+            else:
+                return Response({'error': 'Unsupported file format'}, status=400)
+        except Exception as e:
+            return Response({'error': f'Failed to write file: {str(e)}'}, status=500)
+
+        # Commit to git (mirror Google flow)
+        try:
+            user = None
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                user = request.user
+            elif project and hasattr(project, 'user'):
+                user = project.user
+            project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
+            if not os.path.exists(os.path.join(project_folder, ".git")):
+                subprocess.run(["git", "init"], cwd=project_folder)
+                subprocess.run(["git", "config", "user.name", user.name], cwd=project_folder)
+                subprocess.run(["git", "config", "user.email", user.email], cwd=project_folder)
+            file_path_relative = os.path.join(file_type, file_name)
+            subprocess.run(["git", "add", file_path_relative], cwd=project_folder)
+            commit_message = f"onedrive excel - {user.id}/{project_id}/{file_type}/{file_name}/{sheet_name}"
+            subprocess.run(["git", "commit", "-m", commit_message], cwd=project_folder)
+        except Exception as e:
+            print(f"Git commit failed: {str(e)}")
+
+        # Read back and return JSON data
+        try:
+            if file_extension == '.csv':
+                updated_df = pd.read_csv(file_path, encoding='utf-8')
+            else:
+                updated_df = pd.read_excel(file_path, engine='openpyxl')
+        except Exception as e:
+            return Response({'error': f'Failed to read updated file: {str(e)}'}, status=500)
+
+        import numpy as np
+        def json_safe(val):
+            if val is None:
+                return None
+            if isinstance(val, (float, np.floating)):
+                if np.isnan(val) or np.isinf(val):
+                    return None
+                return float(val)
+            if isinstance(val, (int, np.integer)):
+                return int(val)
+            if isinstance(val, (np.generic, np.ndarray)):
+                return val.item() if hasattr(val, "item") else str(val)
+            return val
+
+        updated_df = updated_df.replace([np.inf, -np.inf], np.nan)
+        updated_df = updated_df.astype(object).where(pd.notnull(updated_df), None)
+        safe_data = [[json_safe(cell) for cell in row] for row in updated_df.values.tolist()]
+
+        user = None
+        if hasattr(request, 'user') and request.user.is_authenticated:
+            user = request.user
+        elif project and hasattr(project, 'user'):
+            user = project.user
+        ip = request.META.get('REMOTE_ADDR')
+        log_user_action(user, "update_from_onedrive_excel", details=f"Data updated from OneDrive Excel successfully", ip_address=ip)
+
+        return Response({
+            'message': 'Data updated from OneDrive Excel successfully',
+            'columns': updated_df.columns.tolist(),
+            'data': safe_data
+        }, status=200)
+
 class UpdateSheetData(APIView):
     """
     API endpoint to update sheet data directly.
@@ -4079,7 +4584,7 @@ class DeleteFile(APIView):
 class TimeoutException(Exception):
     pass
 
-def run_with_timeout(func, args=(), kwargs={}, timeout_duration=10):
+def run_with_timeout(func, args=(), kwargs={}, timeout_duration=100):
     """Run a function with a timeout using threading"""
     result = []
     error = []
@@ -6754,6 +7259,209 @@ class GetSheets(APIView):
             }, status=500)
 
 
+class GetSheetPage(APIView):
+    """
+    API endpoint to fetch a specific page of rows from a given sheet (CSV) without
+    loading the entire file in memory. Returns columns, current page of data, and total_rows.
+    """
+    def post(self, request):
+        try:
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            project_id = request.data.get('project_id')
+            sheet_name = request.data.get('sheet_name')
+            user_id = request.data.get('user_id')
+            permission_level = request.data.get('permission_level')
+            page = int(request.data.get('page', 1))
+            page_size = int(request.data.get('page_size', 1000))
+
+            # Validate required fields
+            missing = []
+            for k, v in [('file_type', file_type), ('file_name', file_name), ('project_id', project_id), ('sheet_name', sheet_name), ('user_id', user_id)]:
+                if not v:
+                    missing.append(k)
+            if missing:
+                return Response({'error': f"Missing required fields: {', '.join(missing)}"}, status=400)
+
+            # Validate pagination values
+            if page < 1 or page_size < 1:
+                return Response({'error': 'page and page_size must be positive integers'}, status=400)
+
+            # Get user and project
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Access check
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name
+            )
+            if not has_access:
+                return Response({'error': "Access denied. You don't have permission to access this project/file."}, status=403)
+
+            # Normalize file_name similar to GetSheets
+            original_file_name = file_name
+            if file_type == 'concatenated':
+                if '/' in file_name:
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+            else:
+                if '/' in file_name or '\\' in file_name:
+                    file_name = file_name.replace('\\', '/').split('/')[-1]
+                else:
+                    file_name = os.path.basename(file_name)
+
+            # Build base folder path
+            project_folder = f"user_{project.user.id}/project_{project.id}"
+            if file_type == 'kpi':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'kpi', file_name)
+            elif file_type == 'media':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'media', file_name)
+            elif file_type == 'concatenated':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'concatenated', file_name)
+            else:
+                return Response({'error': 'Unsupported file type'}, status=400)
+
+            base_folder = os.path.normpath(base_folder)
+            if not os.path.exists(base_folder):
+                return Response({'error': 'Folder not found'}, status=404)
+
+            # Determine CSV file path for the provided sheet_name. Accept both with/without extension
+            # and support nested relative paths.
+            normalized_input = (sheet_name or '').replace('\\', '/').strip()
+            input_no_ext = os.path.splitext(normalized_input)[0]
+
+            # Try direct joins first
+            direct_candidate = os.path.normpath(os.path.join(base_folder, normalized_input))
+            direct_with_ext = direct_candidate if direct_candidate.lower().endswith('.csv') else direct_candidate + '.csv'
+            alt_candidate = os.path.normpath(os.path.join(base_folder, input_no_ext + '.csv'))
+
+            target_csv_path = None
+            for candidate in [direct_with_ext, alt_candidate, direct_candidate]:
+                if os.path.exists(candidate) and candidate.lower().endswith('.csv'):
+                    target_csv_path = candidate
+                    break
+
+            # Fallback: walk the tree and match by relative path (with and without extension),
+            # or by basename (with and without extension)
+            if not target_csv_path:
+                found = False
+                wanted_rel_no_ext = input_no_ext.lower()
+                wanted_rel_with_ext = (input_no_ext + '.csv').lower()
+                wanted_base_no_ext = os.path.basename(input_no_ext).lower()
+                wanted_base_with_ext = (wanted_base_no_ext + '.csv').lower()
+                for root, dirs, files in os.walk(base_folder):
+                    for f in files:
+                        if not f.lower().endswith('.csv'):
+                            continue
+                        abs_path = os.path.join(root, f)
+                        rel_path = os.path.relpath(abs_path, base_folder).replace('\\', '/').lower()
+                        rel_no_ext = os.path.splitext(rel_path)[0]
+                        base_with_ext = os.path.basename(rel_path)
+                        base_no_ext = os.path.splitext(base_with_ext)[0]
+                        if (
+                            rel_path == normalized_input.lower()
+                            or rel_no_ext == wanted_rel_no_ext
+                            or base_with_ext == wanted_base_with_ext
+                            or base_no_ext == wanted_base_no_ext
+                        ):
+                            target_csv_path = abs_path
+                            found = True
+                            break
+                    if found:
+                        break
+
+            if not target_csv_path:
+                return Response({'error': 'Sheet not found'}, status=404)
+
+            # Count total rows quickly (excluding header)
+            try:
+                with open(target_csv_path, 'rb') as fh:
+                    # Count lines; assumes first line is header
+                    total_lines = sum(1 for _ in fh)
+                total_rows = max(total_lines - 1, 0)
+            except Exception:
+                # Fallback: read with pandas to count rows (slower)
+                try:
+                    total_rows = int(pd.read_csv(target_csv_path, usecols=[0]).shape[0])
+                except Exception:
+                    total_rows = 0
+
+            # Compute slice
+            start_row = (page - 1) * page_size
+            if start_row >= total_rows and total_rows != 0:
+                return Response({'error': 'Page out of range'}, status=400)
+
+            # Read columns (header only)
+            columns = []
+            try:
+                try:
+                    columns_df = pd.read_csv(target_csv_path, nrows=0, encoding='utf-8')
+                except UnicodeDecodeError:
+                    columns_df = pd.read_csv(target_csv_path, nrows=0, encoding='latin1')
+                columns = columns_df.columns.tolist()
+            except Exception:
+                # If header read fails, attempt full read for header
+                try:
+                    columns_df = pd.read_csv(target_csv_path, nrows=0)
+                    columns = columns_df.columns.tolist()
+                except Exception:
+                    columns = []
+
+            # Read the requested page
+            skiprows = range(1, start_row + 1) if start_row > 0 else None
+            try:
+                try:
+                    df = pd.read_csv(
+                        target_csv_path,
+                        encoding='utf-8',
+                        dtype=str,
+                        skiprows=skiprows,
+                        nrows=page_size
+                    )
+                except UnicodeDecodeError:
+                    df = pd.read_csv(
+                        target_csv_path,
+                        encoding='latin1',
+                        dtype=str,
+                        skiprows=skiprows,
+                        nrows=page_size
+                    )
+            except Exception as e:
+                return Response({'error': f'Failed to read sheet page: {str(e)}'}, status=500)
+
+            # Ensure JSON-safe values
+            df = df.replace([np.nan, np.inf, -np.inf], None)
+
+            return Response({
+                'success': True,
+                'file_info': {
+                    'file_type': file_type,
+                    'file_name': file_name,
+                    'project_id': project_id,
+                    'sheet_name': sheet_name,
+                },
+                'columns': columns,
+                'data': make_json_safe(df.values.tolist()),
+                'pagination': {
+                    'page': page,
+                    'page_size': page_size,
+                    'total_rows': total_rows,
+                    'total_pages': (total_rows + page_size - 1) // page_size if page_size > 0 else 0
+                }
+            }, status=200)
+
+        except Exception as e:
+            return Response({'error': f'An unexpected error occurred: {str(e)}'}, status=500)
+
+
 def get_logging_user(request, fallback_user=None):
     """
     Get user for logging purposes with priority order:
@@ -7149,6 +7857,171 @@ class TestAPILogging(APIView):
             
         except Exception as e:
             return Response({'error': f'Test failed: {str(e)}'}, status=500)
+
+
+class GetCompleteSheetData(APIView):
+    """
+    API endpoint to fetch complete sheet data for modals that need the full dataset.
+    This loads the entire CSV file into memory and returns all rows.
+    """
+    def post(self, request):
+        try:
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            project_id = request.data.get('project_id')
+            sheet_name = request.data.get('sheet_name')
+            user_id = request.data.get('user_id')
+            permission_level = request.data.get('permission_level')
+
+            # Validate required fields
+            missing = []
+            for k, v in [('file_type', file_type), ('file_name', file_name), ('project_id', project_id), ('sheet_name', sheet_name), ('user_id', user_id)]:
+                if not v:
+                    missing.append(k)
+            if missing:
+                return Response({'error': f"Missing required fields: {', '.join(missing)}"}, status=400)
+
+            # Get user and project
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Access check
+            has_access, share_object, permission_level = check_project_access(
+                user_id, project_id, file_type, file_name
+            )
+            if not has_access:
+                return Response({'error': "Access denied. You don't have permission to access this project/file."}, status=403)
+
+            # Normalize file_name similar to GetSheets
+            original_file_name = file_name
+            if file_type == 'concatenated':
+                if '/' in file_name:
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+            else:
+                if '/' in file_name or '\\' in file_name:
+                    file_name = file_name.replace('\\', '/').split('/')[-1]
+                else:
+                    file_name = os.path.basename(file_name)
+
+            # Build base folder path
+            project_folder = f"user_{project.user.id}/project_{project.id}"
+            if file_type == 'kpi':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'kpi', file_name)
+            elif file_type == 'media':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'media', file_name)
+            elif file_type == 'concatenated':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'concatenated', file_name)
+            else:
+                return Response({'error': 'Unsupported file type'}, status=400)
+
+            base_folder = os.path.normpath(base_folder)
+            if not os.path.exists(base_folder):
+                return Response({'error': 'Folder not found'}, status=404)
+
+            # Determine CSV file path for the provided sheet_name
+            normalized_input = (sheet_name or '').replace('\\', '/').strip()
+            input_no_ext = os.path.splitext(normalized_input)[0]
+
+            # Try direct joins first
+            direct_candidate = os.path.normpath(os.path.join(base_folder, normalized_input))
+            direct_with_ext = direct_candidate if direct_candidate.lower().endswith('.csv') else direct_candidate + '.csv'
+            alt_candidate = os.path.normpath(os.path.join(base_folder, input_no_ext + '.csv'))
+
+            target_csv_path = None
+            for candidate in [direct_with_ext, alt_candidate, direct_candidate]:
+                if os.path.exists(candidate) and candidate.lower().endswith('.csv'):
+                    target_csv_path = candidate
+                    break
+
+            # Fallback: walk the tree and match by relative path
+            if not target_csv_path:
+                found = False
+                wanted_rel_no_ext = input_no_ext.lower()
+                wanted_rel_with_ext = (input_no_ext + '.csv').lower()
+                wanted_base_no_ext = os.path.basename(input_no_ext).lower()
+                wanted_base_with_ext = (wanted_base_no_ext + '.csv').lower()
+                for root, dirs, files in os.walk(base_folder):
+                    for f in files:
+                        if not f.lower().endswith('.csv'):
+                            continue
+                        abs_path = os.path.join(root, f)
+                        rel_path = os.path.relpath(abs_path, base_folder).replace('\\', '/').lower()
+                        rel_no_ext = os.path.splitext(rel_path)[0]
+                        base_with_ext = os.path.basename(rel_path)
+                        base_no_ext = os.path.splitext(base_with_ext)[0]
+                        if (
+                            rel_path == normalized_input.lower()
+                            or rel_no_ext == wanted_rel_no_ext
+                            or base_with_ext == wanted_base_with_ext
+                            or base_no_ext == wanted_base_no_ext
+                        ):
+                            target_csv_path = abs_path
+                            found = True
+                            break
+                    if found:
+                        break
+
+            if not target_csv_path:
+                return Response({'error': 'Sheet not found'}, status=404)
+
+            # Read the complete CSV file
+            try:
+                try:
+                    df = pd.read_csv(target_csv_path, encoding='utf-8', dtype=str)
+                except UnicodeDecodeError:
+                    try:
+                        df = pd.read_csv(target_csv_path, encoding='latin1', dtype=str)
+                    except UnicodeDecodeError:
+                        df = pd.read_csv(target_csv_path, dtype=str)
+            except Exception as e:
+                return Response({'error': f'Failed to read sheet data: {str(e)}'}, status=500)
+
+            # Ensure JSON-safe values
+            df = df.replace([np.nan, np.inf, -np.inf], None)
+
+            # Get column types for better data handling
+            column_types = {}
+            for column in df.columns:
+                try:
+                    # Try to convert to numeric to determine type
+                    numeric_data = pd.to_numeric(df[column], errors='coerce')
+                    if not numeric_data.isnull().all():
+                        column_types[column] = "numeric"
+                    else:
+                        # Check if it's datetime
+                        try:
+                            pd.to_datetime(df[column], errors='coerce')
+                            column_types[column] = "datetime"
+                        except:
+                            column_types[column] = "string"
+                except:
+                    column_types[column] = "string"
+
+            return Response({
+                'success': True,
+                'file_info': {
+                    'file_type': file_type,
+                    'file_name': file_name,
+                    'project_id': project_id,
+                    'sheet_name': sheet_name,
+                },
+                'columns': df.columns.tolist(),
+                'data': make_json_safe(df.values.tolist()),
+                'column_types': column_types,
+                'total_rows': len(df)
+            }, status=200)
+
+        except Exception as e:
+            return Response({'error': f'An unexpected error occurred: {str(e)}'}, status=500)
 
 
 
