@@ -99,7 +99,7 @@ class CloudSparkManager:
             
             # Use Workspace Files instead of DBFS
             file_name = Path(local_file_path).name
-            workspace_path = f"/Users/harsh.kumar@skewb.ai/uploads/{file_name}"
+            workspace_path = f"/Users/{os.getenv('DATABRICKS_USER', 'user')}/uploads/{file_name}"
             
             # Upload file using workspace-files API
             upload_url = f"{self.workspace_url}/api/2.0/workspace-files/upload"
@@ -247,12 +247,12 @@ dbutils.notebook.exit(json.dumps(result))
         try:
             import base64
             # Create temporary notebook in user-specific directory
-            notebook_path = "/Users/harsh.kumar@skewb.ai/temp/excel_processing_temp"
+            notebook_path = f"/Users/{os.getenv('DATABRICKS_USER', 'user')}/temp/excel_processing_temp"
             
             # First, create the parent directory if it doesn't exist
             try:
                 mkdir_url = f"{self.workspace_url}/api/2.0/workspace/mkdirs"
-                mkdir_data = {"path": "/Users/harsh.kumar@skewb.ai/temp"}
+                mkdir_data = {"path": f"/Users/{os.getenv('DATABRICKS_USER', 'user')}/temp"}
                 response = requests.post(mkdir_url, headers=self.headers, json=mkdir_data)
                 if response.status_code not in [200, 400]:  # 400 means directory already exists
                     response.raise_for_status()
@@ -318,7 +318,7 @@ dbutils.notebook.exit(json.dumps(result))
             except Exception as upload_error:
                 logger.warning(f"File upload failed, trying alternative method: {upload_error}")
                 # Fallback: Create a notebook that references the local file path
-                dbfs_path = f"/Users/harsh.kumar@skewb.ai/uploads/{Path(local_file_path).name}"
+                dbfs_path = f"/Users/{os.getenv('DATABRICKS_USER', 'user')}/uploads/{Path(local_file_path).name}"
                 logger.info(f"Using fallback path: {dbfs_path}")
             
             # Step 2: Create processing notebook
