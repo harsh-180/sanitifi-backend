@@ -2279,11 +2279,9 @@ class PivotTableAPI(APIView):
             columns = request.data.get('columns', [])  # Column fields
             values = request.data.get('values', [])  # Value fields
             aggregation = request.data.get('aggregation', 'sum')  # Aggregation method
-<<<<<<< HEAD
-=======
+            
             # New: per-field aggregation selections from frontend (e.g., {field: ['sum','min','max']})
             value_aggregations = request.data.get('value_aggregations', {}) or {}
->>>>>>> f5a75af
             
             # Optional filters
             filters = request.data.get('filters', {})
@@ -2359,8 +2357,6 @@ class PivotTableAPI(APIView):
             print(f"PivotTableAPI: Sample data (first 3 rows):")
             if len(df) > 0:
                 print(df.head(3).to_string())
-<<<<<<< HEAD
-=======
                 
             # Check if the requested value column exists
             for value_col in values:
@@ -2389,7 +2385,6 @@ class PivotTableAPI(APIView):
                     }, status=400)
                 else:
                     print(f"PivotTableAPI: Value column '{value_col}' found with {len(df[value_col].dropna())} non-null values")
->>>>>>> f5a75af
 
             # Validate that specified fields exist in the data
             all_fields = rows + columns + values
@@ -2427,8 +2422,7 @@ class PivotTableAPI(APIView):
                 'row_totals': row_totals,
                 'show_empty_items': show_empty_items,
                 'compact_layout': compact_layout
-<<<<<<< HEAD
-            })
+            }, value_aggregations)
 
             # === Build MMMDummy-like data/columns when mapping_configurations provided ===
             records = []
@@ -2452,34 +2446,6 @@ class PivotTableAPI(APIView):
                             df_filtered_by_rows = df_filtered_by_rows[df_filtered_by_rows[row_field] == row_value]
 
                     if mapping_configurations and not df_filtered_by_rows.empty:
-=======
-            }, value_aggregations)
-
-            # === Handle mapping_configurations if provided, otherwise use standard pivot table ===
-            if mapping_configurations:
-                # Build MMMDummy-like data/columns when mapping_configurations provided
-                records = []
-                series_columns = []
-                try:
-                    # Use only explicitly provided value column; do not fallback to any default
-                    primary_value_col = values[0]
-                    # Unique combinations for all row fields
-                    if rows and not df.empty:
-                        grouped = df.groupby(rows).size().reset_index()
-                        row_combinations = grouped[rows].to_dict('records')
-                    else:
-                        row_combinations = [{}]
-
-                    for row_combo in row_combinations:
-                        record = row_combo.copy()
-
-                        # Filter df based on row values
-                        df_filtered_by_rows = df.copy()
-                        for row_field, row_value in row_combo.items():
-                            if row_field in df_filtered_by_rows.columns:
-                                df_filtered_by_rows = df_filtered_by_rows[df_filtered_by_rows[row_field] == row_value]
-
->>>>>>> f5a75af
                         for key, config in mapping_configurations.items():
                             column_values = self._parse_mapping_key(key)
                             df_filtered = df_filtered_by_rows.copy()
@@ -2524,7 +2490,6 @@ class PivotTableAPI(APIView):
                                     'absolute': agg_value_formatted,
                                     'percent': pct_val
                                 }
-<<<<<<< HEAD
                     else:
                         # No mapping_configurations: aggregate overall values like MMMDummy fallback
                         if not df_filtered_by_rows.empty:
@@ -2563,73 +2528,40 @@ class PivotTableAPI(APIView):
             try:
                 # Only merge if we have mapping_configurations or if we have records from the mapping logic
                 if mapping_configurations and records:
-=======
-
-                        records.append(record)
-
-                    # Collect series columns (exclude row fields)
-                    series_columns_set = set()
-                    for rec in records:
-                        for k in rec.keys():
-                            if k not in rows:
-                                series_columns_set.add(k)
-                    series_columns = sorted(list(series_columns_set))
-                except Exception as mc_err:
-                    # Do not fail the API if mapping processing errors; keep existing response
-                    print(f"PivotTableAPI: mapping_configurations processing error: {mc_err}")
-                
-                # === Merge computed records into pivot_table rows ===
-                try:
->>>>>>> f5a75af
                     # Build lookup by row key
                     def _row_key_from_dict(d):
                         return tuple(d.get(rf) for rf in rows)
-
-                    record_map = {}
-                    for rec in records:
-                        record_map[_row_key_from_dict(rec)] = rec
-
-                    enriched_pivot_rows = []
-                    for pt_row in pivot_result['pivot_data']:
-                        key = _row_key_from_dict(pt_row)
-                        rec = record_map.get(key, {})
-                        # Start enriched row with ONLY row fields to drop original pivot value columns when mapping_configurations are used
-                        enriched = {rf: pt_row.get(rf) for rf in rows}
-                        for k, v in rec.items():
-                            if k in rows:
-                                continue
-                            if isinstance(v, dict):
-                                # append only absolute column, never percent
-                                enriched[f"{k}_absolute"] = v.get('absolute')
-                        enriched_pivot_rows.append(enriched)
-                    # Replace pivot_data with enriched rows
-                    pivot_data_for_response = enriched_pivot_rows
-<<<<<<< HEAD
-                else:
-                    # No mapping_configurations: use the original pivot table data directly
-                    # This ensures proper column names are preserved for the value fields
-                    pivot_data_for_response = pivot_result['pivot_data']
-                    print(f"PivotTableAPI: Using original pivot table data (no mapping_configurations)")
-            except Exception as merge_err:
-                print(f"PivotTableAPI: error merging mapping data into pivot_table: {merge_err}")
-                pivot_data_for_response = pivot_result['pivot_data']
-=======
-                except Exception as merge_err:
-                    print(f"PivotTableAPI: error merging mapping data into pivot_table: {merge_err}")
-                    pivot_data_for_response = pivot_result['pivot_data']
-            else:
-                # No mapping_configurations: use the standard pivot table result
-                print(f"PivotTableAPI: No mapping_configurations provided, using standard pivot table")
-                pivot_data_for_response = pivot_result['pivot_data']
+                    
+                    # Create lookup for existing pivot rows
+                    pivot_row_lookup = {}
+                    for row in pivot_result['pivot_data']:
+                        key = _row_key_from_dict(row)
+                        pivot_row_lookup[key] = row
+                    
+                    # Merge computed records into pivot rows
+                    for record in records:
+                        key = _row_key_from_dict(record)
+                        if key in pivot_row_lookup:
+                            # Merge the computed values into the existing pivot row
+                            pivot_row_lookup[key].update(record)
+                        else:
+                            # Add new row if it doesn't exist
+                            pivot_result['pivot_data'].append(record)
+                    
+                    # Update series columns
+                    series_columns_set = set()
+                    for row in pivot_result['pivot_data']:
+                        for k in row.keys():
+                            if k not in rows:
+                                series_columns_set.add(k)
+                    series_columns = sorted(list(series_columns_set))
                 
-                # Collect series columns from the pivot table data
-                series_columns_set = set()
-                for row in pivot_data_for_response:
-                    for k in row.keys():
-                        if k not in rows:
-                            series_columns_set.add(k)
-                series_columns = sorted(list(series_columns_set))
->>>>>>> f5a75af
+            except Exception as mc_err:
+                # Do not fail the API if mapping processing errors; keep existing response
+                print(f"PivotTableAPI: mapping_configurations processing error: {mc_err}")
+            
+            # Use the pivot table data for response
+            pivot_data_for_response = pivot_result['pivot_data']
             
             # Log the action
             ip = request.META.get('REMOTE_ADDR')
@@ -2647,10 +2579,7 @@ class PivotTableAPI(APIView):
                     'pivot_rows': pivot_result['pivot_rows'],
                     'pivot_columns': pivot_result['pivot_columns'],
                     'aggregation_method': aggregation,
-<<<<<<< HEAD
-=======
                     'value_aggregations': value_aggregations,
->>>>>>> f5a75af
                     'row_fields': rows,
                     'column_fields': columns,
                     'value_fields': values,
@@ -2830,17 +2759,11 @@ class PivotTableAPI(APIView):
             traceback.print_exc()
             return df
 
-<<<<<<< HEAD
-    def _create_pivot_table(self, df, rows, columns, values, aggregation, layout_options=None):
-=======
     def _create_pivot_table(self, df, rows, columns, values, aggregation, layout_options=None, value_aggregations=None):
->>>>>>> f5a75af
         """Create pivot table with specified configuration and layout options"""
         try:
             print(f"PivotTableAPI: _create_pivot_table starting with {len(df)} rows")
             print(f"PivotTableAPI: Pivot config - Rows: {rows}, Columns: {columns}, Values: {values}, Aggregation: {aggregation}")
-<<<<<<< HEAD
-=======
             print(f"PivotTableAPI: DataFrame columns: {list(df.columns)}")
             print(f"PivotTableAPI: DataFrame sample data:")
             print(df.head(3).to_string())
@@ -2852,7 +2775,6 @@ class PivotTableAPI(APIView):
                     print(f"PivotTableAPI: Sample values in '{value_col}': {df[value_col].dropna().head(5).tolist()}")
                 else:
                     print(f"PivotTableAPI: ERROR - Value column '{value_col}' not found in data!")
->>>>>>> f5a75af
             
             # Extract layout options
             if layout_options is None:
@@ -2937,12 +2859,6 @@ class PivotTableAPI(APIView):
                     
                     print(f"PivotTableAPI: '{value_col}' final sample values: {df[value_col].dropna().head(5).tolist()}")
             
-<<<<<<< HEAD
-            # Create pivot table
-            if columns:
-                print(f"PivotTableAPI: Creating pivot with columns")
-                if aggregation == 'count':
-=======
             # Normalize per-field aggregation selections
             if value_aggregations is None:
                 value_aggregations = {}
@@ -2962,23 +2878,11 @@ class PivotTableAPI(APIView):
             if columns:
                 print(f"PivotTableAPI: Creating pivot with columns")
                 if aggregation == 'count' and not multi_agg:
->>>>>>> f5a75af
                     # For count aggregation, we need to count rows, not values
                     pivot_table = df.groupby(rows + columns, dropna=not show_empty_items).size().unstack(fill_value=0)
                     if rows:
                         pivot_table.index.name = rows[0] if len(rows) == 1 else None
                 else:
-<<<<<<< HEAD
-                    pivot_table = pd.pivot_table(
-                        df, 
-                        values=values, 
-                        index=rows if rows else None, 
-                        columns=columns, 
-                        aggfunc=pandas_agg,
-                        fill_value=0,
-                        dropna=not show_empty_items  # Include empty items if show_empty_items is True
-                    )
-=======
                     if multi_agg:
                         aggfunc = {}
                         for v in values:
@@ -3005,25 +2909,19 @@ class PivotTableAPI(APIView):
                             columns=columns, 
                             aggfunc=pandas_agg,
                             fill_value=0,
-                            dropna=not show_empty_items  # Include empty items if show_empty_items is True
+                            dropna=not show_empty_items
                         )
->>>>>>> f5a75af
             else:
                 # If no columns specified, just group by rows
                 if rows:
                     print(f"PivotTableAPI: Creating group by rows: {rows}")
-<<<<<<< HEAD
-                    if aggregation == 'count':
-=======
                     if aggregation == 'count' and not multi_agg:
->>>>>>> f5a75af
                         # For count aggregation, count rows in each group
                         pivot_series = df.groupby(rows, dropna=not show_empty_items).size()
                         pivot_series.name = f"Count of {values[0]}" if values else "Count"
                         # Convert Series to DataFrame
                         pivot_table = pivot_series.to_frame()
                     else:
-<<<<<<< HEAD
                         pivot_table = df.groupby(rows, dropna=not show_empty_items)[values].agg(pandas_agg)
                 else:
                     print(f"PivotTableAPI: Creating simple aggregation")
@@ -3039,49 +2937,8 @@ class PivotTableAPI(APIView):
             if len(pivot_table) > 0:
                 print(f"PivotTableAPI: Pivot table sample:")
                 print(pivot_table.head(3).to_string())
-=======
-                        if multi_agg:
-                            aggdict = {}
-                            for v in values:
-                                req = normalized_value_aggs.get(v)
-                                if req:
-                                    mapped = [agg_mapping.get(a, 'sum') for a in req]
-                                    aggdict[v] = mapped
-                                else:
-                                    aggdict[v] = pandas_agg
-                            pivot_table = df.groupby(rows, dropna=not show_empty_items)[values].agg(aggdict)
-                        else:
-                            pivot_table = df.groupby(rows, dropna=not show_empty_items)[values].agg(pandas_agg)
-                else:
-                    print(f"PivotTableAPI: Creating simple aggregation")
-                    # If no rows or columns, just aggregate all values
-                    if aggregation == 'count' and not multi_agg:
-                        pivot_series = pd.Series([len(df)], index=['Total'], name=f"Count of {values[0]}" if values else "Count")
-                        pivot_table = pivot_series.to_frame()
-                    else:
-                        if multi_agg:
-                            aggdict = {}
-                            for v in values:
-                                req = normalized_value_aggs.get(v)
-                                if req:
-                                    mapped = [agg_mapping.get(a, 'sum') for a in req]
-                                    aggdict[v] = mapped
-                                else:
-                                    aggdict[v] = pandas_agg
-                            tmp = df[values].agg(aggdict)
-                            pivot_table = tmp.to_frame().T if isinstance(tmp, pd.Series) else tmp
-                        else:
-                            pivot_table = df[values].agg(pandas_agg).to_frame().T
-            
-            print(f"PivotTableAPI: Pivot table created - shape: {pivot_table.shape}")
-            print(f"PivotTableAPI: Pivot table columns: {list(pivot_table.columns)}")
-            print(f"PivotTableAPI: Pivot table index: {pivot_table.index}")
-            if len(pivot_table) > 0:
-                print(f"PivotTableAPI: Pivot table sample:")
-                print(pivot_table.head(3).to_string())
                 print(f"PivotTableAPI: Pivot table data types:")
                 print(pivot_table.dtypes)
->>>>>>> f5a75af
             
             # Add Grand Totals and Row Totals if requested
             if grand_totals or row_totals:
@@ -3128,10 +2985,6 @@ class PivotTableAPI(APIView):
             
             # Convert to JSON-friendly format
             if isinstance(pivot_table.columns, pd.MultiIndex):
-<<<<<<< HEAD
-                # Flatten multi-level columns
-                pivot_table.columns = ['_'.join(map(str, col)).strip() for col in pivot_table.columns.values]
-=======
                 # Flatten multi-level columns and map agg function name to friendly label
                 def _flatten(col):
                     parts = [str(c) for c in col if c is not None and str(c) != '']
@@ -3142,7 +2995,6 @@ class PivotTableAPI(APIView):
                             parts[-1] = mapping[last]
                     return '_'.join(parts)
                 pivot_table.columns = [_flatten(col) for col in pivot_table.columns.values]
->>>>>>> f5a75af
             
             # Reset index to make it JSON serializable
             pivot_table_reset = pivot_table.reset_index()
@@ -3153,14 +3005,10 @@ class PivotTableAPI(APIView):
             # Convert to list of dictionaries
             pivot_data = pivot_table_reset.to_dict('records')
             
-<<<<<<< HEAD
-=======
             print(f"PivotTableAPI: Converted to records - {len(pivot_data)} rows")
             if len(pivot_data) > 0:
                 print(f"PivotTableAPI: Sample record keys: {list(pivot_data[0].keys())}")
                 print(f"PivotTableAPI: Sample record: {pivot_data[0]}")
-            
->>>>>>> f5a75af
             # Clean data for JSON serialization using make_json_safe
             for row in pivot_data:
                 for key, value in row.items():
@@ -3183,11 +3031,7 @@ class PivotTableAPI(APIView):
                     else:
                         row[key] = make_json_safe(value)
             
-<<<<<<< HEAD
-=======
             print(f"PivotTableAPI: After JSON cleaning - sample record: {pivot_data[0] if pivot_data else 'No data'}")
-            
->>>>>>> f5a75af
             return {
                 'pivot_data': pivot_data,
                 'pivot_rows': len(pivot_table),
