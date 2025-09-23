@@ -11,7 +11,7 @@ def test_eda_download_api():
     """Test the EDA Plot Download API"""
     
     # API endpoint
-    url = "http://127.0.0.1:8000/api/download-eda-plots-excel/"
+    url = "http://localhost:8000/api/download-eda-plots-excel/"
     
     # Test data - using the values from the error message
     test_data = {
@@ -76,7 +76,7 @@ def test_eda_download_api():
 def test_api_without_plots():
     """Test the API when no plots exist"""
     
-    url = "http://127.0.0.1:8000/api/download-eda-plots-excel/"
+    url = "http://localhost:8000/api/download-eda-plots-excel/"
     
     # Test with a project that likely has no plots
     test_data = {
