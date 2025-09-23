@@ -14,26 +14,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Environment Setup
-# JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
-# HADOOP_HOME = r"C:\hadoop"
-# PYSPARK_PYTHON = sys.executable
+JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
+HADOOP_HOME = r"C:\hadoop"
+PYSPARK_PYTHON = sys.executable
 
 # # Set environment variables
-# os.environ["JAVA_HOME"] = JAVA_HOME
-# os.environ["HADOOP_HOME"] = HADOOP_HOME
-# os.environ["PATH"] += f";{os.path.join(HADOOP_HOME, 'bin')}"
-# os.environ["PYSPARK_PYTHON"] = PYSPARK_PYTHON
-# os.environ["SPARK_LOCAL_IP"] = "localhost"
+os.environ["JAVA_HOME"] = JAVA_HOME
+os.environ["HADOOP_HOME"] = HADOOP_HOME
+os.environ["PATH"] += f";{os.path.join(HADOOP_HOME, 'bin')}"
+os.environ["PYSPARK_PYTHON"] = PYSPARK_PYTHON
+os.environ["SPARK_LOCAL_IP"] = "localhost"
 
 # --- Linux/Server Environment Setup ---
-os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
-os.environ["HADOOP_HOME"] = "/opt/hadoop"
-os.environ["SPARK_HOME"] = "/opt/spark"
-os.environ["PATH"] += f":/opt/hadoop/bin:/opt/spark/bin"
-os.environ["PYSPARK_PYTHON"] = sys.executable
+# os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
+# os.environ["HADOOP_HOME"] = "/opt/hadoop"
+# os.environ["SPARK_HOME"] = "/opt/spark"
+# os.environ["PATH"] += f":/opt/hadoop/bin:/opt/spark/bin"
+# os.environ["PYSPARK_PYTHON"] = sys.executable
 
-# Create local Spark temp dir if it doesn't exist
-SPARK_LOCAL_DIRS = "/home/prashant/Dashboard-backend/spark-temp"
+# Create local Spark temp dir if it doesn't exist (Linux)
+# SPARK_LOCAL_DIRS = "/home/prashant/Dashboard-backend/spark-temp"
+# os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
+# os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
+
+# Create local Spark temp dir if it doesn't exist (Linux)
+SPARK_LOCAL_DIRS = "C:/Users/harsh/Documents/skewb/dashboard/Dashboard-backend/spark-temp"
 os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
 os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
 
@@ -54,9 +59,9 @@ class SparkSessionManager:
         self._sessions: Dict[str, SparkSession] = {}
         self._session_metadata: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
-        self._max_sessions = 3  # Maximum concurrent sessions
-        self._session_timeout = 300  # 5 minutes timeout
-        self._cleanup_interval = 60  # 1 minute cleanup interval
+        self._max_sessions = 2  # Reduced for 16GB server to prevent memory issues
+        self._session_timeout = 600  # 10 minutes timeout for larger files
+        self._cleanup_interval = 120  # 2 minutes cleanup interval
         self._last_cleanup = time.time()
         
         # Start cleanup thread
@@ -87,17 +92,19 @@ class SparkSessionManager:
     
     def _create_session_config(self) -> Dict[str, str]:
         """Create Spark configuration."""
-        # jar_paths = [
-        #     r"C:\spark-jars\spark-excel_2.12-3.3.1_0.18.7.jar",
-        #     r"C:\spark-jars\poi-5.2.3.jar",
-        #     r"C:\spark-jars\poi-ooxml-5.2.3.jar"
-        # ]
-
-        jar_paths = [
-            "/opt/spark-jars/spark-excel_2.12-3.3.1_0.18.7.jar",
-            "/opt/spark-jars/poi-5.2.3.jar",
-            "/opt/spark-jars/poi-ooxml-5.2.3.jar"
-        ]
+        # Use fixed JAR paths for Windows
+        if os.name == 'nt':  # Windows
+            jar_paths = [
+                r"C:\spark-jars\spark-excel_2.12-3.3.1_0.18.7.jar",
+                r"C:\spark-jars\poi-5.2.3.jar",
+                r"C:\spark-jars\poi-ooxml-5.2.3.jar"
+            ]
+        else:  # Linux/Unix
+            jar_paths = [
+                "/opt/spark-jars/spark-excel_2.12-3.3.1_0.18.7.jar",
+                "/opt/spark-jars/poi-5.2.3.jar",
+                "/opt/spark-jars/poi-ooxml-5.2.3.jar"
+            ]
         
         # Check JARs exist and log status
         missing_jars = []
@@ -119,39 +126,70 @@ class SparkSessionManager:
             logger.info(f"Using JAR files: {jars_str}")
         
         config = {
-            "spark.driver.memory": "4g",
-            "spark.executor.memory": "4g",
-            "spark.driver.maxResultSize": "2g",
+            "spark.driver.memory": "12g",  # Optimized for 16GB server (75% of available RAM)
+            "spark.executor.memory": "12g",  # Optimized for 16GB server (75% of available RAM)
+            "spark.driver.maxResultSize": "6g",  # Increased for larger datasets
             "spark.sql.execution.arrow.pyspark.enabled": "true",
             "spark.hadoop.io.native.lib.available": "false",
-            "spark.sql.shuffle.partitions": "64",
-            "spark.memory.fraction": "0.6",
-            "spark.memory.storageFraction": "0.3",
+            "spark.sql.shuffle.partitions": "16",  # Reduced for better memory management on 16GB server
+            "spark.memory.fraction": "0.85",  # Increased memory fraction for better performance
+            "spark.memory.storageFraction": "0.15",  # Reduced storage fraction to give more to execution
             "spark.ui.showConsoleProgress": "true",
             "spark.sql.sources.commitProtocolClass": "org.apache.spark.sql.execution.datasources.SQLHadoopMapReduceCommitProtocol",
-            "spark.driver.extraJavaOptions": "-Djava.net.preferIPv4Stack=true -XX:+UseG1GC -XX:MaxGCPauseMillis=200",
-            "spark.executor.extraJavaOptions": "-Djava.net.preferIPv4Stack=true -XX:+UseG1GC -XX:MaxGCPauseMillis=200",
+            "spark.driver.extraJavaOptions": "-Djava.net.preferIPv4Stack=true -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UseStringDeduplication",
+            "spark.executor.extraJavaOptions": "-Djava.net.preferIPv4Stack=true -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UseStringDeduplication",
             "spark.sql.adaptive.enabled": "true",
             "spark.sql.adaptive.coalescePartitions.enabled": "true",
             "spark.sql.adaptive.skewJoin.enabled": "true",
             "spark.sql.adaptive.localShuffleReader.enabled": "true",
-            "spark.sql.adaptive.advisoryPartitionSizeInBytes": "128m",
-            "spark.sql.files.maxPartitionBytes": "128MB",
-            "spark.sql.files.openCostInBytes": "4194304",
+            "spark.sql.adaptive.advisoryPartitionSizeInBytes": "512m",  # Increased for better performance
+            "spark.sql.files.maxPartitionBytes": "512MB",  # Increased for better performance
+            "spark.sql.files.openCostInBytes": "16777216",  # Increased for better performance
             "spark.sql.files.minPartitionNum": "1",
             "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
-            "spark.kryoserializer.buffer.max": "1024m",
-            "spark.rpc.askTimeout": "300s",
-            "spark.rpc.lookupTimeout": "300s",
-            "spark.network.timeout": "300s",
-            "spark.executor.heartbeatInterval": "60s",
-            "spark.sql.broadcastTimeout": "300s",
-            "spark.sql.execution.timeout": "300s"
+            "spark.kryoserializer.buffer.max": "2047m",  # Maximum allowed for Kryo
+            "spark.rpc.askTimeout": "600s",  # Increased from 300s
+            "spark.rpc.lookupTimeout": "600s",  # Increased from 300s
+            "spark.network.timeout": "600s",  # Increased from 300s
+            "spark.executor.heartbeatInterval": "120s",  # Increased from 60s
+            "spark.sql.broadcastTimeout": "600s",  # Increased from 300s
+            "spark.sql.execution.timeout": "600s",  # Increased from 300s
+            # Additional configurations for large files
+            "spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold": "0",
+            "spark.sql.adaptive.forceApplyShuffledHashJoin": "false",
+            "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes": "512MB",
+            "spark.sql.adaptive.skewJoin.skewedPartitionFactor": "10",
+            "spark.sql.adaptive.coalescePartitions.minPartitionNum": "1",
+            "spark.sql.adaptive.coalescePartitions.initialPartitionNum": "16",  # Reduced for 16GB server
+            # Storage optimizations for 50GB storage
+            "spark.local.dir": SPARK_LOCAL_DIRS,
+            "spark.sql.warehouse.dir": os.path.join(SPARK_LOCAL_DIRS, "warehouse"),
+            "spark.sql.execution.arrow.pyspark.selfDestruct.enabled": "true",
+            "spark.sql.execution.arrow.pyspark.maxRecordsPerBatch": "5000"
         }
         
         # Only add JARs if they exist
         if jars_str:
             config["spark.jars"] = jars_str
+            # Additional Excel-specific configurations
+            config.update({
+                "spark.sql.execution.arrow.pyspark.enabled": "true",
+                "spark.sql.execution.arrow.pyspark.fallback.enabled": "true",
+                "spark.sql.execution.arrow.pyspark.selfDestruct.enabled": "true",
+                "spark.sql.execution.arrow.pyspark.maxRecordsPerBatch": "10000",
+                # Excel reading optimizations
+                "spark.sql.files.maxPartitionBytes": "256MB",
+                "spark.sql.files.openCostInBytes": "8388608",
+                "spark.sql.files.minPartitionNum": "1",
+                "spark.sql.files.maxPartitionBytes": "256MB",
+                # Memory management for large files
+                "spark.memory.offHeap.enabled": "true",
+                "spark.memory.offHeap.size": "4g",
+                "spark.sql.adaptive.enabled": "true",
+                "spark.sql.adaptive.coalescePartitions.enabled": "true",
+                "spark.sql.adaptive.skewJoin.enabled": "true",
+                "spark.sql.adaptive.localShuffleReader.enabled": "true"
+            })
         
         return config
 
@@ -295,6 +333,81 @@ def get_spark_session() -> SparkSession:
         logger.error(f"Failed to get Spark session: {e}")
         raise
 
+def get_large_file_spark_session() -> SparkSession:
+    """
+    Get a Spark session specifically optimized for large file processing.
+    This session has higher memory allocation and better resource management.
+    """
+    try:
+        # Create a new session with large file optimizations
+        config = _session_manager._create_session_config()
+        
+        # Override with large file specific settings optimized for 16GB server
+        large_file_config = {
+            "spark.driver.memory": "14g",  # Optimized for 16GB server (87.5% of available RAM)
+            "spark.executor.memory": "14g",  # Optimized for 16GB server (87.5% of available RAM)
+            "spark.driver.maxResultSize": "8g",  # Increased for very large datasets
+            "spark.sql.files.maxPartitionBytes": "1GB",  # Larger partitions for better performance
+            "spark.sql.files.openCostInBytes": "33554432",  # Higher open cost threshold
+            "spark.sql.adaptive.advisoryPartitionSizeInBytes": "1g",
+            "spark.sql.adaptive.coalescePartitions.initialPartitionNum": "8",  # Fewer initial partitions for 16GB server
+            "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes": "1GB",
+            "spark.memory.offHeap.size": "8g",  # More off-heap memory for large files
+            "spark.sql.execution.arrow.pyspark.maxRecordsPerBatch": "3000",  # Smaller batches for memory efficiency
+            "spark.sql.adaptive.forceApplyShuffledHashJoin": "false",
+            "spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold": "0",
+            # Additional optimizations for large files on 16GB server
+            "spark.sql.adaptive.coalescePartitions.minPartitionNum": "1",
+            "spark.sql.adaptive.coalescePartitions.maxPartitionNum": "8",
+            "spark.sql.adaptive.skewJoin.skewedPartitionFactor": "5",  # Reduced for memory efficiency
+            "spark.sql.adaptive.localShuffleReader.enabled": "true",
+            "spark.sql.adaptive.optimizeSkewedJoin.enabled": "true"
+        }
+        
+        config.update(large_file_config)
+        
+        builder = SparkSession.builder \
+            .appName("LargeFileProcessor") \
+            .master("local[*]")
+        
+        # Apply all configurations
+        for key, value in config.items():
+            builder = builder.config(key, value)
+        
+        session = builder.getOrCreate()
+        logger.info(f"Created large file optimized Spark session (version: {session.version})")
+        return session
+        
+    except Exception as e:
+        logger.error(f"Failed to create large file Spark session: {e}")
+        # Fallback to regular session
+        return get_spark_session()
+
+@contextmanager
+def large_file_spark_context():
+    """
+    Context manager for large file processing with automatic cleanup.
+    
+    Usage:
+        with large_file_spark_context() as spark:
+            df = spark.read.format("com.crealytics.spark.excel").load("large_file.xlsx")
+            # ... process data
+    """
+    session = None
+    try:
+        session = get_large_file_spark_session()
+        yield session
+    except Exception as e:
+        logger.error(f"Error in large file Spark session context: {e}")
+        raise
+    finally:
+        if session:
+            try:
+                session.stop()
+                logger.info("Stopped large file Spark session")
+            except Exception as e:
+                logger.warning(f"Error stopping large file session: {e}")
+
 @contextmanager
 def spark_session_context():
     """
@@ -328,6 +441,134 @@ def get_spark_session_info() -> Dict[str, Any]:
 def validate_spark_session(spark: SparkSession) -> bool:
     """Validate if a Spark session is still active."""
     return _session_manager._validate_session(spark)
+
+def process_excel_locally(file_path: str, sheet_name: str = None) -> Dict[str, Any]:
+    """
+    Process Excel file locally using Spark with Excel support.
+    
+    Args:
+        file_path: Path to Excel file
+        sheet_name: Specific sheet to process (optional)
+        
+    Returns:
+        Processing results
+    """
+    try:
+        # Get Spark session optimized for large files
+        spark = get_large_file_spark_session()
+        
+        logger.info(f"Processing Excel file locally: {file_path}")
+        
+        # Read Excel file using Spark Excel format
+        df = spark.read.format("com.crealytics.spark.excel") \
+            .option("header", "true") \
+            .option("inferSchema", "true") \
+            .option("dataAddress", sheet_name or "Sheet1") \
+            .option("maxRowsInMemory", "10000") \
+            .option("tempFileThreshold", "1000000") \
+            .load(file_path)
+        
+        # Get basic info
+        total_rows = df.count()
+        total_columns = len(df.columns)
+        
+        # Show sample data (first 10 rows)
+        sample_data = df.limit(10).toPandas().to_dict('records')
+        
+        # Get column types
+        column_types = {}
+        for field in df.schema.fields:
+            column_types[field.name] = str(field.dataType)
+        
+        logger.info(f"Successfully processed Excel file: {total_rows} rows, {total_columns} columns")
+        
+        return {
+            "status": "success",
+            "service": "local_spark",
+            "total_rows": total_rows,
+            "total_columns": total_columns,
+            "columns": df.columns,
+            "column_types": column_types,
+            "sample_data": sample_data,
+            "file_path": file_path,
+            "sheet_name": sheet_name or "Sheet1"
+        }
+        
+    except Exception as e:
+        logger.error(f"Local Excel processing failed: {e}")
+        return {
+            "status": "error",
+            "service": "local_spark",
+            "error": str(e),
+            "file_path": file_path,
+            "sheet_name": sheet_name or "Sheet1"
+        }
+
+def process_excel_with_fallback(file_path: str, sheet_name: str = None) -> Dict[str, Any]:
+    """
+    Process Excel file with fallback to pandas if Spark fails.
+    
+    Args:
+        file_path: Path to Excel file
+        sheet_name: Specific sheet to process (optional)
+        
+    Returns:
+        Processing results
+    """
+    try:
+        # First try Spark processing
+        result = process_excel_locally(file_path, sheet_name)
+        
+        if result['status'] == 'success':
+            return result
+        
+        # If Spark fails, fallback to pandas
+        logger.info(f"Spark processing failed, falling back to pandas: {result['error']}")
+        
+        import pandas as pd
+        
+        # Read Excel file with pandas
+        if sheet_name:
+            df = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str)
+        else:
+            df = pd.read_excel(file_path, dtype=str)
+        
+        # Get basic info
+        total_rows = len(df)
+        total_columns = len(df.columns)
+        
+        # Show sample data (first 10 rows)
+        sample_data = df.head(10).to_dict('records')
+        
+        # Get column types
+        column_types = {}
+        for col in df.columns:
+            column_types[col] = str(df[col].dtype)
+        
+        logger.info(f"Pandas fallback successful: {total_rows} rows, {total_columns} columns")
+        
+        return {
+            "status": "success",
+            "service": "pandas_fallback",
+            "total_rows": total_rows,
+            "total_columns": total_columns,
+            "columns": df.columns.tolist(),
+            "column_types": column_types,
+            "sample_data": sample_data,
+            "file_path": file_path,
+            "sheet_name": sheet_name or "Sheet1",
+            "fallback_reason": result['error']
+        }
+        
+    except Exception as e:
+        logger.error(f"All Excel processing methods failed: {e}")
+        return {
+            "status": "error",
+            "service": "all_methods_failed",
+            "error": str(e),
+            "file_path": file_path,
+            "sheet_name": sheet_name or "Sheet1"
+        }
 
 # Legacy function for backward compatibility
 def get_spark_session_legacy() -> SparkSession:

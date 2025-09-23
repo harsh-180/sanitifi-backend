@@ -22,23 +22,23 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Databricks Configuration
-DATABRICKS_WORKSPACE_URL = os.getenv("DATABRICKS_WORKSPACE_URL", "https://dbc-e8343889-d484.cloud.databricks.com")
+DATABRICKS_WORKSPACE_URL = os.getenv("DATABRICKS_WORKSPACE_URL")
 DATABRICKS_ACCESS_TOKEN = os.getenv("DATABRICKS_ACCESS_TOKEN")
 
 # Environment Setup (same as original spark_utils.py)
-JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
-HADOOP_HOME = r"C:\hadoop"
+JAVA_HOME = os.getenv("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk")
+HADOOP_HOME = os.getenv("HADOOP_HOME", "/opt/hadoop")
 PYSPARK_PYTHON = sys.executable
 
 # Set environment variables
 os.environ["JAVA_HOME"] = JAVA_HOME
 os.environ["HADOOP_HOME"] = HADOOP_HOME
-os.environ["PATH"] += f";{os.path.join(HADOOP_HOME, 'bin')}"
+os.environ["PATH"] += f":{os.path.join(HADOOP_HOME, 'bin')}"
 os.environ["PYSPARK_PYTHON"] = PYSPARK_PYTHON
 os.environ["SPARK_LOCAL_IP"] = "localhost"
 
 # Create local Spark temp dir if it doesn't exist
-SPARK_LOCAL_DIRS = "C:/Users/harsh/Documents/skewb/dashboard/Dashboard-backend/spark-temp"
+SPARK_LOCAL_DIRS = os.getenv("SPARK_LOCAL_DIRS", "./spark-temp")
 os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
 os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
 
@@ -99,7 +99,7 @@ class CloudSparkManager:
             
             # Use Workspace Files instead of DBFS
             file_name = Path(local_file_path).name
-            workspace_path = f"/Users/harsh.kumar@skewb.ai/uploads/{file_name}"
+            workspace_path = f"/Users/{os.getenv('DATABRICKS_USER', 'user')}/uploads/{file_name}"
             
             # Upload file using workspace-files API
             upload_url = f"{self.workspace_url}/api/2.0/workspace-files/upload"
@@ -247,12 +247,12 @@ dbutils.notebook.exit(json.dumps(result))
         try:
             import base64
             # Create temporary notebook in user-specific directory
-            notebook_path = "/Users/harsh.kumar@skewb.ai/temp/excel_processing_temp"
+            notebook_path = f"/Users/{os.getenv('DATABRICKS_USER', 'user')}/temp/excel_processing_temp"
             
             # First, create the parent directory if it doesn't exist
             try:
                 mkdir_url = f"{self.workspace_url}/api/2.0/workspace/mkdirs"
-                mkdir_data = {"path": "/Users/harsh.kumar@skewb.ai/temp"}
+                mkdir_data = {"path": f"/Users/{os.getenv('DATABRICKS_USER', 'user')}/temp"}
                 response = requests.post(mkdir_url, headers=self.headers, json=mkdir_data)
                 if response.status_code not in [200, 400]:  # 400 means directory already exists
                     response.raise_for_status()
@@ -318,7 +318,7 @@ dbutils.notebook.exit(json.dumps(result))
             except Exception as upload_error:
                 logger.warning(f"File upload failed, trying alternative method: {upload_error}")
                 # Fallback: Create a notebook that references the local file path
-                dbfs_path = f"/Users/harsh.kumar@skewb.ai/uploads/{Path(local_file_path).name}"
+                dbfs_path = f"/Users/{os.getenv('DATABRICKS_USER', 'user')}/uploads/{Path(local_file_path).name}"
                 logger.info(f"Using fallback path: {dbfs_path}")
             
             # Step 2: Create processing notebook

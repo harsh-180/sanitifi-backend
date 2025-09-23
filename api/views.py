@@ -3833,6 +3833,464 @@ class UpdateFromGoogleSheet(APIView):
             return Response({'error': f'Google Sheets error: {str(e)}'}, status=500)
 
 
+def get_onedrive_service():
+    """Get OneDrive service using Microsoft Graph API"""
+    import requests
+    import json
+    
+    client_id = os.getenv('MS_CLIENT_ID')
+    client_secret = os.getenv('MS_CLIENT_SECRET')
+    tenant_id = os.getenv('MS_TENANT_ID')
+    
+    if not all([client_id, client_secret, tenant_id]):
+        raise ValueError("OneDrive credentials not set in environment variables. Required: MS_CLIENT_ID, MS_CLIENT_SECRET, MS_TENANT_ID")
+    
+    # Get access token using client credentials flow
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    token_data = {
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'scope': 'https://graph.microsoft.com/.default',
+        'grant_type': 'client_credentials'
+    }
+    
+    response = requests.post(token_url, data=token_data)
+    if response.status_code != 200:
+        raise ValueError(f"Failed to get access token: {response.text}")
+    
+    token_info = response.json()
+    access_token = token_info['access_token']
+    
+    return access_token
+
+
+class CreateOneDriveExcel(APIView):
+    def post(self, request):
+        import pandas as pd
+        import requests
+        import os
+        import io
+
+        file_type = request.data.get('file_type')
+        file_name = request.data.get('file_name')
+        project_id = request.data.get('project_id')
+        sheet_name = request.data.get('sheet_name')
+
+        if not all([file_type, file_name, project_id, sheet_name]):
+            return Response({'error': 'Missing required fields'}, status=400)
+
+        file_name = os.path.basename(file_name)
+
+        try:
+            project = Projects.objects.get(id=project_id)
+        except Projects.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=404)
+
+        # Validate file path
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+            found = False
+            file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({'error': 'File not found in concatenated folder'}, status=404)
+        else:
+            # Regular file type handling
+            file_path = os.path.normpath(os.path.join(
+                settings.MEDIA_ROOT,
+                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+            ))
+
+            if not os.path.exists(file_path):
+                return Response({'error': 'File not found'}, status=404)
+
+        file_extension = os.path.splitext(sheet_name)[1].lower()
+
+        try:
+            # Read the data
+            if file_extension == '.csv':
+                try:
+                    df = pd.read_csv(file_path, encoding='utf-8')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(file_path, encoding='latin1')
+            elif file_extension in ['.xlsx', '.xls']:
+                df = pd.read_excel(file_path)
+            else:
+                return Response({'error': 'Unsupported file format'}, status=400)
+
+            # Get OneDrive access token
+            access_token = get_onedrive_service()
+            
+            # Create Excel file in memory
+            excel_buffer = io.BytesIO()
+            df.to_excel(excel_buffer, index=False, engine='openpyxl')
+            excel_buffer.seek(0)
+            
+            # Upload to OneDrive
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            }
+            
+            # Get target user and folder path from environment
+            target_user = os.getenv('MS_GRAPH_USER_ID', 'me')
+            folder_path = os.getenv('MS_ONEDRIVE_FOLDER_PATH', '')
+            
+            # Clean up the file name for OneDrive
+            file_name_onedrive = f'EditData_{os.path.splitext(sheet_name)[0]}.xlsx'
+            
+            # Construct upload URL based on folder path
+            if folder_path:
+                upload_url = f"https://graph.microsoft.com/v1.0/users/{target_user}/drive/root:/{folder_path}/{file_name_onedrive}:/content"
+            else:
+                upload_url = f"https://graph.microsoft.com/v1.0/users/{target_user}/drive/root:/{file_name_onedrive}:/content"
+            
+            response = requests.put(upload_url, headers=headers, data=excel_buffer.getvalue())
+            
+            if response.status_code in [200, 201]:
+                file_info = response.json()
+                file_id = file_info.get('id')
+                web_url = file_info.get('webUrl')
+                
+                # Create a sharing link for editing
+                share_scope = os.getenv('MS_SHARE_LINK_SCOPE', 'organization')
+                share_url = f"https://graph.microsoft.com/v1.0/users/{target_user}/drive/items/{file_id}/createLink"
+                share_data = {
+                    "type": "edit",
+                    "scope": share_scope
+                }
+                
+                share_response = requests.post(share_url, headers=headers, json=share_data)
+                edit_link = None
+                if share_response.status_code in [200, 201]:
+                    share_info = share_response.json()
+                    edit_link = share_info.get('link', {}).get('webUrl')
+                
+                # Return the file URL and ID in the format expected by frontend
+                return Response({
+                    "onedrive_url": edit_link or web_url,  # Use edit_link if available, fallback to web_url
+                    "onedrive_edit_link": edit_link or web_url,  # explicit field for editable link consumption by frontend
+                    "onedrive_item_id": file_id,
+                    "message": "OneDrive Excel file created successfully"
+                }, status=200)
+            else:
+                return Response({'error': f'OneDrive API error: {response.text}'}, status=500)
+
+        except Exception as e:
+            return Response({'error': f'Unexpected error: {str(e)}'}, status=500)
+
+
+class UpdateFromOneDriveExcel(APIView):
+    def post(self, request):
+        import pandas as pd
+        import requests
+        import os
+
+        file_type = request.data.get('file_type')
+        file_name = request.data.get('file_name')
+        project_id = request.data.get('project_id')
+        sheet_name = request.data.get('sheet_name')
+        onedrive_file_id = request.data.get('onedrive_file_id') or request.data.get('onedrive_item_id')
+        
+        if not all([file_type, file_name, project_id, sheet_name, onedrive_file_id]):
+            return Response({'error': 'Missing required fields: file_type, file_name, project_id, sheet_name, onedrive_file_id (or onedrive_item_id)'}, status=400)
+            
+        file_name = os.path.basename(file_name)
+        
+        try:
+            project = Projects.objects.get(id=project_id)
+        except Projects.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=404)
+
+        # Validate file path
+        if file_type == 'concatenated':
+            # Search all subfolders for the sheet_name
+            concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+            found = False
+            file_path = None
+            if os.path.exists(concatenated_base):
+                for folder in os.listdir(concatenated_base):
+                    folder_path = os.path.join(concatenated_base, folder)
+                    candidate = os.path.join(folder_path, sheet_name)
+                    if os.path.isfile(candidate):
+                        file_path = candidate
+                        found = True
+                        break
+            if not found:
+                return Response({'error': 'File not found in concatenated folder'}, status=404)
+        else:
+            # Regular file type handling
+            file_path = os.path.join(
+                settings.MEDIA_ROOT,
+                f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+            )
+            file_path = os.path.normpath(file_path)
+
+        file_extension = os.path.splitext(sheet_name)[1].lower()
+        
+        try:
+            # Get OneDrive access token
+            access_token = get_onedrive_service()
+            
+            # Get target user from environment
+            target_user = os.getenv('MS_GRAPH_USER_ID', 'me')
+            
+            # Download file from OneDrive
+            headers = {
+                'Authorization': f'Bearer {access_token}'
+            }
+            
+            download_url = f"https://graph.microsoft.com/v1.0/users/{target_user}/drive/items/{onedrive_file_id}/content"
+            response = requests.get(download_url, headers=headers)
+            
+            if response.status_code != 200:
+                return Response({'error': f'Failed to download from OneDrive: {response.text}'}, status=500)
+            
+            # Read the downloaded Excel file
+            import io
+            excel_buffer = io.BytesIO(response.content)
+            df = pd.read_excel(excel_buffer)
+            
+            if df.empty:
+                return Response({'error': 'No data found in OneDrive Excel file'}, status=400)
+            
+            # Save to backend file (csv or xlsx)
+            if file_extension == '.csv':
+                try:
+                    df.to_csv(file_path, index=False, encoding='utf-8')
+                except Exception as e:
+                    return Response({'error': f'Failed to write CSV: {str(e)}'}, status=500)
+            elif file_extension in ['.xlsx', '.xls']:
+                try:
+                    df.to_excel(file_path, index=False, engine='openpyxl')
+                except Exception as e:
+                    return Response({'error': f'Failed to write Excel: {str(e)}'}, status=500)
+            else:
+                return Response({'error': 'Unsupported file format'}, status=400)
+
+            # Git commit logic (similar to Google Sheets)
+            try:
+                user = None
+                if hasattr(request, 'user') and request.user.is_authenticated:
+                    user = request.user
+                elif project and hasattr(project, 'user'):
+                    user = project.user
+                    
+                project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}")
+                
+                # Initialize git repo if it doesn't exist
+                if not os.path.exists(os.path.join(project_folder, ".git")):
+                    subprocess.run(["git", "init"], cwd=project_folder)
+                    subprocess.run(["git", "config", "user.name", user.name], cwd=project_folder)
+                    subprocess.run(["git", "config", "user.email", user.email], cwd=project_folder)
+                
+                file_path_relative = os.path.join(file_type, file_name)
+                subprocess.run(["git", "add", file_path_relative], cwd=project_folder)
+                commit_message = f"onedrive update - {user.id}/{project_id}/{file_type}/{file_name}/{sheet_name}"
+                subprocess.run(["git", "commit", "-m", commit_message], cwd=project_folder)
+                
+            except Exception as git_error:
+                print(f"Git commit failed: {git_error}")
+                # Continue execution even if git fails
+
+            return Response({
+                'message': 'Sheet updated successfully from OneDrive',
+                'columns': df.columns.tolist(),
+                'data': safe_data,
+                'total_rows': len(df)
+            }, status=200)
+
+        except Exception as e:
+            return Response({'error': f'Unexpected error: {str(e)}'}, status=500)
+
+
+class GetSheetPage(APIView):
+    """
+    API endpoint to get paginated sheet data
+    """
+    def post(self, request):
+        try:
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            project_id = request.data.get('project_id')
+            sheet_name = request.data.get('sheet_name')
+            page = request.data.get('page', 1)
+            page_size = request.data.get('page_size', 1000)
+            
+            if not all([file_type, file_name, project_id, sheet_name]):
+                return Response({'error': 'Missing required fields'}, status=400)
+            
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+            
+            # Validate file path
+            if file_type == 'concatenated':
+                concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+                found = False
+                file_path = None
+                if os.path.exists(concatenated_base):
+                    for folder in os.listdir(concatenated_base):
+                        folder_path = os.path.join(concatenated_base, folder)
+                        candidate = os.path.join(folder_path, sheet_name)
+                        if os.path.isfile(candidate):
+                            file_path = candidate
+                            found = True
+                            break
+                if not found:
+                    return Response({'error': 'File not found in concatenated folder'}, status=404)
+            else:
+                file_path = os.path.normpath(os.path.join(
+                    settings.MEDIA_ROOT,
+                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+                ))
+                
+                if not os.path.exists(file_path):
+                    return Response({'error': 'File not found'}, status=404)
+            
+            file_extension = os.path.splitext(sheet_name)[1].lower()
+            
+            # Read the data
+            if file_extension == '.csv':
+                try:
+                    df = pd.read_csv(file_path, encoding='utf-8')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(file_path, encoding='latin1')
+            elif file_extension in ['.xlsx', '.xls']:
+                df = pd.read_excel(file_path)
+            else:
+                return Response({'error': 'Unsupported file format'}, status=400)
+            
+            # Calculate pagination
+            total_rows = len(df)
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            
+            # Get paginated data
+            paginated_df = df.iloc[start_idx:end_idx]
+            
+            # Convert to safe format
+            def json_safe(val):
+                if pd.isna(val):
+                    return None
+                elif isinstance(val, (int, float)):
+                    if pd.isna(val):
+                        return None
+                    return val
+                return str(val)
+            
+            safe_data = []
+            for _, row in paginated_df.iterrows():
+                safe_row = [json_safe(val) for val in row]
+                safe_data.append(safe_row)
+            
+            return Response({
+                'columns': df.columns.tolist(),
+                'data': safe_data,
+                'pagination': {
+                    'current_page': page,
+                    'page_size': page_size,
+                    'total_rows': total_rows,
+                    'total_pages': (total_rows + page_size - 1) // page_size,
+                    'start_idx': start_idx,
+                    'end_idx': min(end_idx, total_rows)
+                }
+            }, status=200)
+            
+        except Exception as e:
+            return Response({'error': f'Unexpected error: {str(e)}'}, status=500)
+
+
+class GetCompleteSheetData(APIView):
+    """
+    API endpoint to get complete sheet data without pagination
+    """
+    def post(self, request):
+        try:
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            project_id = request.data.get('project_id')
+            sheet_name = request.data.get('sheet_name')
+            
+            if not all([file_type, file_name, project_id, sheet_name]):
+                return Response({'error': 'Missing required fields'}, status=400)
+            
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+            
+            # Validate file path
+            if file_type == 'concatenated':
+                concatenated_base = os.path.join(settings.MEDIA_ROOT, f"user_{project.user.id}/project_{project.id}/concatenated")
+                found = False
+                file_path = None
+                if os.path.exists(concatenated_base):
+                    for folder in os.listdir(concatenated_base):
+                        folder_path = os.path.join(concatenated_base, folder)
+                        candidate = os.path.join(folder_path, sheet_name)
+                        if os.path.isfile(candidate):
+                            file_path = candidate
+                            found = True
+                            break
+                if not found:
+                    return Response({'error': 'File not found in concatenated folder'}, status=404)
+            else:
+                file_path = os.path.normpath(os.path.join(
+                    settings.MEDIA_ROOT,
+                    f"user_{project.user.id}/project_{project.id}/{file_type}/{file_name}/{sheet_name}"
+                ))
+                
+                if not os.path.exists(file_path):
+                    return Response({'error': 'File not found'}, status=404)
+            
+            file_extension = os.path.splitext(sheet_name)[1].lower()
+            
+            # Read the data
+            if file_extension == '.csv':
+                try:
+                    df = pd.read_csv(file_path, encoding='utf-8')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(file_path, encoding='latin1')
+            elif file_extension in ['.xlsx', '.xls']:
+                df = pd.read_excel(file_path)
+            else:
+                return Response({'error': 'Unsupported file format'}, status=400)
+            
+            # Convert to safe format
+            def json_safe(val):
+                if pd.isna(val):
+                    return None
+                elif isinstance(val, (int, float)):
+                    if pd.isna(val):
+                        return None
+                    return val
+                return str(val)
+            
+            safe_data = []
+            for _, row in df.iterrows():
+                safe_row = [json_safe(val) for val in row]
+                safe_data.append(safe_row)
+            
+            return Response({
+                'columns': df.columns.tolist(),
+                'data': safe_data,
+                'total_rows': len(df)
+            }, status=200)
+            
+        except Exception as e:
+            return Response({'error': f'Unexpected error: {str(e)}'}, status=500)
+
+
 class UpdateSheetData(APIView):
     """
     API endpoint to update sheet data directly.

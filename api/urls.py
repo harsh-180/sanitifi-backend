@@ -33,6 +33,8 @@ urlpatterns = [
     path('add-date/', views.AddDateColumns.as_view(), name='add_date_columns'),
     path('create_google_sheet/', views.CreateGoogleSheet.as_view(), name='create_google_sheet'),
     path('update_from_google_sheet/', views.UpdateFromGoogleSheet.as_view(), name='update_from_google_sheet'),
+    path('create_onedrive_excel/', views.CreateOneDriveExcel.as_view(), name='create_onedrive_excel'),
+    path('update_from_onedrive_excel/', views.UpdateFromOneDriveExcel.as_view(), name='update_from_onedrive_excel'),
     path('update-sheet-data/', views.UpdateSheetData.as_view(), name='update_sheet_data'),
     path('auth/file/delete/', views.DeleteFile.as_view(), name='delete_file'),
     path('custom-script/', views.CustomScriptRun.as_view(), name='custom-script'),
@@ -55,6 +57,8 @@ urlpatterns = [
     path('concatenate-project-sheets/', views.ConcatenateProjectSheets.as_view(), name='concatenate_project_sheets'),
     path('get-project-files/', views.GetProjectFiles.as_view(), name='get_project_files'),
     path('sheets/', views.GetSheets.as_view(), name='get_sheets'),
+    path('sheet-page/', views.GetSheetPage.as_view(), name='get_sheet_page'),
+    path('sheet-complete/', views.GetCompleteSheetData.as_view(), name='get_complete_sheet_data'),
     path('users/emails/', views.GetUserEmails.as_view(), name='get_user_emails'),
     path('test-user-detection/', views.TestUserDetection.as_view(), name='test_user_detection'),
     path('spark-monitor/', views.SparkSessionMonitor.as_view(), name='spark_monitor'),
@@ -94,4 +98,12 @@ urlpatterns = [
     
     # Logging API
     path('logging/', apis.LoggingAPI.as_view(), name='logging_api'),
+    
+    # Pivot Table and Column Info APIs
+    path('pivot-table/', apis.PivotTableAPI.as_view(), name='pivot_table_api'),
+    path('column-info/', apis.ColumnInfoAPI.as_view(), name='column_info_api'),
+    path('debug-data/', apis.DebugDataAPI.as_view(), name='debug_data_api'),
+    
+    # Chart Builder API
+    path('chart-builder/', apis.ChartBuilderAPI.as_view(), name='chart_builder_api'),
 ]+ static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
