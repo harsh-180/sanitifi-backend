@@ -14,10 +14,13 @@ from rest_framework import serializers
 from django.core.paginator import Paginator, EmptyPage
 from django.db.models import Q
 import pandas as pd
+import numpy as np
+import math
 from .serializers import EDAPlotSerializer
 from django.shortcuts import get_object_or_404
 from datetime import datetime
 from rest_framework.parsers import JSONParser
+# Removed circular import - define make_json_safe locally
 # Excel and chart imports
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, PieChart, ScatterChart
@@ -27,6 +30,30 @@ from openpyxl.chart.reference import Reference
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
 from io import BytesIO
+
+# Utility function for JSON serialization
+def make_json_safe(obj):
+    """Convert objects to JSON-safe format"""
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_json_safe(v) for v in obj]
+    elif isinstance(obj, (float, np.floating)):
+        if pd.isna(obj) or math.isnan(obj) or math.isinf(obj):
+            return None
+        # Check for very large or very small numbers that cause JSON issues
+        if abs(obj) > 1e308 or (abs(obj) < 1e-308 and obj != 0):
+            return None
+        return float(obj)
+    elif isinstance(obj, (int, np.integer)):
+        try:
+            return int(obj)
+        except (OverflowError, ValueError):
+            return None
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
 
 # Write new API views here
 
@@ -2197,5 +2224,2378 @@ class DownloadEDAPlotsExcel(APIView):
             # Ultimate fallback: create a simple DataFrame
             return pd.DataFrame({'Data': ['Cleaning failed']})
 
+
+class PivotTableAPI(APIView):
+    """
+    API to generate pivot tables with various aggregations
+    Supports sum/count/average/minimum/maximum aggregations
+    """
+    parser_classes = [JSONParser]
+
+    # === Helper methods for mapping_configurations support (aligned with MMMDummy.PivotTableAPIView) ===
+    def _format_indian_number(self, num):
+        try:
+            if pd.isna(num):
+                return None
+            s = str(int(num))
+            if len(s) > 3:
+                last_three = s[-3:]
+                rest = s[:-3]
+                rest = ",".join([rest[max(i - 2, 0):i] for i in range(len(rest), 0, -2)][::-1])
+                return rest + "," + last_three
+            else:
+                return s
+        except (ValueError, TypeError):
+            return str(num)
+
+    def _parse_mapping_key(self, key):
+        parts = key.split(',')
+        column_values = {}
+        for part in parts:
+            if '-' in part:
+                column, value = part.split('-', 1)
+                column_values[column.strip()] = value.strip()
+        return column_values
+
+    def _get_simplified_field_name(self, agg_type, mapping_key):
+        field_name_parts = [agg_type]
+        for part in mapping_key.split(','):
+            if '-' in part:
+                _, value = part.split('-', 1)
+                field_name_parts.append(value.strip())
+        return "|".join(field_name_parts)
+
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            sheet_name = request.data.get('sheet_name')
+            
+            # Pivot table configuration
+            rows = request.data.get('rows', [])  # Row fields
+            columns = request.data.get('columns', [])  # Column fields
+            values = request.data.get('values', [])  # Value fields
+            aggregation = request.data.get('aggregation', 'sum')  # Aggregation method
+            # New: per-field aggregation selections from frontend (e.g., {field: ['sum','min','max']})
+            value_aggregations = request.data.get('value_aggregations', {}) or {}
+            
+            # Optional filters
+            filters = request.data.get('filters', {})
+            mapping_configurations = request.data.get('mapping_configurations', {})
+            
+            # Optional layout options
+            layout_options = request.data.get('layout_options', {})
+            grand_totals = layout_options.get('grand_totals', False)
+            row_totals = layout_options.get('row_totals', False)
+            show_empty_items = layout_options.get('show_empty_items', False)
+            compact_layout = layout_options.get('compact_layout', False)
+
+            # Validate required fields
+            if not all([user_id, project_id, file_type, file_name, sheet_name]):
+                missing_fields = []
+                if not user_id: missing_fields.append('user_id')
+                if not project_id: missing_fields.append('project_id')
+                if not file_type: missing_fields.append('file_type')
+                if not file_name: missing_fields.append('file_name')
+                if not sheet_name: missing_fields.append('sheet_name')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            # Validate pivot table configuration
+            if not rows and not columns:
+                return Response({
+                    'error': 'At least one row or column field must be specified'
+                }, status=400)
+
+            if not values:
+                return Response({
+                    'error': 'At least one value field must be specified'
+                }, status=400)
+
+            # Validate aggregation method
+            valid_aggregations = ['sum', 'count', 'average', 'minimum', 'maximum']
+            if aggregation not in valid_aggregations:
+                return Response({
+                    'error': f'Invalid aggregation method. Must be one of: {", ".join(valid_aggregations)}'
+                }, status=400)
+
+            # Get user and project
+            try:
+                from .models import User
+                user = User.objects.get(id=user_id)
+                project = Projects.objects.get(id=project_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Check if user has access to this project
+            if project.user != user:
+                return Response({
+                    'error': 'Access denied. You don\'t have permission to access this project.'
+                }, status=403)
+
+            # Validate file exists in project
+            file_validation_result = self._validate_file_in_project(project, file_type, file_name)
+            if not file_validation_result['valid']:
+                return Response({
+                    'error': file_validation_result['error']
+                }, status=404)
+
+            # Load the data
+            df = self._load_sheet_data(project, file_type, file_name, sheet_name)
+            if df is None:
+                return Response({'error': 'Failed to load sheet data'}, status=404)
+
+            print(f"PivotTableAPI: Loaded data - {len(df)} rows, {len(df.columns)} columns")
+            print(f"PivotTableAPI: Available columns: {list(df.columns)}")
+            print(f"PivotTableAPI: Sample data (first 3 rows):")
+            if len(df) > 0:
+                print(df.head(3).to_string())
+                
+            # Check if the requested value column exists
+            for value_col in values:
+                if value_col not in df.columns:
+                    print(f"PivotTableAPI: ERROR - Requested value column '{value_col}' not found!")
+                    print(f"PivotTableAPI: Available columns: {list(df.columns)}")
+                    
+                    # Try to suggest a likely value column
+                    numeric_columns = []
+                    for col in df.columns:
+                        if col not in rows and col not in columns:
+                            # Check if this column has numeric data
+                            try:
+                                numeric_data = pd.to_numeric(df[col], errors='coerce')
+                                if not numeric_data.isnull().all():
+                                    numeric_columns.append(col)
+                            except:
+                                pass
+                    
+                    suggestion_msg = ""
+                    if numeric_columns:
+                        suggestion_msg = f" Consider using one of these numeric columns as values: {', '.join(numeric_columns)}"
+                    
+                    return Response({
+                        'error': f'Value column "{value_col}" not found in data. Available columns: {", ".join(df.columns)}.{suggestion_msg}'
+                    }, status=400)
+                else:
+                    print(f"PivotTableAPI: Value column '{value_col}' found with {len(df[value_col].dropna())} non-null values")
+
+            # Validate that specified fields exist in the data
+            all_fields = rows + columns + values
+            missing_columns = [col for col in all_fields if col not in df.columns]
+            if missing_columns:
+                return Response({
+                    'error': f'Columns not found in data: {", ".join(missing_columns)}'
+                }, status=400)
+
+            print(f"PivotTableAPI: All required fields found in data")
+            print(f"PivotTableAPI: Original data shape: {df.shape}")
+
+            # Apply filters if provided
+            if filters:
+                print(f"PivotTableAPI: Applying filters: {filters}")
+                original_count = len(df)
+                df = self._apply_filters(df, filters)
+                print(f"PivotTableAPI: After filtering: {len(df)} rows (was {original_count})")
+                
+                if len(df) == 0:
+                    print("PivotTableAPI: WARNING - All data filtered out!")
+                    # Reload original data to check what values actually exist
+                    original_df = self._load_sheet_data(project, file_type, file_name, sheet_name)
+                    for filter_col, filter_config in filters.items():
+                        if filter_col in original_df.columns:
+                            available_values = original_df[filter_col].unique()[:10].tolist()
+                            print(f"PivotTableAPI: Available values in '{filter_col}': {available_values}")
+                            print(f"PivotTableAPI: Requested filter values: {filter_config.get('value', [])}")
+            else:
+                print("PivotTableAPI: No filters applied")
+
+            # Create pivot table
+            pivot_result = self._create_pivot_table(df, rows, columns, values, aggregation, {
+                'grand_totals': grand_totals,
+                'row_totals': row_totals,
+                'show_empty_items': show_empty_items,
+                'compact_layout': compact_layout
+            }, value_aggregations)
+
+            # === Handle mapping_configurations if provided, otherwise use standard pivot table ===
+            if mapping_configurations:
+                # Build MMMDummy-like data/columns when mapping_configurations provided
+                records = []
+                series_columns = []
+                try:
+                    # Use only explicitly provided value column; do not fallback to any default
+                    primary_value_col = values[0]
+                    # Unique combinations for all row fields
+                    if rows and not df.empty:
+                        grouped = df.groupby(rows).size().reset_index()
+                        row_combinations = grouped[rows].to_dict('records')
+                    else:
+                        row_combinations = [{}]
+
+                    for row_combo in row_combinations:
+                        record = row_combo.copy()
+
+                        # Filter df based on row values
+                        df_filtered_by_rows = df.copy()
+                        for row_field, row_value in row_combo.items():
+                            if row_field in df_filtered_by_rows.columns:
+                                df_filtered_by_rows = df_filtered_by_rows[df_filtered_by_rows[row_field] == row_value]
+
+                        for key, config in mapping_configurations.items():
+                            column_values = self._parse_mapping_key(key)
+                            df_filtered = df_filtered_by_rows.copy()
+                            for column, value in column_values.items():
+                                if column in df_filtered.columns:
+                                    df_filtered = df_filtered[df_filtered[column] == value]
+                            if df_filtered.empty:
+                                continue
+                            for agg_type in config.get('aggregations', ['sum']):
+                                agg_type_lower = agg_type.lower()
+                                try:
+                                    if primary_value_col not in df_filtered.columns:
+                                        continue
+                                    if agg_type_lower == 'sum':
+                                        agg_value = df_filtered[primary_value_col].sum()
+                                    elif agg_type_lower == 'mean' or agg_type_lower == 'average':
+                                        agg_value = df_filtered[primary_value_col].mean()
+                                    elif agg_type_lower == 'max' or agg_type_lower == 'maximum':
+                                        agg_value = df_filtered[primary_value_col].max()
+                                    elif agg_type_lower == 'min' or agg_type_lower == 'minimum':
+                                        agg_value = df_filtered[primary_value_col].min()
+                                    elif agg_type_lower == 'count':
+                                        agg_value = df_filtered[primary_value_col].count()
+                                    else:
+                                        agg_value = df_filtered[primary_value_col].sum()
+                                except KeyError:
+                                    continue
+
+                                if config.get('absolute', True):
+                                    agg_value_formatted = self._format_indian_number(agg_value)
+                                else:
+                                    agg_value_formatted = None
+
+                                if config.get('percentage', True) and not df_filtered_by_rows.empty and primary_value_col in df_filtered_by_rows.columns:
+                                    total = df_filtered_by_rows[primary_value_col].sum()
+                                    pct_val = f"{(agg_value / total * 100):.2f}%" if total != 0 else "0.00%"
+                                else:
+                                    pct_val = None
+
+                                field_name = self._get_simplified_field_name(agg_type_lower, key)
+                                record[field_name] = {
+                                    'absolute': agg_value_formatted,
+                                    'percent': pct_val
+                                }
+
+                        records.append(record)
+
+                    # Collect series columns (exclude row fields)
+                    series_columns_set = set()
+                    for rec in records:
+                        for k in rec.keys():
+                            if k not in rows:
+                                series_columns_set.add(k)
+                    series_columns = sorted(list(series_columns_set))
+                except Exception as mc_err:
+                    # Do not fail the API if mapping processing errors; keep existing response
+                    print(f"PivotTableAPI: mapping_configurations processing error: {mc_err}")
+                
+                # === Merge computed records into pivot_table rows ===
+                try:
+                    # Build lookup by row key
+                    def _row_key_from_dict(d):
+                        return tuple(d.get(rf) for rf in rows)
+
+                    record_map = {}
+                    for rec in records:
+                        record_map[_row_key_from_dict(rec)] = rec
+
+                    enriched_pivot_rows = []
+                    for pt_row in pivot_result['pivot_data']:
+                        key = _row_key_from_dict(pt_row)
+                        rec = record_map.get(key, {})
+                        # Start enriched row with ONLY row fields to drop original pivot value columns when mapping_configurations are used
+                        enriched = {rf: pt_row.get(rf) for rf in rows}
+                        for k, v in rec.items():
+                            if k in rows:
+                                continue
+                            if isinstance(v, dict):
+                                # append only absolute column, never percent
+                                enriched[f"{k}_absolute"] = v.get('absolute')
+                        enriched_pivot_rows.append(enriched)
+                    # Replace pivot_data with enriched rows
+                    pivot_data_for_response = enriched_pivot_rows
+                except Exception as merge_err:
+                    print(f"PivotTableAPI: error merging mapping data into pivot_table: {merge_err}")
+                    pivot_data_for_response = pivot_result['pivot_data']
+            else:
+                # No mapping_configurations: use the standard pivot table result
+                print(f"PivotTableAPI: No mapping_configurations provided, using standard pivot table")
+                pivot_data_for_response = pivot_result['pivot_data']
+                
+                # Collect series columns from the pivot table data
+                series_columns_set = set()
+                for row in pivot_data_for_response:
+                    for k in row.keys():
+                        if k not in rows:
+                            series_columns_set.add(k)
+                series_columns = sorted(list(series_columns_set))
+            
+            # Log the action
+            ip = request.META.get('REMOTE_ADDR')
+            from .log_utils import log_user_action
+            log_user_action(user, "generate_pivot_table", 
+                          details=f"Generated pivot table for {file_name}/{sheet_name}", 
+                          ip_address=ip)
+
+            # Ensure the entire response is JSON-safe
+            response_data = {
+                'success': True,
+                'pivot_table': pivot_data_for_response,
+                'summary': {
+                    'total_rows': len(df),
+                    'pivot_rows': pivot_result['pivot_rows'],
+                    'pivot_columns': pivot_result['pivot_columns'],
+                    'aggregation_method': aggregation,
+                    'value_aggregations': value_aggregations,
+                    'row_fields': rows,
+                    'column_fields': columns,
+                    'value_fields': values,
+                    'layout_options': {
+                        'grand_totals': grand_totals,
+                        'row_totals': row_totals,
+                        'show_empty_items': show_empty_items,
+                        'compact_layout': compact_layout
+                    }
+                },
+                # Keep columns list for frontend series identification
+                'columns': series_columns
+            }
+            
+            # Make the entire response JSON-safe
+            safe_response = make_json_safe(response_data)
+            
+            return Response(safe_response, status=200)
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+    def _load_sheet_data(self, project, file_type, file_name, sheet_name):
+        """Load data from the specified sheet"""
+        try:
+            # Construct file path similar to existing APIs
+            project_folder = f"user_{project.user.id}/project_{project.id}"
+            
+            print(f"PivotTableAPI: Loading data for project_folder: {project_folder}")
+            print(f"PivotTableAPI: Original params - file_type: {file_type}, file_name: {file_name}, sheet_name: {sheet_name}")
+            
+            # Clean file name
+            original_file_name = file_name
+            if file_type == 'concatenated':
+                if '/' in file_name:
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+            else:
+                if '/' in file_name or '\\' in file_name:
+                    file_name = file_name.replace('\\', '/').split('/')[-1]
+                else:
+                    file_name = os.path.basename(file_name)
+
+            print(f"PivotTableAPI: Cleaned file_name: {file_name}")
+
+            # Build base folder path
+            if file_type == 'kpi':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'kpi', file_name)
+            elif file_type == 'media':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'media', file_name)
+            elif file_type == 'concatenated':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'concatenated', file_name)
+            else:
+                print(f"PivotTableAPI: Unsupported file_type: {file_type}")
+                return None
+
+            base_folder = os.path.normpath(base_folder)
+            print(f"PivotTableAPI: Base folder path: {base_folder}")
+            print(f"PivotTableAPI: Base folder exists: {os.path.exists(base_folder)}")
+            
+            if not os.path.exists(base_folder):
+                # List contents of parent directory for debugging
+                parent_dir = os.path.dirname(base_folder)
+                if os.path.exists(parent_dir):
+                    print(f"PivotTableAPI: Parent directory contents: {os.listdir(parent_dir)}")
+                else:
+                    print(f"PivotTableAPI: Parent directory does not exist: {parent_dir}")
+                return None
+
+            # List contents of base folder for debugging
+            try:
+                folder_contents = os.listdir(base_folder)
+                print(f"PivotTableAPI: Base folder contents: {folder_contents}")
+            except Exception as e:
+                print(f"PivotTableAPI: Error listing base folder contents: {e}")
+
+            # Find the CSV file
+            normalized_input = (sheet_name or '').replace('\\', '/').strip()
+            input_no_ext = os.path.splitext(normalized_input)[0]
+
+            print(f"PivotTableAPI: Looking for sheet: {normalized_input}")
+            print(f"PivotTableAPI: Sheet name without extension: {input_no_ext}")
+
+            # Try different path combinations
+            direct_candidate = os.path.normpath(os.path.join(base_folder, normalized_input))
+            direct_with_ext = direct_candidate if direct_candidate.lower().endswith('.csv') else direct_candidate + '.csv'
+            alt_candidate = os.path.normpath(os.path.join(base_folder, input_no_ext + '.csv'))
+
+            candidates = [direct_with_ext, alt_candidate, direct_candidate]
+            print(f"PivotTableAPI: Trying candidates: {candidates}")
+
+            target_csv_path = None
+            for i, candidate in enumerate(candidates):
+                print(f"PivotTableAPI: Checking candidate {i+1}: {candidate} - exists: {os.path.isfile(candidate)}")
+                if os.path.isfile(candidate):
+                    target_csv_path = candidate
+                    break
+
+            if not target_csv_path:
+                print(f"PivotTableAPI: No valid CSV file found among candidates")
+                return None
+
+            print(f"PivotTableAPI: Found CSV file: {target_csv_path}")
+
+            # Read the CSV file
+            try:
+                df = pd.read_csv(target_csv_path, encoding='utf-8')
+                print(f"PivotTableAPI: Successfully loaded CSV with {len(df)} rows and {len(df.columns)} columns")
+            except UnicodeDecodeError:
+                try:
+                    df = pd.read_csv(target_csv_path, encoding='latin1')
+                    print(f"PivotTableAPI: Loaded CSV with latin1 encoding - {len(df)} rows and {len(df.columns)} columns")
+                except UnicodeDecodeError:
+                    df = pd.read_csv(target_csv_path, encoding='cp1252')
+                    print(f"PivotTableAPI: Loaded CSV with cp1252 encoding - {len(df)} rows and {len(df.columns)} columns")
+
+            # Clean the data
+            df = df.replace([np.inf, -np.inf], np.nan)
+            
+            return df
+
+        except Exception as e:
+            print(f"PivotTableAPI: Error loading sheet data: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _apply_filters(self, df, filters):
+        """Apply filters to the dataframe"""
+        try:
+            original_count = len(df)
+            print(f"PivotTableAPI: _apply_filters starting with {original_count} rows")
+            
+            for column, filter_config in filters.items():
+                if column not in df.columns:
+                    print(f"PivotTableAPI: Filter column '{column}' not found in data")
+                    continue
+                
+                filter_type = filter_config.get('type', 'equals')
+                filter_value = filter_config.get('value')
+                
+                print(f"PivotTableAPI: Applying filter - Column: '{column}', Type: '{filter_type}', Value: {filter_value}")
+                
+                # Show sample of actual values in the column
+                actual_values = df[column].unique()[:10].tolist()
+                print(f"PivotTableAPI: Sample actual values in '{column}': {actual_values}")
+                
+                rows_before = len(df)
+                
+                if filter_type == 'equals':
+                    df = df[df[column] == filter_value]
+                elif filter_type == 'not_equals':
+                    df = df[df[column] != filter_value]
+                elif filter_type == 'contains':
+                    df = df[df[column].astype(str).str.contains(str(filter_value), na=False)]
+                elif filter_type == 'greater_than':
+                    df = df[pd.to_numeric(df[column], errors='coerce') > float(filter_value)]
+                elif filter_type == 'less_than':
+                    df = df[pd.to_numeric(df[column], errors='coerce') < float(filter_value)]
+                elif filter_type == 'in':
+                    if isinstance(filter_value, list):
+                        print(f"PivotTableAPI: Filtering '{column}' to include values: {filter_value}")
+                        # Convert both sides to strings for comparison to handle type mismatches
+                        df_str_col = df[column].astype(str)
+                        filter_value_str = [str(v) for v in filter_value]
+                        df = df[df_str_col.isin(filter_value_str)]
+                
+                rows_after = len(df)
+                print(f"PivotTableAPI: Filter '{column}' reduced rows from {rows_before} to {rows_after}")
+                        
+            print(f"PivotTableAPI: _apply_filters completed - {len(df)} rows remaining (started with {original_count})")
+            return df
+        except Exception as e:
+            print(f"PivotTableAPI: Error applying filters: {e}")
+            import traceback
+            traceback.print_exc()
+            return df
+
+    def _create_pivot_table(self, df, rows, columns, values, aggregation, layout_options=None, value_aggregations=None):
+        """Create pivot table with specified configuration and layout options"""
+        try:
+            print(f"PivotTableAPI: _create_pivot_table starting with {len(df)} rows")
+            print(f"PivotTableAPI: Pivot config - Rows: {rows}, Columns: {columns}, Values: {values}, Aggregation: {aggregation}")
+            print(f"PivotTableAPI: DataFrame columns: {list(df.columns)}")
+            print(f"PivotTableAPI: DataFrame sample data:")
+            print(df.head(3).to_string())
+            
+            # Check if value columns exist and have data
+            for value_col in values:
+                if value_col in df.columns:
+                    print(f"PivotTableAPI: Value column '{value_col}' exists with {len(df[value_col].dropna())} non-null values")
+                    print(f"PivotTableAPI: Sample values in '{value_col}': {df[value_col].dropna().head(5).tolist()}")
+                else:
+                    print(f"PivotTableAPI: ERROR - Value column '{value_col}' not found in data!")
+            
+            # Extract layout options
+            if layout_options is None:
+                layout_options = {}
+            grand_totals = layout_options.get('grand_totals', False)
+            row_totals = layout_options.get('row_totals', False)
+            show_empty_items = layout_options.get('show_empty_items', False)
+            compact_layout = layout_options.get('compact_layout', False)
+            
+            print(f"PivotTableAPI: Layout options - Grand Totals: {grand_totals}, Row Totals: {row_totals}, Show Empty Items: {show_empty_items}, Compact Layout: {compact_layout}")
+            
+            # Map aggregation methods to pandas functions
+            agg_mapping = {
+                'sum': 'sum',
+                'count': 'size',  # Use 'size' to count rows, not non-null values
+                'average': 'mean',
+                'minimum': 'min',
+                'maximum': 'max'
+            }
+            
+            pandas_agg = agg_mapping.get(aggregation, 'sum')
+            print(f"PivotTableAPI: Using pandas aggregation: {pandas_agg}")
+            
+            # Special handling for count aggregation
+            if aggregation == 'count':
+                print(f"PivotTableAPI: Count aggregation - will count rows in each group (like Excel)")
+                # For count, we'll use 'size' which counts all rows in each group
+                pandas_agg = 'size'
+            
+            # For date columns with max/min, we need special handling
+            date_columns = []
+            for value_col in values:
+                if value_col in df.columns and pd.api.types.is_datetime64_any_dtype(df[value_col]):
+                    date_columns.append(value_col)
+            
+            print(f"PivotTableAPI: Date columns detected: {date_columns}")
+            
+            # Convert value columns appropriately based on their data type
+            for value_col in values:
+                if value_col in df.columns:
+                    original_dtype = df[value_col].dtype
+                    print(f"PivotTableAPI: Processing value column '{value_col}' with dtype: {original_dtype}")
+                    
+                    # Check if it's a date/period column
+                    sample_values = df[value_col].dropna().head(10)
+                    print(f"PivotTableAPI: Sample values in '{value_col}': {sample_values.tolist()}")
+                    
+                    # Try to detect if it's a date column
+                    is_date_column = False
+                    try:
+                        # Check if values look like dates or if column name suggests it's a period/date
+                        sample_str = str(sample_values.iloc[0]) if len(sample_values) > 0 else ""
+                        column_name_lower = value_col.lower()
+                        
+                        # Check by column name patterns
+                        if any(pattern in column_name_lower for pattern in ['period', 'date', 'time', 'year', 'month', 'day']):
+                            print(f"PivotTableAPI: '{value_col}' detected as date column by name pattern")
+                            is_date_column = True
+                        # Check by value format
+                        elif '/' in sample_str or '-' in sample_str or sample_str.isdigit() and len(sample_str) == 4:
+                            # Try to parse as date
+                            test_conversion = pd.to_datetime(sample_values, errors='coerce')
+                            if not test_conversion.isnull().all():
+                                is_date_column = True
+                                print(f"PivotTableAPI: '{value_col}' detected as date column by value format")
+                    except Exception as e:
+                        print(f"PivotTableAPI: Error detecting date column for '{value_col}': {e}")
+                        is_date_column = False
+                    
+                    if is_date_column:
+                        # For date columns, convert to datetime for proper aggregation
+                        df[value_col] = pd.to_datetime(df[value_col], errors='coerce')
+                        print(f"PivotTableAPI: Converted '{value_col}' to datetime")
+                    else:
+                        # For non-date columns, try numeric conversion
+                        numeric_converted = pd.to_numeric(df[value_col], errors='coerce')
+                        if not numeric_converted.isnull().all():
+                            df[value_col] = numeric_converted
+                            print(f"PivotTableAPI: Converted '{value_col}' to numeric")
+                        else:
+                            print(f"PivotTableAPI: Keeping '{value_col}' as original type for categorical aggregation")
+                    
+                    print(f"PivotTableAPI: '{value_col}' final sample values: {df[value_col].dropna().head(5).tolist()}")
+            
+            # Normalize per-field aggregation selections
+            if value_aggregations is None:
+                value_aggregations = {}
+            normalized_value_aggs = {}
+            try:
+                for fld, aggs in (value_aggregations or {}).items():
+                    if isinstance(aggs, list):
+                        normalized_value_aggs[fld] = [str(a).lower() for a in aggs]
+                    elif aggs is not None:
+                        normalized_value_aggs[fld] = [str(aggs).lower()]
+            except Exception:
+                normalized_value_aggs = {}
+
+            multi_agg = any(len(normalized_value_aggs.get(v, [])) > 1 for v in values) or any(v in normalized_value_aggs for v in values)
+
+            # Create pivot table
+            if columns:
+                print(f"PivotTableAPI: Creating pivot with columns")
+                if aggregation == 'count' and not multi_agg:
+                    # For count aggregation, we need to count rows, not values
+                    pivot_table = df.groupby(rows + columns, dropna=not show_empty_items).size().unstack(fill_value=0)
+                    if rows:
+                        pivot_table.index.name = rows[0] if len(rows) == 1 else None
+                else:
+                    if multi_agg:
+                        aggfunc = {}
+                        for v in values:
+                            req = normalized_value_aggs.get(v)
+                            if req:
+                                mapped = [agg_mapping.get(a, 'sum') for a in req]
+                                aggfunc[v] = mapped
+                            else:
+                                aggfunc[v] = pandas_agg
+                        pivot_table = pd.pivot_table(
+                            df, 
+                            values=values, 
+                            index=rows if rows else None, 
+                            columns=columns, 
+                            aggfunc=aggfunc,
+                            fill_value=0,
+                            dropna=not show_empty_items
+                        )
+                    else:
+                        pivot_table = pd.pivot_table(
+                            df, 
+                            values=values, 
+                            index=rows if rows else None, 
+                            columns=columns, 
+                            aggfunc=pandas_agg,
+                            fill_value=0,
+                            dropna=not show_empty_items  # Include empty items if show_empty_items is True
+                        )
+            else:
+                # If no columns specified, just group by rows
+                if rows:
+                    print(f"PivotTableAPI: Creating group by rows: {rows}")
+                    if aggregation == 'count' and not multi_agg:
+                        # For count aggregation, count rows in each group
+                        pivot_series = df.groupby(rows, dropna=not show_empty_items).size()
+                        pivot_series.name = f"Count of {values[0]}" if values else "Count"
+                        # Convert Series to DataFrame
+                        pivot_table = pivot_series.to_frame()
+                    else:
+                        if multi_agg:
+                            aggdict = {}
+                            for v in values:
+                                req = normalized_value_aggs.get(v)
+                                if req:
+                                    mapped = [agg_mapping.get(a, 'sum') for a in req]
+                                    aggdict[v] = mapped
+                                else:
+                                    aggdict[v] = pandas_agg
+                            pivot_table = df.groupby(rows, dropna=not show_empty_items)[values].agg(aggdict)
+                        else:
+                            pivot_table = df.groupby(rows, dropna=not show_empty_items)[values].agg(pandas_agg)
+                else:
+                    print(f"PivotTableAPI: Creating simple aggregation")
+                    # If no rows or columns, just aggregate all values
+                    if aggregation == 'count' and not multi_agg:
+                        pivot_series = pd.Series([len(df)], index=['Total'], name=f"Count of {values[0]}" if values else "Count")
+                        pivot_table = pivot_series.to_frame()
+                    else:
+                        if multi_agg:
+                            aggdict = {}
+                            for v in values:
+                                req = normalized_value_aggs.get(v)
+                                if req:
+                                    mapped = [agg_mapping.get(a, 'sum') for a in req]
+                                    aggdict[v] = mapped
+                                else:
+                                    aggdict[v] = pandas_agg
+                            tmp = df[values].agg(aggdict)
+                            pivot_table = tmp.to_frame().T if isinstance(tmp, pd.Series) else tmp
+                        else:
+                            pivot_table = df[values].agg(pandas_agg).to_frame().T
+            
+            print(f"PivotTableAPI: Pivot table created - shape: {pivot_table.shape}")
+            print(f"PivotTableAPI: Pivot table columns: {list(pivot_table.columns)}")
+            print(f"PivotTableAPI: Pivot table index: {pivot_table.index}")
+            if len(pivot_table) > 0:
+                print(f"PivotTableAPI: Pivot table sample:")
+                print(pivot_table.head(3).to_string())
+                print(f"PivotTableAPI: Pivot table data types:")
+                print(pivot_table.dtypes)
+            
+            # Add Grand Totals and Row Totals if requested
+            if grand_totals or row_totals:
+                print(f"PivotTableAPI: Adding totals - Grand: {grand_totals}, Row: {row_totals}")
+                
+                # Add row totals if requested
+                if row_totals and len(pivot_table) > 0:
+                    # Calculate row totals for each row
+                    if isinstance(pivot_table.columns, pd.MultiIndex):
+                        # For multi-level columns, sum across all value columns
+                        numeric_cols = pivot_table.select_dtypes(include=[np.number]).columns
+                        if len(numeric_cols) > 0:
+                            pivot_table['Row_Total'] = pivot_table[numeric_cols].sum(axis=1)
+                    else:
+                        # For single-level columns, sum all numeric columns
+                        numeric_cols = pivot_table.select_dtypes(include=[np.number]).columns
+                        if len(numeric_cols) > 0:
+                            if aggregation == 'count':
+                                # For count aggregation, row total is the sum of counts
+                                pivot_table['Row_Total'] = pivot_table[numeric_cols].sum(axis=1)
+                            else:
+                                pivot_table['Row_Total'] = pivot_table[numeric_cols].sum(axis=1)
+                
+                # Add grand totals if requested
+                if grand_totals and len(pivot_table) > 0:
+                    # Calculate grand totals for each column
+                    grand_total_row = {}
+                    
+                    # Add totals for each column
+                    for col in pivot_table.columns:
+                        if pd.api.types.is_numeric_dtype(pivot_table[col]):
+                            if aggregation == 'count':
+                                # For count aggregation, grand total is the sum of all counts
+                                grand_total_row[col] = pivot_table[col].sum()
+                            else:
+                                grand_total_row[col] = pivot_table[col].sum()
+                        else:
+                            grand_total_row[col] = 'Grand Total'
+                    
+                    # Add the grand total row
+                    grand_total_df = pd.DataFrame([grand_total_row])
+                    pivot_table = pd.concat([pivot_table, grand_total_df], ignore_index=True)
+                    print(f"PivotTableAPI: Added grand total row")
+            
+            # Convert to JSON-friendly format
+            if isinstance(pivot_table.columns, pd.MultiIndex):
+                # Flatten multi-level columns and map agg function name to friendly label
+                def _flatten(col):
+                    parts = [str(c) for c in col if c is not None and str(c) != '']
+                    if parts:
+                        last = parts[-1]
+                        mapping = {'sum':'sum','size':'count','mean':'average','min':'minimum','max':'maximum'}
+                        if last in mapping:
+                            parts[-1] = mapping[last]
+                    return '_'.join(parts)
+                pivot_table.columns = [_flatten(col) for col in pivot_table.columns.values]
+            
+            # Reset index to make it JSON serializable
+            pivot_table_reset = pivot_table.reset_index()
+            
+            # Apply chronological sorting if applicable
+            pivot_table_reset = self._apply_chronological_sorting(pivot_table_reset, rows, columns)
+            
+            # Convert to list of dictionaries
+            pivot_data = pivot_table_reset.to_dict('records')
+            
+            print(f"PivotTableAPI: Converted to records - {len(pivot_data)} rows")
+            if len(pivot_data) > 0:
+                print(f"PivotTableAPI: Sample record keys: {list(pivot_data[0].keys())}")
+                print(f"PivotTableAPI: Sample record: {pivot_data[0]}")
+            
+            # Clean data for JSON serialization using make_json_safe
+            for row in pivot_data:
+                for key, value in row.items():
+                    # Special handling for datetime objects
+                    if pd.isna(value):
+                        row[key] = None
+                    elif hasattr(value, 'strftime'):
+                        try:
+                            # Convert datetime to string format matching the original format
+                            row[key] = value.strftime('%m/%d/%Y')
+                        except:
+                            row[key] = str(value)
+                    elif isinstance(value, (pd.Timestamp, np.datetime64)):
+                        try:
+                            # Handle pandas Timestamp objects
+                            ts = pd.to_datetime(value)
+                            row[key] = ts.strftime('%m/%d/%Y')
+                        except:
+                            row[key] = str(value)
+                    else:
+                        row[key] = make_json_safe(value)
+            
+            print(f"PivotTableAPI: After JSON cleaning - sample record: {pivot_data[0] if pivot_data else 'No data'}")
+            
+            return {
+                'pivot_data': pivot_data,
+                'pivot_rows': len(pivot_table),
+                'pivot_columns': len(pivot_table.columns)
+            }
+            
+        except Exception as e:
+            print(f"Error creating pivot table: {e}")
+            raise
+
+    def _apply_chronological_sorting(self, df, rows, columns):
+        """Apply chronological sorting to the pivot table data"""
+        try:
+            print(f"PivotTableAPI: Applying chronological sorting")
+            
+            # Get all field names that might contain date/time information
+            all_fields = rows + columns
+            print(f"PivotTableAPI: Fields to check for chronological sorting: {all_fields}")
+            
+            # Define patterns for detecting date/time columns
+            year_patterns = ['year', 'yr', 'y']
+            month_patterns = ['month', 'mon', 'm']
+            date_patterns = ['date', 'period', 'time', 'day']
+            
+            # Find columns that might contain chronological data
+            chronological_columns = []
+            for field in all_fields:
+                if field in df.columns:
+                    field_lower = field.lower()
+                    
+                    # Check if field name suggests it's a date/time field
+                    is_date_field = any(pattern in field_lower for pattern in date_patterns)
+                    is_year_field = any(pattern in field_lower for pattern in year_patterns)
+                    is_month_field = any(pattern in field_lower for pattern in month_patterns)
+                    
+                    if is_date_field or is_year_field or is_month_field:
+                        chronological_columns.append(field)
+                        print(f"PivotTableAPI: Detected chronological field: '{field}'")
+            
+            # Also check for columns that contain date-like values
+            for col in df.columns:
+                if col not in chronological_columns:
+                    # Sample some values to check if they look like dates
+                    sample_values = df[col].dropna().head(10)
+                    if len(sample_values) > 0:
+                        # Check if values look like years (4 digits)
+                        year_like_values = [str(val) for val in sample_values if str(val).isdigit() and len(str(val)) == 4]
+                        if len(year_like_values) > 0:
+                            # Check if they're reasonable years
+                            years = [int(val) for val in year_like_values if 1900 <= int(val) <= 2100]
+                            if len(years) > 0:
+                                chronological_columns.append(col)
+                                print(f"PivotTableAPI: Detected year-like values in column: '{col}'")
+                        
+                        # Check if values look like months
+                        month_like_values = [str(val).lower() for val in sample_values]
+                        month_names = ['january', 'february', 'march', 'april', 'may', 'june',
+                                     'july', 'august', 'september', 'october', 'november', 'december',
+                                     'jan', 'feb', 'mar', 'apr', 'may', 'jun',
+                                     'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+                        if any(month in month_like_values for month in month_names):
+                            chronological_columns.append(col)
+                            print(f"PivotTableAPI: Detected month-like values in column: '{col}'")
+            
+            if not chronological_columns:
+                print(f"PivotTableAPI: No chronological columns detected, returning unsorted data")
+                return df
+            
+            print(f"PivotTableAPI: Chronological columns found: {chronological_columns}")
+            
+            # Create sorting key columns
+            sort_columns = []
+            
+            for col in chronological_columns:
+                if col in df.columns:
+                    # Create a sorting column for this chronological field
+                    sort_col_name = f"{col}_sort"
+                    
+                    # Convert values to sortable format
+                    sort_values = []
+                    for val in df[col]:
+                        if pd.isna(val):
+                            sort_values.append(0)  # Put nulls first
+                        else:
+                            val_str = str(val).lower().strip()
+                            
+                            # Handle year values
+                            if val_str.isdigit() and len(val_str) == 4:
+                                year = int(val_str)
+                                if 1900 <= year <= 2100:
+                                    sort_values.append(year)
+                                    continue
+                            
+                            # Handle month values
+                            month_mapping = {
+                                'january': 1, 'jan': 1,
+                                'february': 2, 'feb': 2,
+                                'march': 3, 'mar': 3,
+                                'april': 4, 'apr': 4,
+                                'may': 5,
+                                'june': 6, 'jun': 6,
+                                'july': 7, 'jul': 7,
+                                'august': 8, 'aug': 8,
+                                'september': 9, 'sep': 9,
+                                'october': 10, 'oct': 10,
+                                'november': 11, 'nov': 11,
+                                'december': 12, 'dec': 12
+                            }
+                            
+                            if val_str in month_mapping:
+                                sort_values.append(month_mapping[val_str])
+                                continue
+                            
+                            # Handle numeric month values
+                            if val_str.isdigit():
+                                month_num = int(val_str)
+                                if 1 <= month_num <= 12:
+                                    sort_values.append(month_num)
+                                    continue
+                            
+                            # Handle date strings (try to parse)
+                            try:
+                                parsed_date = pd.to_datetime(val_str, errors='coerce')
+                                if not pd.isna(parsed_date):
+                                    # Use year for primary sorting, month for secondary
+                                    sort_values.append(parsed_date.year * 100 + parsed_date.month)
+                                    continue
+                            except:
+                                pass
+                            
+                            # If we can't parse it, use string sorting
+                            sort_values.append(val_str)
+                    
+                    df[sort_col_name] = sort_values
+                    sort_columns.append(sort_col_name)
+                    print(f"PivotTableAPI: Created sort column '{sort_col_name}' for '{col}'")
+            
+            # Sort by chronological columns
+            if sort_columns:
+                print(f"PivotTableAPI: Sorting by columns: {sort_columns}")
+                df_sorted = df.sort_values(sort_columns, na_position='first')
+                
+                # Remove the temporary sort columns
+                df_sorted = df_sorted.drop(columns=sort_columns)
+                
+                print(f"PivotTableAPI: Applied chronological sorting")
+                return df_sorted
+            else:
+                print(f"PivotTableAPI: No valid sort columns created")
+                return df
+                
+        except Exception as e:
+            print(f"PivotTableAPI: Error applying chronological sorting: {e}")
+            import traceback
+            traceback.print_exc()
+            return df
+
+    def _validate_file_in_project(self, project, file_type, file_name):
+        """Validate that the file exists in the project's file lists"""
+        try:
+            # Extract just the filenames from the database paths
+            def extract_filename(file_path):
+                if '\\' in file_path or '/' in file_path:
+                    return os.path.basename(file_path)
+                return file_path
+            
+            last_name_kpi = [extract_filename(file) for file in project.kpi_file] if project.kpi_file else []
+            last_name_media = [extract_filename(file) for file in project.media_file] if project.media_file else []
+            last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
+
+            print(f"PivotTableAPI File validation - file_name: {file_name}, file_type: {file_type}")
+            print(f"Available KPI files: {last_name_kpi}")
+            print(f"Available Media files: {last_name_media}")
+            print(f"Available Concatenated files: {last_name_concatenated}")
+
+            # Check if file exists in the appropriate list
+            if file_type == 'kpi' and file_name in last_name_kpi:
+                return {'valid': True}
+            elif file_type == 'media' and file_name in last_name_media:
+                return {'valid': True}
+            elif file_type == 'concatenated':
+                # For concatenated files, check if any folder contains this CSV file
+                project_folder = f"user_{project.user.id}/project_{project.id}"
+                concatenated_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated")
+                if os.path.exists(concatenated_folder):
+                    for folder_name in os.listdir(concatenated_folder):
+                        folder_path = os.path.join(concatenated_folder, folder_name)
+                        if os.path.isdir(folder_path):
+                            if folder_name == file_name or file_name in last_name_concatenated:
+                                return {'valid': True}
+                return {'valid': False, 'error': f'Concatenated file "{file_name}" not found in project'}
+            else:
+                return {
+                    'valid': False, 
+                    'error': f'File "{file_name}" of type "{file_type}" not found in project. Available files: KPI={last_name_kpi}, Media={last_name_media}, Concatenated={last_name_concatenated}'
+                }
+
+        except Exception as e:
+            print(f"Error validating file in project: {e}")
+            return {'valid': False, 'error': f'File validation failed: {str(e)}'}
+
+
+class ColumnInfoAPI(APIView):
+    """
+    API to get complete column information including data types and unique values
+    Returns all columns with their data types and unique values (except for numerical columns)
+    """
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            print("ColumnInfoAPI: Starting request processing")
+            
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            sheet_name = request.data.get('sheet_name')
+            
+            print(f"ColumnInfoAPI: Received params - user_id: {user_id}, project_id: {project_id}, file_type: {file_type}, file_name: {file_name}, sheet_name: {sheet_name}")
+            
+            # Optional parameters (max_unique_values no longer used - we return all unique values for non-numerical columns)
+            max_unique_values = request.data.get('max_unique_values', None)  # Kept for backward compatibility but not used
+
+            # Validate required fields
+            if not all([user_id, project_id, file_type, file_name, sheet_name]):
+                missing_fields = []
+                if not user_id: missing_fields.append('user_id')
+                if not project_id: missing_fields.append('project_id')
+                if not file_type: missing_fields.append('file_type')
+                if not file_name: missing_fields.append('file_name')
+                if not sheet_name: missing_fields.append('sheet_name')
+                return Response({
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }, status=400)
+
+            print("ColumnInfoAPI: All required fields present")
+
+            # Get user and project
+            try:
+                from .models import User
+                user = User.objects.get(id=user_id)
+                project = Projects.objects.get(id=project_id)
+                print(f"ColumnInfoAPI: Found user {user.id} and project {project.id}")
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Check if user has access to this project
+            if project.user != user:
+                return Response({
+                    'error': 'Access denied. You don\'t have permission to access this project.'
+                }, status=403)
+
+            print("ColumnInfoAPI: User has access to project")
+
+            # Validate file exists in project
+            file_validation_result = self._validate_file_in_project(project, file_type, file_name)
+            if not file_validation_result['valid']:
+                return Response({
+                    'error': file_validation_result['error']
+                }, status=404)
+
+            print("ColumnInfoAPI: File validation passed")
+
+            # Load the data
+            df = self._load_sheet_data(project, file_type, file_name, sheet_name)
+            if df is None:
+                return Response({'error': 'Failed to load sheet data'}, status=404)
+
+            print(f"ColumnInfoAPI: Data loaded successfully - {len(df)} rows, {len(df.columns)} columns")
+
+            # Analyze columns
+            column_info = self._analyze_columns(df)
+            
+            print(f"ColumnInfoAPI: Column analysis completed - {len(column_info)} columns analyzed")
+            
+            # Log the action
+            try:
+                ip = request.META.get('REMOTE_ADDR')
+                from .log_utils import log_user_action
+                log_user_action(user, "get_column_info", 
+                              details=f"Retrieved column info for {file_name}/{sheet_name}", 
+                              ip_address=ip)
+                print("ColumnInfoAPI: Action logged successfully")
+            except Exception as log_error:
+                print(f"ColumnInfoAPI: Warning - failed to log action: {log_error}")
+
+            print("ColumnInfoAPI: Preparing response")
+            
+            # Ensure the entire response is JSON-safe
+            response_data = {
+                'success': True,
+                'file_info': {
+                    'file_type': file_type,
+                    'file_name': file_name,
+                    'sheet_name': sheet_name,
+                    'total_rows': len(df),
+                    'total_columns': len(df.columns)
+                },
+                'columns': column_info
+            }
+            
+            # Make the entire response JSON-safe
+            safe_response = make_json_safe(response_data)
+            
+            return Response(safe_response, status=200)
+
+        except Exception as e:
+            print(f"ColumnInfoAPI: Unexpected error in post method: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response({'error': f'Internal server error: {str(e)}'}, status=500)
+
+    def _load_sheet_data(self, project, file_type, file_name, sheet_name):
+        """Load data from the specified sheet"""
+        try:
+            # Construct file path similar to existing APIs
+            project_folder = f"user_{project.user.id}/project_{project.id}"
+            
+            print(f"ColumnInfoAPI: Loading data for project_folder: {project_folder}")
+            print(f"ColumnInfoAPI: Original params - file_type: {file_type}, file_name: {file_name}, sheet_name: {sheet_name}")
+            
+            # Clean file name
+            original_file_name = file_name
+            if file_type == 'concatenated':
+                if '/' in file_name:
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+            else:
+                if '/' in file_name or '\\' in file_name:
+                    file_name = file_name.replace('\\', '/').split('/')[-1]
+                else:
+                    file_name = os.path.basename(file_name)
+
+            print(f"ColumnInfoAPI: Cleaned file_name: {file_name}")
+
+            # Build base folder path
+            if file_type == 'kpi':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'kpi', file_name)
+            elif file_type == 'media':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'media', file_name)
+            elif file_type == 'concatenated':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'concatenated', file_name)
+            else:
+                print(f"ColumnInfoAPI: Unsupported file_type: {file_type}")
+                return None
+
+            base_folder = os.path.normpath(base_folder)
+            print(f"ColumnInfoAPI: Base folder path: {base_folder}")
+            print(f"ColumnInfoAPI: Base folder exists: {os.path.exists(base_folder)}")
+            
+            if not os.path.exists(base_folder):
+                # List contents of parent directory for debugging
+                parent_dir = os.path.dirname(base_folder)
+                if os.path.exists(parent_dir):
+                    print(f"ColumnInfoAPI: Parent directory contents: {os.listdir(parent_dir)}")
+                else:
+                    print(f"ColumnInfoAPI: Parent directory does not exist: {parent_dir}")
+                return None
+
+            # List contents of base folder for debugging
+            try:
+                folder_contents = os.listdir(base_folder)
+                print(f"ColumnInfoAPI: Base folder contents: {folder_contents}")
+            except Exception as e:
+                print(f"ColumnInfoAPI: Error listing base folder contents: {e}")
+
+            # Find the CSV file
+            normalized_input = (sheet_name or '').replace('\\', '/').strip()
+            input_no_ext = os.path.splitext(normalized_input)[0]
+
+            print(f"ColumnInfoAPI: Looking for sheet: {normalized_input}")
+            print(f"ColumnInfoAPI: Sheet name without extension: {input_no_ext}")
+
+            # Try different path combinations
+            direct_candidate = os.path.normpath(os.path.join(base_folder, normalized_input))
+            direct_with_ext = direct_candidate if direct_candidate.lower().endswith('.csv') else direct_candidate + '.csv'
+            alt_candidate = os.path.normpath(os.path.join(base_folder, input_no_ext + '.csv'))
+
+            candidates = [direct_with_ext, alt_candidate, direct_candidate]
+            print(f"ColumnInfoAPI: Trying candidates: {candidates}")
+
+            target_csv_path = None
+            for i, candidate in enumerate(candidates):
+                print(f"ColumnInfoAPI: Checking candidate {i+1}: {candidate} - exists: {os.path.isfile(candidate)}")
+                if os.path.isfile(candidate):
+                    target_csv_path = candidate
+                    break
+
+            if not target_csv_path:
+                print(f"ColumnInfoAPI: No valid CSV file found among candidates")
+                return None
+
+            print(f"ColumnInfoAPI: Found CSV file: {target_csv_path}")
+
+            # Read the CSV file
+            try:
+                df = pd.read_csv(target_csv_path, encoding='utf-8')
+                print(f"ColumnInfoAPI: Successfully loaded CSV with {len(df)} rows and {len(df.columns)} columns")
+            except UnicodeDecodeError:
+                try:
+                    df = pd.read_csv(target_csv_path, encoding='latin1')
+                    print(f"ColumnInfoAPI: Loaded CSV with latin1 encoding - {len(df)} rows and {len(df.columns)} columns")
+                except UnicodeDecodeError:
+                    df = pd.read_csv(target_csv_path, encoding='cp1252')
+                    print(f"ColumnInfoAPI: Loaded CSV with cp1252 encoding - {len(df)} rows and {len(df.columns)} columns")
+
+            # Clean the data
+            df = df.replace([np.inf, -np.inf], np.nan)
+            
+            return df
+
+        except Exception as e:
+            print(f"ColumnInfoAPI: Error loading sheet data: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _analyze_columns(self, df):
+        """Analyze each column to determine data type and unique values"""
+        try:
+            column_info = {}
+            
+            print(f"ColumnInfoAPI: Analyzing {len(df.columns)} columns")
+            print(f"ColumnInfoAPI: Column names: {list(df.columns)}")
+            
+            for column in df.columns:
+                try:
+                    print(f"ColumnInfoAPI: Processing column '{column}'")
+                    column_data = df[column]
+                    
+                    # Basic statistics
+                    null_count = column_data.isnull().sum()
+                    total_count = len(column_data)
+                    unique_count = column_data.nunique()
+                    
+                    print(f"ColumnInfoAPI: Column '{column}' - null_count: {null_count}, total: {total_count}, unique: {unique_count}")
+                    
+                    # Determine data type
+                    data_type = self._determine_data_type(column_data)
+                    print(f"ColumnInfoAPI: Column '{column}' data_type: {data_type}")
+                    
+                    # Get unique values (except for numerical columns)
+                    unique_values = []
+                    if data_type != 'numerical':
+                        # For non-numerical columns, get ALL unique values (no limit)
+                        try:
+                            unique_vals = column_data.dropna().unique()
+                            # Convert to list and make JSON safe
+                            unique_list = []
+                            for val in unique_vals:
+                                safe_val = make_json_safe(val)
+                                if safe_val is not None:  # Only add non-null values
+                                    unique_list.append(safe_val)
+                            unique_values = unique_list
+                            print(f"ColumnInfoAPI: Column '{column}' unique_values count: {len(unique_values)}")
+                        except Exception as unique_error:
+                            print(f"ColumnInfoAPI: Error getting unique values for '{column}': {unique_error}")
+                            unique_values = []
+                    elif data_type == 'numerical':
+                        # For numerical columns, provide both statistical summary and unique values
+                        try:
+                            numeric_data = pd.to_numeric(column_data, errors='coerce')
+                            # Clean the numeric data to remove inf/nan values
+                            clean_numeric = numeric_data.replace([np.inf, -np.inf], np.nan).dropna()
+                            
+                            if len(clean_numeric) > 0:
+                                stats = {
+                                    'min': make_json_safe(clean_numeric.min()),
+                                    'max': make_json_safe(clean_numeric.max()),
+                                    'mean': make_json_safe(clean_numeric.mean()),
+                                    'median': make_json_safe(clean_numeric.median()),
+                                    'std': make_json_safe(clean_numeric.std())
+                                }
+                                
+                                # Get unique values for numerical columns
+                                unique_vals = clean_numeric.unique()
+                                unique_list = []
+                                for val in unique_vals:
+                                    safe_val = make_json_safe(val)
+                                    if safe_val is not None:  # Only add non-null values
+                                        unique_list.append(safe_val)
+                                
+                                # Combine stats and unique values
+                                unique_values = {
+                                    'statistics': stats,
+                                    'unique_values': unique_list
+                                }
+                            else:
+                                stats = {
+                                    'min': None,
+                                    'max': None,
+                                    'mean': None,
+                                    'median': None,
+                                    'std': None
+                                }
+                                unique_values = {
+                                    'statistics': stats,
+                                    'unique_values': []
+                                }
+                            print(f"ColumnInfoAPI: Column '{column}' numerical stats: {stats}, unique count: {len(unique_values.get('unique_values', []))}")
+                        except Exception as stats_error:
+                            print(f"ColumnInfoAPI: Error calculating stats for '{column}': {stats_error}")
+                            unique_values = {
+                                'statistics': {
+                                    'min': None,
+                                    'max': None,
+                                    'mean': None,
+                                    'median': None,
+                                    'std': None
+                                },
+                                'unique_values': []
+                            }
+                    
+                    # Ensure all values are JSON-safe
+                    column_info[column] = {
+                        'data_type': data_type,
+                        'null_count': make_json_safe(int(null_count)),
+                        'non_null_count': make_json_safe(int(total_count - null_count)),
+                        'unique_count': make_json_safe(int(unique_count)),
+                        'unique_values': unique_values,
+                        'null_percentage': make_json_safe(round((null_count / total_count) * 100, 2) if total_count > 0 else 0)
+                    }
+                    
+                    print(f"ColumnInfoAPI: Successfully processed column '{column}'")
+                    
+                except Exception as col_error:
+                    print(f"ColumnInfoAPI: Error processing column '{column}': {col_error}")
+                    # Continue with other columns
+                    continue
+            
+            print(f"ColumnInfoAPI: Finished analyzing columns, returning {len(column_info)} column infos")
+            return column_info
+            
+        except Exception as e:
+            print(f"ColumnInfoAPI: Error analyzing columns: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
+    def _determine_data_type(self, series):
+        """Determine the data type of a pandas series"""
+        try:
+            # Remove null values for analysis
+            non_null_series = series.dropna()
+            
+            if len(non_null_series) == 0:
+                return 'unknown'
+            
+            # Check if it's numerical
+            try:
+                numeric_series = pd.to_numeric(non_null_series, errors='coerce')
+                if not numeric_series.isnull().all():
+                    return 'numerical'
+            except:
+                pass
+            
+            # Check if it's datetime
+            try:
+                datetime_series = pd.to_datetime(non_null_series, errors='coerce')
+                if not datetime_series.isnull().all():
+                    return 'datetime'
+            except:
+                pass
+            
+            # Check if it's boolean
+            unique_values = set(str(val).lower() for val in non_null_series.unique())
+            boolean_values = {'true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n'}
+            if unique_values.issubset(boolean_values) and len(unique_values) <= 2:
+                return 'boolean'
+            
+            # Default to categorical/text
+            return 'categorical'
+            
+        except Exception as e:
+            print(f"Error determining data type: {e}")
+            return 'unknown'
+
+    def _validate_file_in_project(self, project, file_type, file_name):
+        """Validate that the file exists in the project's file lists"""
+        try:
+            # Extract just the filenames from the database paths
+            def extract_filename(file_path):
+                if '\\' in file_path or '/' in file_path:
+                    return os.path.basename(file_path)
+                return file_path
+            
+            last_name_kpi = [extract_filename(file) for file in project.kpi_file] if project.kpi_file else []
+            last_name_media = [extract_filename(file) for file in project.media_file] if project.media_file else []
+            last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
+
+            print(f"ColumnInfoAPI File validation - file_name: {file_name}, file_type: {file_type}")
+            print(f"Available KPI files: {last_name_kpi}")
+            print(f"Available Media files: {last_name_media}")
+            print(f"Available Concatenated files: {last_name_concatenated}")
+
+            # Check if file exists in the appropriate list
+            if file_type == 'kpi' and file_name in last_name_kpi:
+                return {'valid': True}
+            elif file_type == 'media' and file_name in last_name_media:
+                return {'valid': True}
+            elif file_type == 'concatenated':
+                # For concatenated files, check if any folder contains this CSV file
+                project_folder = f"user_{project.user.id}/project_{project.id}"
+                concatenated_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated")
+                if os.path.exists(concatenated_folder):
+                    for folder_name in os.listdir(concatenated_folder):
+                        folder_path = os.path.join(concatenated_folder, folder_name)
+                        if os.path.isdir(folder_path):
+                            if folder_name == file_name or file_name in last_name_concatenated:
+                                return {'valid': True}
+                return {'valid': False, 'error': f'Concatenated file "{file_name}" not found in project'}
+            else:
+                return {
+                    'valid': False, 
+                    'error': f'File "{file_name}" of type "{file_type}" not found in project. Available files: KPI={last_name_kpi}, Media={last_name_media}, Concatenated={last_name_concatenated}'
+                }
+
+        except Exception as e:
+            print(f"ColumnInfoAPI: Error validating file in project: {e}")
+            return {'valid': False, 'error': f'File validation failed: {str(e)}'}
+
+
+class ChartBuilderAPI(APIView):
+    """
+    API to generate charts with various configurations
+    Similar to PivotPlotAPIView but for ChartBuilder component
+    """
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            payload = request.data
+            
+            # Extract request parameters
+            user_id = payload.get("user_id")
+            project_id = payload.get("project_id")
+            file_type = payload.get("file_type")
+            file_name = payload.get("file_name")
+            sheet_name = payload.get("sheet_name")
+            
+            # Chart configuration
+            x_axes = payload.get("x_axes", [])
+            y_axes = payload.get("y_axes", [])
+            chart_type = payload.get("chart_type", "bar")
+            aggregation_method = payload.get("aggregation_method", "sum")
+            y_axis_aggregations = payload.get("y_axis_aggregations", {})
+            date_grouping = payload.get("date_grouping", "raw")
+            filters = payload.get("filters", {})
+            
+            # Validate required fields
+            if not all([user_id, project_id, file_type, file_name, sheet_name]):
+                return Response({
+                    "success": False,
+                    "error": "Missing required fields: user_id, project_id, file_type, file_name, sheet_name"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            if not x_axes or not y_axes:
+                return Response({
+                    "success": False,
+                    "error": "Both X-axes and Y-axes must be specified"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Get project and validate access
+            try:
+                project = Projects.objects.get(id=project_id, user_id=user_id)
+            except Projects.DoesNotExist:
+                return Response({
+                    "success": False,
+                    "error": "Project not found or access denied"
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Validate file exists in project
+            if not self._validate_file_in_project(project, file_type, file_name):
+                return Response({
+                    "success": False,
+                    "error": f"File '{file_name}' not found in project"
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Load sheet data
+            df = self._load_sheet_data(project, file_type, file_name, sheet_name)
+            if df is None:
+                return Response({
+                    "success": False,
+                    "error": "Failed to load sheet data"
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            print(f"ChartBuilderAPI: Loaded dataframe with {len(df)} rows and {len(df.columns)} columns")
+            print(f"ChartBuilderAPI: DataFrame columns: {list(df.columns)}")
+            print(f"ChartBuilderAPI: DataFrame head:\n{df.head()}")
+            
+            # Validate columns exist in data
+            missing_columns = []
+            for col in x_axes + y_axes:
+                if col not in df.columns:
+                    missing_columns.append(col)
+            
+            if missing_columns:
+                return Response({
+                    "success": False,
+                    "error": f"Columns not found in data: {', '.join(missing_columns)}"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Apply filters
+            if filters:
+                df = self._apply_filters(df, filters)
+            
+            # Process datetime grouping for X-axis
+            for col in x_axes:
+                if self._is_date_like_column(df[col]) and date_grouping != "raw":
+                    df = self._apply_date_grouping(df, col, date_grouping)
+            
+            # Generate chart data
+            chart_data = self._generate_chart_data(
+                df, x_axes, y_axes, aggregation_method, y_axis_aggregations
+            )
+            
+            # Prepare response
+            response_data = {
+                "success": True,
+                "chart": {
+                    "type": chart_type,
+                    "data": chart_data["data"],
+                    "categories": chart_data["categories"],
+                    "series": chart_data["series"]
+                },
+                "x_axis": {
+                    "columns": x_axes,
+                    "label": " / ".join(x_axes)
+                },
+                "y_axis": {
+                    "columns": y_axes,
+                    "aggregation_method": aggregation_method,
+                    "individual_aggregations": y_axis_aggregations
+                },
+                "options": {
+                    "date_grouping": date_grouping,
+                    "filters_applied": filters,
+                    "total_data_points": len(chart_data["data"]),
+                    "generated_at": datetime.utcnow().isoformat() + "Z"
+                },
+                "meta": {
+                    "project_id": project_id,
+                    "file_type": file_type,
+                    "file_name": file_name,
+                    "sheet_name": sheet_name
+                }
+            }
+            
+            return Response(response_data, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            import traceback
+            return Response({
+                "success": False,
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def _apply_date_grouping(self, df, column, grouping):
+        """Apply date grouping to a column"""
+        try:
+            df[column] = pd.to_datetime(df[column], errors='coerce')
+            
+            if grouping == "day":
+                df[column] = df[column].dt.strftime("%Y-%m-%d")
+            elif grouping == "week":
+                df[column] = df[column].dt.to_period('W').astype(str)
+            elif grouping == "month":
+                df[column] = df[column].dt.strftime("%Y-%m")
+            elif grouping == "quarter":
+                df[column] = df[column].dt.to_period('Q').astype(str)
+            elif grouping == "year":
+                df[column] = df[column].dt.strftime("%Y")
+            
+            return df
+        except Exception as e:
+            print(f"Error applying date grouping: {e}")
+            return df
+    
+    def _is_date_like_column(self, series):
+        """Check if a column contains date-like data"""
+        try:
+            # Try to convert a sample to datetime
+            sample = series.dropna().head(10)
+            if len(sample) == 0:
+                return False
+            
+            pd.to_datetime(sample, errors='raise')
+            return True
+        except:
+            return False
+    
+    def _generate_chart_data(self, df, x_axes, y_axes, global_aggregation, y_axis_aggregations):
+        """Generate chart data with proper aggregation"""
+        try:
+            print(f"ChartBuilderAPI: _generate_chart_data called with:")
+            print(f"  - DataFrame shape: {df.shape}")
+            print(f"  - X-axes: {x_axes}")
+            print(f"  - Y-axes: {y_axes}")
+            print(f"  - Global aggregation: {global_aggregation}")
+            print(f"  - Y-axis aggregations: {y_axis_aggregations}")
+            
+            # Create combinations of X-axis values
+            from itertools import product
+            
+            unique_values = [df[col].dropna().unique().tolist() for col in x_axes]
+            print(f"ChartBuilderAPI: Unique values for X-axes: {unique_values}")
+            
+            x_combinations = [dict(zip(x_axes, vals)) for vals in product(*unique_values)]
+            print(f"ChartBuilderAPI: X-axis combinations: {x_combinations}")
+            
+            # Process each Y-axis column
+            series_data = []
+            chart_data = []
+            
+            for y_col in y_axes:
+                # Get aggregation method for this column
+                agg_method = y_axis_aggregations.get(y_col, global_aggregation)
+                print(f"ChartBuilderAPI: Processing Y-axis column '{y_col}' with aggregation '{agg_method}'")
+                
+                # Generate data points for this series
+                series_points = []
+                for combo in x_combinations:
+                    # Filter data for this combination
+                    temp_df = df.copy()
+                    for col, val in combo.items():
+                        temp_df = temp_df[temp_df[col] == val]
+                    
+                    print(f"ChartBuilderAPI: Filtered data for combo {combo}: {len(temp_df)} rows")
+                    
+                    # Apply aggregation
+                    if temp_df.empty:
+                        value = 0
+                        print(f"ChartBuilderAPI: Empty filtered data, setting value to 0")
+                    else:
+                        try:
+                            # Convert column to numeric first
+                            numeric_col = pd.to_numeric(temp_df[y_col], errors='coerce')
+                            
+                            if agg_method == "sum":
+                                value = numeric_col.sum()
+                            elif agg_method == "avg":
+                                value = numeric_col.mean()
+                            elif agg_method == "max":
+                                value = numeric_col.max()
+                            elif agg_method == "min":
+                                value = numeric_col.min()
+                            elif agg_method == "count":
+                                value = numeric_col.count()
+                            else:
+                                value = numeric_col.sum()
+                            
+                            print(f"ChartBuilderAPI: Aggregated value for combo {combo}: {value}")
+                            
+                            # Handle NaN values
+                            if pd.isna(value):
+                                value = 0
+                        except Exception as agg_error:
+                            print(f"ChartBuilderAPI: Error aggregating column {y_col}: {agg_error}")
+                            value = 0
+                    
+                    # Create data point
+                    x_key = " | ".join([str(combo[col]) for col in x_axes])
+                    data_point = {
+                        "x": x_key,
+                        "y": float(value) if value is not None else 0
+                    }
+                    
+                    series_points.append(data_point)
+                    
+                    # Add to chart data if this is the first series
+                    if y_col == y_axes[0]:
+                        chart_data.append({
+                            **combo,
+                            **{col: value for col in y_axes if col == y_col}
+                        })
+                
+                # Add series data
+                series_data.append({
+                    "name": y_col,
+                    "data": series_points,
+                    "aggregation": agg_method
+                })
+            
+            # Get categories from X-axis combinations
+            categories = [" | ".join([str(combo[col]) for col in x_axes]) for combo in x_combinations]
+            
+            print(f"ChartBuilderAPI: Final result:")
+            print(f"  - Chart data length: {len(chart_data)}")
+            print(f"  - Categories: {categories}")
+            print(f"  - Series data length: {len(series_data)}")
+            print(f"  - Series data: {series_data}")
+            
+            return {
+                "data": chart_data,
+                "categories": categories,
+                "series": series_data
+            }
+            
+        except Exception as e:
+            print(f"Error generating chart data: {e}")
+            return {
+                "data": [],
+                "categories": [],
+                "series": []
+            }
+    
+    def _validate_file_in_project(self, project, file_type, file_name):
+        """Validate that the file exists in the project's file lists"""
+        try:
+            # Extract just the filenames from the database paths
+            def extract_filename(file_path):
+                if '\\' in file_path or '/' in file_path:
+                    return os.path.basename(file_path)
+                return file_path
+            
+            last_name_kpi = [extract_filename(file) for file in project.kpi_file] if project.kpi_file else []
+            last_name_media = [extract_filename(file) for file in project.media_file] if project.media_file else []
+            last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
+
+            print(f"ChartBuilderAPI File validation - file_name: {file_name}, file_type: {file_type}")
+            print(f"Available KPI files: {last_name_kpi}")
+            print(f"Available Media files: {last_name_media}")
+            print(f"Available Concatenated files: {last_name_concatenated}")
+
+            # Check if file exists in the appropriate list
+            if file_type == 'kpi' and file_name in last_name_kpi:
+                return True
+            elif file_type == 'media' and file_name in last_name_media:
+                return True
+            elif file_type == 'concatenated':
+                # For concatenated files, check if any folder contains this CSV file
+                project_folder = f"user_{project.user.id}/project_{project.id}"
+                concatenated_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated")
+                if os.path.exists(concatenated_folder):
+                    for folder_name in os.listdir(concatenated_folder):
+                        folder_path = os.path.join(concatenated_folder, folder_name)
+                        if os.path.isdir(folder_path):
+                            if folder_name == file_name or file_name in last_name_concatenated:
+                                return True
+                return False
+            else:
+                return False
+
+        except Exception as e:
+            print(f"Error validating file in project: {e}")
+            return False
+    
+    def _load_sheet_data(self, project, file_type, file_name, sheet_name):
+        """Load data from the specified sheet"""
+        try:
+            # Construct file path similar to existing APIs
+            project_folder = f"user_{project.user.id}/project_{project.id}"
+            
+            print(f"ChartBuilderAPI: Loading data for project_folder: {project_folder}")
+            print(f"ChartBuilderAPI: Original params - file_type: {file_type}, file_name: {file_name}, sheet_name: {sheet_name}")
+            
+            # Clean file name
+            original_file_name = file_name
+            if file_type == 'concatenated':
+                if '/' in file_name:
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+            else:
+                if '/' in file_name or '\\' in file_name:
+                    file_name = file_name.replace('\\', '/').split('/')[-1]
+                else:
+                    file_name = os.path.basename(file_name)
+
+            print(f"ChartBuilderAPI: Cleaned file_name: {file_name}")
+
+            # Build base folder path
+            if file_type == 'kpi':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'kpi', file_name)
+            elif file_type == 'media':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'media', file_name)
+            elif file_type == 'concatenated':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'concatenated', file_name)
+            else:
+                print(f"ChartBuilderAPI: Unknown file_type: {file_type}")
+                return None
+
+            print(f"ChartBuilderAPI: Base folder: {base_folder}")
+
+            # Handle different file types
+            if os.path.isdir(base_folder):
+                # Directory containing CSV files
+                csv_files = [f for f in os.listdir(base_folder) if f.endswith('.csv')]
+                print(f"ChartBuilderAPI: Found CSV files in directory: {csv_files}")
+                
+                if not csv_files:
+                    print(f"ChartBuilderAPI: No CSV files found in directory: {base_folder}")
+                    return None
+                
+                # If sheet_name matches a file, use it; otherwise use the first file
+                target_file = None
+                if sheet_name and sheet_name.endswith('.csv'):
+                    if sheet_name in csv_files:
+                        target_file = sheet_name
+                elif sheet_name:
+                    # Try to match without extension
+                    for csv_file in csv_files:
+                        if csv_file.replace('.csv', '') == sheet_name:
+                            target_file = csv_file
+                            break
+                
+                if not target_file:
+                    target_file = csv_files[0]  # Use first CSV file as default
+                
+                file_path = os.path.join(base_folder, target_file)
+                print(f"ChartBuilderAPI: Using file: {target_file}")
+                
+            else:
+                # Single file
+                file_path = base_folder
+                print(f"ChartBuilderAPI: Using single file: {file_path}")
+
+            print(f"ChartBuilderAPI: Final file path: {file_path}")
+
+            # Check if file exists
+            if not os.path.exists(file_path):
+                print(f"ChartBuilderAPI: File does not exist: {file_path}")
+                return None
+
+            # Load the CSV file
+            try:
+                df = pd.read_csv(file_path)
+                print(f"ChartBuilderAPI: Successfully loaded data with {len(df)} rows and {len(df.columns)} columns")
+                print(f"ChartBuilderAPI: Columns: {list(df.columns)}")
+                return df
+            except Exception as e:
+                print(f"ChartBuilderAPI: Error reading CSV file: {e}")
+                return None
+
+        except Exception as e:
+            print(f"ChartBuilderAPI: Error in _load_sheet_data: {e}")
+            return None
+    
+    def _apply_filters(self, df, filters):
+        """Apply filters to the dataframe"""
+        try:
+            original_count = len(df)
+            print(f"ChartBuilderAPI: _apply_filters starting with {original_count} rows")
+            
+            for column, allowed_values in filters.items():
+                if column not in df.columns:
+                    print(f"ChartBuilderAPI: Filter column '{column}' not found in data")
+                    continue
+                
+                if not allowed_values or len(allowed_values) == 0:
+                    print(f"ChartBuilderAPI: No filter values for column '{column}', skipping")
+                    continue
+                
+                print(f"ChartBuilderAPI: Applying filter - Column: '{column}', Allowed values: {allowed_values}")
+                
+                # Show sample of actual values in the column
+                actual_values = df[column].unique()[:10].tolist()
+                print(f"ChartBuilderAPI: Sample actual values in '{column}': {actual_values}")
+                print(f"ChartBuilderAPI: Data types - Column dtype: {df[column].dtype}, Sample value types: {[type(v) for v in actual_values[:3]]}")
+                print(f"ChartBuilderAPI: Filter value types: {[type(v) for v in allowed_values[:3]]}")
+                
+                # Check if any filter values match actual values
+                matches = []
+                for filter_val in allowed_values:
+                    for actual_val in actual_values:
+                        if str(filter_val) == str(actual_val):
+                            matches.append((filter_val, actual_val))
+                print(f"ChartBuilderAPI: Direct matches found: {matches}")
+                
+                # Check for partial matches (string contains)
+                partial_matches = []
+                for filter_val in allowed_values:
+                    for actual_val in actual_values:
+                        if str(filter_val) in str(actual_val) or str(actual_val) in str(filter_val):
+                            partial_matches.append((filter_val, actual_val))
+                print(f"ChartBuilderAPI: Partial matches found: {partial_matches}")
+                
+                rows_before = len(df)
+                
+                # Try to convert filter values to match column data type
+                try:
+                    # Convert filter values to match the column's data type
+                    if df[column].dtype == 'object':
+                        # For object columns, try to match both string and converted values
+                        converted_filters = []
+                        for val in allowed_values:
+                            converted_filters.append(str(val))
+                            # Also try converting to numeric if possible
+                            try:
+                                if str(val).replace('.', '').replace('-', '').isdigit():
+                                    converted_filters.append(float(val))
+                            except:
+                                pass
+                        allowed_values = list(set(converted_filters))
+                        print(f"ChartBuilderAPI: Converted filter values: {allowed_values}")
+                    
+                    df = df[df[column].isin(allowed_values)]
+                except Exception as filter_error:
+                    print(f"ChartBuilderAPI: Error applying filter: {filter_error}")
+                    # Fallback to original filter values
+                    df = df[df[column].isin(allowed_values)]
+                
+                rows_after = len(df)
+                
+                print(f"ChartBuilderAPI: Filter '{column}' reduced rows from {rows_before} to {rows_after}")
+                
+                # Show sample of filtered data
+                if rows_after > 0:
+                    filtered_sample = df[column].unique()[:5].tolist()
+                    print(f"ChartBuilderAPI: Sample values after filtering '{column}': {filtered_sample}")
+                else:
+                    print(f"ChartBuilderAPI: WARNING - No data remaining after filtering '{column}'!")
+            
+            final_count = len(df)
+            print(f"ChartBuilderAPI: _apply_filters finished with {final_count} rows (started with {original_count})")
+            return df
+            
+        except Exception as e:
+            print(f"ChartBuilderAPI: Error applying filters: {e}")
+            return df
+
+class DebugDataAPI(APIView):
+    """
+    Debug API to check what data actually exists in a sheet
+    """
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            # Extract data from request
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            file_type = request.data.get('file_type')
+            file_name = request.data.get('file_name')
+            sheet_name = request.data.get('sheet_name')
+            column_name = request.data.get('column_name')  # Optional: specific column to debug
+
+            # Validate required fields
+            if not all([user_id, project_id, file_type, file_name, sheet_name]):
+                return Response({'error': 'Missing required fields'}, status=400)
+
+            # Get user and project
+            try:
+                from .models import User
+                user = User.objects.get(id=user_id)
+                project = Projects.objects.get(id=project_id)
+            except (User.DoesNotExist, Projects.DoesNotExist):
+                return Response({'error': 'User or project not found'}, status=404)
+
+            # Check access
+            if project.user != user:
+                return Response({'error': 'Access denied'}, status=403)
+
+            # Load data using the same method as PivotTableAPI
+            project_folder = f"user_{project.user.id}/project_{project.id}"
+            
+            # Clean file name
+            if file_type == 'concatenated':
+                if '/' in file_name:
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+            else:
+                if '/' in file_name or '\\' in file_name:
+                    file_name = file_name.replace('\\', '/').split('/')[-1]
+                else:
+                    file_name = os.path.basename(file_name)
+
+            # Build base folder path
+            if file_type == 'kpi':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'kpi', file_name)
+            elif file_type == 'media':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'media', file_name)
+            elif file_type == 'concatenated':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'concatenated', file_name)
+            else:
+                return Response({'error': 'Unsupported file type'}, status=400)
+
+            base_folder = os.path.normpath(base_folder)
+            if not os.path.exists(base_folder):
+                return Response({'error': f'Folder not found: {base_folder}'}, status=404)
+
+            # Find the CSV file
+            normalized_input = (sheet_name or '').replace('\\', '/').strip()
+            input_no_ext = os.path.splitext(normalized_input)[0]
+            
+            direct_candidate = os.path.normpath(os.path.join(base_folder, normalized_input))
+            direct_with_ext = direct_candidate if direct_candidate.lower().endswith('.csv') else direct_candidate + '.csv'
+            alt_candidate = os.path.normpath(os.path.join(base_folder, input_no_ext + '.csv'))
+
+            target_csv_path = None
+            for candidate in [direct_with_ext, alt_candidate, direct_candidate]:
+                if os.path.isfile(candidate):
+                    target_csv_path = candidate
+                    break
+
+            if not target_csv_path:
+                return Response({'error': f'CSV file not found. Tried: {[direct_with_ext, alt_candidate, direct_candidate]}'}, status=404)
+
+            # Read the CSV file
+            try:
+                df = pd.read_csv(target_csv_path, encoding='utf-8')
+            except UnicodeDecodeError:
+                try:
+                    df = pd.read_csv(target_csv_path, encoding='latin1')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(target_csv_path, encoding='cp1252')
+
+            # Clean the data
+            df = df.replace([np.inf, -np.inf], np.nan)
+
+            # Prepare debug info
+            debug_info = {
+                'file_path': target_csv_path,
+                'total_rows': len(df),
+                'total_columns': len(df.columns),
+                'columns': list(df.columns),
+                'column_dtypes': {col: str(df[col].dtype) for col in df.columns},
+                'sample_data': make_json_safe(df.head(5).to_dict('records'))
+            }
+
+            # If specific column requested, add detailed info
+            if column_name and column_name in df.columns:
+                col_data = df[column_name]
+                debug_info['column_debug'] = {
+                    'column_name': column_name,
+                    'dtype': str(col_data.dtype),
+                    'unique_values': make_json_safe(col_data.unique()[:20].tolist()),
+                    'null_count': int(col_data.isnull().sum()),
+                    'sample_values': make_json_safe(col_data.head(10).tolist()),
+                    'value_counts': make_json_safe(col_data.value_counts().head(10).to_dict())
+                }
+
+            return Response({
+                'success': True,
+                'debug_info': debug_info
+            }, status=200)
+
+        except Exception as e:
+            return Response({'error': f'Debug API error: {str(e)}'}, status=500)
+
+    def _load_sheet_data(self, project, file_type, file_name, sheet_name):
+        """Load data from the specified sheet - reuse logic from PivotTableAPI"""
+        try:
+            # Construct file path similar to existing APIs
+            project_folder = f"user_{project.user.id}/project_{project.id}"
+            
+            print(f"ColumnInfoAPI: Loading data for project_folder: {project_folder}")
+            print(f"ColumnInfoAPI: Original params - file_type: {file_type}, file_name: {file_name}, sheet_name: {sheet_name}")
+            
+            # Clean file name
+            original_file_name = file_name
+            if file_type == 'concatenated':
+                if '/' in file_name:
+                    file_name = file_name.split('/')[0]
+                else:
+                    file_name = os.path.basename(file_name)
+            else:
+                if '/' in file_name or '\\' in file_name:
+                    file_name = file_name.replace('\\', '/').split('/')[-1]
+                else:
+                    file_name = os.path.basename(file_name)
+
+            print(f"ColumnInfoAPI: Cleaned file_name: {file_name}")
+
+            # Build base folder path
+            if file_type == 'kpi':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'kpi', file_name)
+            elif file_type == 'media':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'media', file_name)
+            elif file_type == 'concatenated':
+                base_folder = os.path.join(settings.MEDIA_ROOT, project_folder, 'concatenated', file_name)
+            else:
+                print(f"ColumnInfoAPI: Unsupported file_type: {file_type}")
+                return None
+
+            base_folder = os.path.normpath(base_folder)
+            print(f"ColumnInfoAPI: Base folder path: {base_folder}")
+            print(f"ColumnInfoAPI: Base folder exists: {os.path.exists(base_folder)}")
+            
+            if not os.path.exists(base_folder):
+                # List contents of parent directory for debugging
+                parent_dir = os.path.dirname(base_folder)
+                if os.path.exists(parent_dir):
+                    print(f"ColumnInfoAPI: Parent directory contents: {os.listdir(parent_dir)}")
+                else:
+                    print(f"ColumnInfoAPI: Parent directory does not exist: {parent_dir}")
+                return None
+
+            # List contents of base folder for debugging
+            try:
+                folder_contents = os.listdir(base_folder)
+                print(f"ColumnInfoAPI: Base folder contents: {folder_contents}")
+            except Exception as e:
+                print(f"ColumnInfoAPI: Error listing base folder contents: {e}")
+
+            # Find the CSV file
+            normalized_input = (sheet_name or '').replace('\\', '/').strip()
+            input_no_ext = os.path.splitext(normalized_input)[0]
+
+            print(f"ColumnInfoAPI: Looking for sheet: {normalized_input}")
+            print(f"ColumnInfoAPI: Sheet name without extension: {input_no_ext}")
+
+            # Try different path combinations
+            direct_candidate = os.path.normpath(os.path.join(base_folder, normalized_input))
+            direct_with_ext = direct_candidate if direct_candidate.lower().endswith('.csv') else direct_candidate + '.csv'
+            alt_candidate = os.path.normpath(os.path.join(base_folder, input_no_ext + '.csv'))
+
+            candidates = [direct_with_ext, alt_candidate, direct_candidate]
+            print(f"ColumnInfoAPI: Trying candidates: {candidates}")
+
+            target_csv_path = None
+            for i, candidate in enumerate(candidates):
+                print(f"ColumnInfoAPI: Checking candidate {i+1}: {candidate} - exists: {os.path.isfile(candidate)}")
+                if os.path.isfile(candidate):
+                    target_csv_path = candidate
+                    break
+
+            if not target_csv_path:
+                print(f"ColumnInfoAPI: No valid CSV file found among candidates")
+                return None
+
+            print(f"ColumnInfoAPI: Found CSV file: {target_csv_path}")
+
+            # Read the CSV file
+            try:
+                df = pd.read_csv(target_csv_path, encoding='utf-8')
+                print(f"ColumnInfoAPI: Successfully loaded CSV with {len(df)} rows and {len(df.columns)} columns")
+            except UnicodeDecodeError:
+                try:
+                    df = pd.read_csv(target_csv_path, encoding='latin1')
+                    print(f"ColumnInfoAPI: Loaded CSV with latin1 encoding - {len(df)} rows and {len(df.columns)} columns")
+                except UnicodeDecodeError:
+                    df = pd.read_csv(target_csv_path, encoding='cp1252')
+                    print(f"ColumnInfoAPI: Loaded CSV with cp1252 encoding - {len(df)} rows and {len(df.columns)} columns")
+
+            # Clean the data
+            df = df.replace([np.inf, -np.inf], np.nan)
+            
+            return df
+
+        except Exception as e:
+            print(f"ColumnInfoAPI: Error loading sheet data: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _analyze_columns(self, df):
+        """Analyze each column to determine data type and unique values"""
+        try:
+            column_info = {}
+            
+            print(f"ColumnInfoAPI: Analyzing {len(df.columns)} columns")
+            print(f"ColumnInfoAPI: Column names: {list(df.columns)}")
+            
+            for column in df.columns:
+                try:
+                    print(f"ColumnInfoAPI: Processing column '{column}'")
+                    column_data = df[column]
+                    
+                    # Basic statistics
+                    null_count = column_data.isnull().sum()
+                    total_count = len(column_data)
+                    unique_count = column_data.nunique()
+                    
+                    print(f"ColumnInfoAPI: Column '{column}' - null_count: {null_count}, total: {total_count}, unique: {unique_count}")
+                    
+                    # Determine data type
+                    data_type = self._determine_data_type(column_data)
+                    print(f"ColumnInfoAPI: Column '{column}' data_type: {data_type}")
+                    
+                    # Get unique values (except for numerical columns)
+                    unique_values = []
+                    if data_type != 'numerical':
+                        # For non-numerical columns, get ALL unique values (no limit)
+                        try:
+                            unique_vals = column_data.dropna().unique()
+                            # Convert to list and make JSON safe
+                            unique_list = []
+                            for val in unique_vals:
+                                safe_val = make_json_safe(val)
+                                if safe_val is not None:  # Only add non-null values
+                                    unique_list.append(safe_val)
+                            unique_values = unique_list
+                            print(f"ColumnInfoAPI: Column '{column}' unique_values count: {len(unique_values)}")
+                        except Exception as unique_error:
+                            print(f"ColumnInfoAPI: Error getting unique values for '{column}': {unique_error}")
+                            unique_values = []
+                    elif data_type == 'numerical':
+                        # For numerical columns, provide both statistical summary and unique values
+                        try:
+                            numeric_data = pd.to_numeric(column_data, errors='coerce')
+                            # Clean the numeric data to remove inf/nan values
+                            clean_numeric = numeric_data.replace([np.inf, -np.inf], np.nan).dropna()
+                            
+                            if len(clean_numeric) > 0:
+                                stats = {
+                                    'min': make_json_safe(clean_numeric.min()),
+                                    'max': make_json_safe(clean_numeric.max()),
+                                    'mean': make_json_safe(clean_numeric.mean()),
+                                    'median': make_json_safe(clean_numeric.median()),
+                                    'std': make_json_safe(clean_numeric.std())
+                                }
+                                
+                                # Get unique values for numerical columns
+                                unique_vals = clean_numeric.unique()
+                                unique_list = []
+                                for val in unique_vals:
+                                    safe_val = make_json_safe(val)
+                                    if safe_val is not None:  # Only add non-null values
+                                        unique_list.append(safe_val)
+                                
+                                # Combine stats and unique values
+                                unique_values = {
+                                    'statistics': stats,
+                                    'unique_values': unique_list
+                                }
+                            else:
+                                stats = {
+                                    'min': None,
+                                    'max': None,
+                                    'mean': None,
+                                    'median': None,
+                                    'std': None
+                                }
+                                unique_values = {
+                                    'statistics': stats,
+                                    'unique_values': []
+                                }
+                            print(f"ColumnInfoAPI: Column '{column}' numerical stats: {stats}, unique count: {len(unique_values.get('unique_values', []))}")
+                        except Exception as stats_error:
+                            print(f"ColumnInfoAPI: Error calculating stats for '{column}': {stats_error}")
+                            unique_values = {
+                                'statistics': {
+                                    'min': None,
+                                    'max': None,
+                                    'mean': None,
+                                    'median': None,
+                                    'std': None
+                                },
+                                'unique_values': []
+                            }
+                    
+                    # Ensure all values are JSON-safe
+                    column_info[column] = {
+                        'data_type': data_type,
+                        'null_count': make_json_safe(int(null_count)),
+                        'non_null_count': make_json_safe(int(total_count - null_count)),
+                        'unique_count': make_json_safe(int(unique_count)),
+                        'unique_values': unique_values,
+                        'null_percentage': make_json_safe(round((null_count / total_count) * 100, 2) if total_count > 0 else 0)
+                    }
+                    
+                    print(f"ColumnInfoAPI: Successfully processed column '{column}'")
+                    
+                except Exception as col_error:
+                    print(f"ColumnInfoAPI: Error processing column '{column}': {col_error}")
+                    # Continue with other columns
+                    continue
+            
+            print(f"ColumnInfoAPI: Finished analyzing columns, returning {len(column_info)} column infos")
+            return column_info
+            
+        except Exception as e:
+            print(f"ColumnInfoAPI: Error analyzing columns: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
+    def _determine_data_type(self, series):
+        """Determine the data type of a pandas series"""
+        try:
+            # Remove null values for analysis
+            non_null_series = series.dropna()
+            
+            if len(non_null_series) == 0:
+                return 'unknown'
+            
+            # Check if it's numerical
+            try:
+                numeric_series = pd.to_numeric(non_null_series, errors='coerce')
+                if not numeric_series.isnull().all():
+                    return 'numerical'
+            except:
+                pass
+            
+            # Check if it's datetime
+            try:
+                datetime_series = pd.to_datetime(non_null_series, errors='coerce')
+                if not datetime_series.isnull().all():
+                    return 'datetime'
+            except:
+                pass
+            
+            # Check if it's boolean
+            unique_values = set(str(val).lower() for val in non_null_series.unique())
+            boolean_values = {'true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n'}
+            if unique_values.issubset(boolean_values) and len(unique_values) <= 2:
+                return 'boolean'
+            
+            # Default to categorical/text
+            return 'categorical'
+            
+        except Exception as e:
+            print(f"Error determining data type: {e}")
+            return 'unknown'
+
+    def _validate_file_in_project(self, project, file_type, file_name):
+        """Validate that the file exists in the project's file lists"""
+        try:
+            # Extract just the filenames from the database paths
+            def extract_filename(file_path):
+                if '\\' in file_path or '/' in file_path:
+                    return os.path.basename(file_path)
+                return file_path
+            
+            last_name_kpi = [extract_filename(file) for file in project.kpi_file] if project.kpi_file else []
+            last_name_media = [extract_filename(file) for file in project.media_file] if project.media_file else []
+            last_name_concatenated = project.concatenated_file if hasattr(project, 'concatenated_file') and isinstance(project.concatenated_file, list) else []
+
+            print(f"File validation - file_name: {file_name}, file_type: {file_type}")
+            print(f"Available KPI files: {last_name_kpi}")
+            print(f"Available Media files: {last_name_media}")
+            print(f"Available Concatenated files: {last_name_concatenated}")
+
+            # Check if file exists in the appropriate list
+            if file_type == 'kpi' and file_name in last_name_kpi:
+                return {'valid': True}
+            elif file_type == 'media' and file_name in last_name_media:
+                return {'valid': True}
+            elif file_type == 'concatenated':
+                # For concatenated files, check if any folder contains this CSV file
+                project_folder = f"user_{project.user.id}/project_{project.id}"
+                concatenated_folder = os.path.join(settings.MEDIA_ROOT, project_folder, "concatenated")
+                if os.path.exists(concatenated_folder):
+                    for folder_name in os.listdir(concatenated_folder):
+                        folder_path = os.path.join(concatenated_folder, folder_name)
+                        if os.path.isdir(folder_path):
+                            if folder_name == file_name or file_name in last_name_concatenated:
+                                return {'valid': True}
+                return {'valid': False, 'error': f'Concatenated file "{file_name}" not found in project'}
+            else:
+                return {
+                    'valid': False, 
+                    'error': f'File "{file_name}" of type "{file_type}" not found in project. Available files: KPI={last_name_kpi}, Media={last_name_media}, Concatenated={last_name_concatenated}'
+                }
+
+        except Exception as e:
+            print(f"Error validating file in project: {e}")
+            return {'valid': False, 'error': f'File validation failed: {str(e)}'}
 
             
