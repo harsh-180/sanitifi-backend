@@ -26,19 +26,19 @@ DATABRICKS_WORKSPACE_URL = os.getenv("DATABRICKS_WORKSPACE_URL")
 DATABRICKS_ACCESS_TOKEN = os.getenv("DATABRICKS_ACCESS_TOKEN")
 
 # Environment Setup (same as original spark_utils.py)
-JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
-HADOOP_HOME = r"C:\hadoop"
+JAVA_HOME = os.getenv("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk")
+HADOOP_HOME = os.getenv("HADOOP_HOME", "/opt/hadoop")
 PYSPARK_PYTHON = sys.executable
 
 # Set environment variables
 os.environ["JAVA_HOME"] = JAVA_HOME
 os.environ["HADOOP_HOME"] = HADOOP_HOME
-os.environ["PATH"] += f";{os.path.join(HADOOP_HOME, 'bin')}"
+os.environ["PATH"] += f":{os.path.join(HADOOP_HOME, 'bin')}"
 os.environ["PYSPARK_PYTHON"] = PYSPARK_PYTHON
 os.environ["SPARK_LOCAL_IP"] = "localhost"
 
 # Create local Spark temp dir if it doesn't exist
-SPARK_LOCAL_DIRS = "C:/Users/harsh/Documents/skewb/dashboard/Dashboard-backend/spark-temp"
+SPARK_LOCAL_DIRS = os.getenv("SPARK_LOCAL_DIRS", "./spark-temp")
 os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
 os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
 
