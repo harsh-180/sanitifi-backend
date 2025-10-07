@@ -165,12 +165,17 @@ class SavedPivotPlot(models.Model):
     plot_config = models.JSONField()  # Stores plot configuration
     chart_data = models.JSONField()  # Stores chart data
     chart_options = models.JSONField()  # Stores chart options
+    # Optional user insight/notes about the chart
+    insight = models.TextField(blank=True, null=True)
     active_filters = models.JSONField(default=dict, blank=True)  # Stores active filters separately
+    # New field to control ordering of plots within a pivot
+    order_id = models.IntegerField(default=0, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['-updated_at']
+        # Order by order_id ascending first, then updated_at desc as fallback
+        ordering = ['order_id', '-updated_at']
         unique_together = ('user', 'project', 'pivot', 'plot_name')
 
     def __str__(self):

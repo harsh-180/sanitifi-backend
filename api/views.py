@@ -39,6 +39,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from api.models import User,Projects, SavedScript, SavedPlot, SavedPivot, SavedPivotPlot, ProjectShare
+from django.db.models import Max
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
 
@@ -2087,6 +2088,29 @@ class UserProjectsView(APIView):
                                 'path': f"user_{user.id}/project_{project.id}/concatenated/{timestamp_folder}/{file}",
                                 'name': f"{timestamp_folder}/{file}"
                             })
+            
+            # Process pivot-generated CSV files and include them in their respective file types
+            pivot_csv_files = []
+            for file_type in ['media', 'kpi', 'concatenated']:
+                file_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user.id}/project_{project.id}/{file_type}")
+                if os.path.exists(file_folder):
+                    for file_name in os.listdir(file_folder):
+                        file_path = os.path.join(file_folder, file_name)
+                        if os.path.isdir(file_path):
+                            # Look for pivot CSV files in each file folder
+                            for csv_file in os.listdir(file_path):
+                                if csv_file.endswith('_pivot.csv'):
+                                    pivot_csv_files.append({
+                                        'id': len(pivot_csv_files) + 1,
+                                        'path': f"user_{user.id}/project_{project.id}/{file_type}/{file_name}/{csv_file}",
+                                        'name': f"{file_name}/{csv_file}",
+                                        'file_type': file_type,
+                                        'source_file': file_name,
+                                        'is_pivot_csv': True
+                                    })
+            
+            # Note: Pivot CSV files are now included as sheets within their source files
+            # in the ProjectDetails API, so we don't need to add them here to avoid duplication
             
             project_data.append({
                 'id': project.id,
@@ -5287,7 +5311,8 @@ class ProjectDetails(APIView):
                 "files": {
                     "media": [],
                     "kpi": [],
-                    "concatenated": []
+                    "concatenated": [],
+                    "pivot_csv": []
                 }
             }
             
@@ -5389,6 +5414,55 @@ class ProjectDetails(APIView):
                             
                             project_details["files"][file_type].append(file_info)
 
+            # Process pivot-generated CSV files and include them in their respective file types
+            pivot_csv_files = []
+            for file_type in ['media', 'kpi', 'concatenated']:
+                file_folder = os.path.join(project_folder, file_type)
+                if os.path.exists(file_folder):
+                    for file_name in os.listdir(file_folder):
+                        file_path = os.path.join(file_folder, file_name)
+                        if os.path.isdir(file_path):
+                            # Look for pivot CSV files in each file folder
+                            for csv_file in os.listdir(file_path):
+                                if csv_file.endswith('_pivot.csv'):
+                                    csv_path = os.path.join(file_path, csv_file)
+                                    pivot_csv_files.append({
+                                        'name': csv_file,
+                                        'source_file': file_name,
+                                        'file_type': file_type,
+                                        'path': csv_path,
+                                        'size': os.path.getsize(csv_path),
+                                        'last_modified': os.path.getmtime(csv_path),
+                                        'is_pivot_csv': True
+                                    })
+            
+            # Add pivot CSV files to their respective file types
+            for pivot_file in pivot_csv_files:
+                file_type = pivot_file['file_type']
+                # Find the corresponding source file in the file list
+                for file_info in project_details["files"][file_type]:
+                    if file_info["name"] == pivot_file['source_file']:
+                        # Add pivot CSV as a sheet in the source file
+                        sheet_info = {
+                            "name": pivot_file['name'],
+                            "size": pivot_file['size'],
+                            "last_modified": pivot_file['last_modified'],
+                            "is_pivot_csv": True
+                        }
+                        
+                        # Read pivot CSV data
+                        try:
+                            df = pd.read_csv(pivot_file['path'], dtype=str)
+                            df = df.replace([np.nan, np.inf, -np.inf], None)
+                            sheet_info["columns"] = df.columns.tolist()
+                            sheet_info["data"] = make_json_safe(df.values.tolist())
+                        except Exception as e:
+                            print(f"Error reading pivot CSV {pivot_file['name']}: {str(e)}")
+                            sheet_info["error"] = "Could not read pivot CSV data"
+                        
+                        file_info["sheets"].append(sheet_info)
+                        break
+
             return Response(project_details, status=200)
 
         except Exception as e:
@@ -5409,6 +5483,7 @@ class SaveReportPivot(APIView):
             sheet_name = request.data.get('sheet_name')
             pivot_config = request.data.get('pivot_config')
             pivot_data = request.data.get('pivot_data')
+            save_option = request.data.get('save_option', 'pivot')  # 'pivot', 'csv', 'both'
 
             # Validate required fields
             if not all([user_id, project_id, pivot_name, file_type, file_name, sheet_name, pivot_config, pivot_data]):
@@ -5429,6 +5504,12 @@ class SaveReportPivot(APIView):
             if file_type not in ['kpi', 'media', 'concatenated']:
                 return Response({
                     'error': 'Invalid file_type. Must be either "kpi", "media", or "concatenated"'
+                }, status=400)
+
+            # Validate save_option
+            if save_option not in ['pivot', 'csv', 'both']:
+                return Response({
+                    'error': 'Invalid save_option. Must be either "pivot", "csv", or "both"'
                 }, status=400)
 
             # Check if user has access to this project/file
@@ -5456,36 +5537,112 @@ class SaveReportPivot(APIView):
             except Projects.DoesNotExist:
                 return Response({'error': 'Project not found'}, status=404)
 
-            # Create or update saved pivot
-            saved_pivot, created = SavedPivot.objects.update_or_create(
-                user=user,
-                project=project,
-                pivot_name=pivot_name,
-                defaults={
-                    'file_type': file_type,
-                    'file_name': file_name,
-                    'sheet_name': sheet_name,
-                    'pivot_config': pivot_config,
-                    'pivot_data': pivot_data
-                }
-            )
+            saved_pivot = None
+            csv_file_path = None
+            csv_saved = False
+
+            # Save as pivot table if requested
+            if save_option in ['pivot', 'both']:
+                saved_pivot, created = SavedPivot.objects.update_or_create(
+                    user=user,
+                    project=project,
+                    pivot_name=pivot_name,
+                    defaults={
+                        'file_type': file_type,
+                        'file_name': file_name,
+                        'sheet_name': sheet_name,
+                        'pivot_config': pivot_config,
+                        'pivot_data': pivot_data
+                    }
+                )
+
+            # Save as CSV file if requested
+            if save_option in ['csv', 'both']:
+                csv_file_path = self.save_pivot_as_csv(
+                    user, project, pivot_name, pivot_data, file_type, file_name, sheet_name
+                )
+                csv_saved = csv_file_path is not None
 
             ip = request.META.get('REMOTE_ADDR')
-            log_user_action(user, "save_pivot", details=f"Pivot table saved successfully", ip_address=ip)
+            action_details = []
+            if save_option in ['pivot', 'both']:
+                action_details.append("pivot table saved")
+            if csv_saved:
+                action_details.append("CSV file created")
+            
+            log_user_action(user, "save_pivot", details=f"{', '.join(action_details)}", ip_address=ip)
 
-            return Response({
+            response_data = {
                 'message': 'Pivot table saved successfully',
-                'pivot_id': saved_pivot.id,
-                'created': created,
-                'updated_at': saved_pivot.updated_at,
                 'access_info': {
                     'permission_level': permission_level,
                     'is_owner': share_object is None
                 }
-            }, status=200)
+            }
+
+            if saved_pivot:
+                response_data.update({
+                    'pivot_id': saved_pivot.id,
+                    'created': created,
+                    'updated_at': saved_pivot.updated_at
+                })
+
+            if csv_saved:
+                response_data.update({
+                    'csv_file_path': csv_file_path,
+                    'csv_saved': True
+                })
+
+            return Response(response_data, status=200)
 
         except Exception as e:
             return Response({'error': str(e)}, status=500)
+
+    def save_pivot_as_csv(self, user, project, pivot_name, pivot_data, file_type, file_name, sheet_name):
+        """
+        Save pivot data as CSV file in the source project's media directory
+        """
+        try:
+            import pandas as pd
+            import os
+            from django.conf import settings
+            
+            # Create project folder path
+            project_folder = f"user_{user.id}/project_{project.id}"
+            
+            # Determine the target directory based on file_type
+            if file_type == 'concatenated':
+                target_dir = os.path.join(settings.MEDIA_ROOT, project_folder, 'concatenated', file_name)
+            else:
+                target_dir = os.path.join(settings.MEDIA_ROOT, project_folder, file_type, file_name)
+            
+            # Ensure the directory exists
+            os.makedirs(target_dir, exist_ok=True)
+            
+            # Create a safe filename from pivot_name
+            safe_filename = "".join(c for c in pivot_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            safe_filename = safe_filename.replace(' ', '_')
+            csv_filename = f"{safe_filename}_pivot.csv"
+            
+            # Full path to the CSV file
+            csv_file_path = os.path.join(target_dir, csv_filename)
+            
+            # Convert pivot_data to DataFrame
+            if isinstance(pivot_data, list) and len(pivot_data) > 0:
+                df = pd.DataFrame(pivot_data)
+                
+                # Save as CSV
+                df.to_csv(csv_file_path, index=False, encoding='utf-8')
+                
+                print(f"CSV file saved to: {csv_file_path}")
+                return csv_file_path
+            else:
+                print("No pivot data to save as CSV")
+                return None
+                
+        except Exception as e:
+            print(f"Error saving pivot as CSV: {str(e)}")
+            return None
 
 
 class FetchReportPivot(APIView):
@@ -5647,6 +5804,8 @@ class SavePivotPlot(APIView):
             plot_config = request.data.get('plot_config')
             chart_data = request.data.get('chart_data')
             chart_options = request.data.get('chart_options', {})
+            order_id = request.data.get('order_id')
+            insight = request.data.get('insight', None)
 
             # Validate required fields
             if not all([user_id, project_id, pivot_id, plot_config, chart_data]):
@@ -5679,7 +5838,12 @@ class SavePivotPlot(APIView):
             # Extract activeFilters from plot_config if it exists
             active_filters = plot_config.get('activeFilters', {}) if plot_config else {}
 
-            # Create or update the plot
+            # If order_id not provided, place at the end (max + 1)
+            if order_id is None:
+                max_order = SavedPivotPlot.objects.filter(project=project, pivot=pivot).aggregate(models.Max('order_id')).get('order_id__max')
+                order_id = (max_order + 1) if (isinstance(max_order, int)) else 0
+
+            # Create or update the plot by name
             saved_plot, created = SavedPivotPlot.objects.update_or_create(
                 user=user,
                 project=project,
@@ -5689,7 +5853,9 @@ class SavePivotPlot(APIView):
                     'plot_config': plot_config,
                     'chart_data': chart_data,
                     'chart_options': chart_options,
-                    'active_filters': active_filters
+                    'active_filters': active_filters,
+                    'order_id': order_id,
+                    'insight': insight,
                 }
             )
 
@@ -5700,6 +5866,7 @@ class SavePivotPlot(APIView):
                 'message': 'Plot saved successfully',
                 'plot_id': saved_plot.id,
                 'plot_name': saved_plot.plot_name,
+                'order_id': saved_plot.order_id,
                 'created_at': saved_plot.created_at,
                 'updated_at': saved_plot.updated_at,
                 'is_new': created
@@ -5781,6 +5948,60 @@ class DeletePivotPlot(APIView):
                 'error': f'Error deleting plot(s): {str(e)}'
             }, status=500)
 
+class UpdatePivotPlot(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            pivot_id = request.data.get('pivot_id')
+            plot_id = request.data.get('plot_id')
+            insight = request.data.get('insight', None)
+
+            if not all([user_id, project_id, pivot_id, plot_id]):
+                return Response({'error': 'Missing required fields'}, status=400)
+
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            has_access, share_object, permission_level = check_project_access(user_id, project_id)
+            if not has_access or permission_level == 'view':
+                return Response({'error': 'Access denied'}, status=403)
+
+            try:
+                if project.user.id == int(user_id):
+                    pivot = SavedPivot.objects.get(id=pivot_id, project=project, user=user)
+                else:
+                    pivot = SavedPivot.objects.get(id=pivot_id, project=project)
+            except SavedPivot.DoesNotExist:
+                return Response({'error': 'Pivot table not found'}, status=404)
+
+            try:
+                plot = SavedPivotPlot.objects.get(id=plot_id, project=project, pivot=pivot)
+            except SavedPivotPlot.DoesNotExist:
+                return Response({'error': 'Plot not found'}, status=404)
+
+            # Update fields
+            fields_to_update = []
+            if 'insight' in request.data:
+                plot.insight = insight
+                fields_to_update.append('insight')
+
+            if fields_to_update:
+                plot.save(update_fields=fields_to_update + ['updated_at'])
+
+            return Response({'message': 'Plot updated successfully', 'plot_id': plot.id, 'insight': plot.insight}, status=200)
+        except Exception as e:
+            return Response({'error': f'Error updating plot: {str(e)}'}, status=500)
+
 class FetchPivotPlots(APIView):
     parser_classes = [JSONParser]
 
@@ -5832,20 +6053,18 @@ class FetchPivotPlots(APIView):
             except SavedPivot.DoesNotExist:
                 return Response({'error': 'Pivot table not found'}, status=404)
 
-            # Fetch all plots for this pivot
-            # For project owner, get plots by user and project
+            # Fetch all plots for this pivot ordered by order_id then updated_at
             if project.user.id == int(user_id):
                 plots = SavedPivotPlot.objects.filter(
                     user=user,
                     project=project,
                     pivot=pivot
-                ).order_by('-updated_at')
+                ).order_by('order_id', '-updated_at')
             else:
-                # For shared access, get plots by project only (plots belong to project owner)
                 plots = SavedPivotPlot.objects.filter(
                     project=project,
                     pivot=pivot
-                ).order_by('-updated_at')
+                ).order_by('order_id', '-updated_at')
 
             # Prepare the response data
             plots_data = []
@@ -5853,10 +6072,12 @@ class FetchPivotPlots(APIView):
                 plot_data = {
                     'plot_id': plot.id,
                     'plot_name': plot.plot_name,
+                        'order_id': plot.order_id,
                     'plot_config': plot.plot_config,
                     'chart_data': plot.chart_data,
                     'chart_options': plot.chart_options,
                     'active_filters': plot.active_filters,
+                    'insight': getattr(plot, 'insight', None),
                     'created_at': plot.created_at,
                     'updated_at': plot.updated_at,
                     'pivot_info': {
@@ -5881,6 +6102,65 @@ class FetchPivotPlots(APIView):
                 'error': f'Error fetching plots: {str(e)}'
             }, status=500)
 
+
+class UpdatePivotPlotOrder(APIView):
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        try:
+            user_id = request.data.get('user_id')
+            project_id = request.data.get('project_id')
+            pivot_id = request.data.get('pivot_id')
+            order = request.data.get('order')  # expects list of {plot_id, order_id}
+
+            if not all([user_id, project_id, pivot_id, isinstance(order, list)]):
+                return Response({'error': 'Missing required fields'}, status=400)
+
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User not found'}, status=404)
+
+            try:
+                project = Projects.objects.get(id=project_id)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found'}, status=404)
+
+            # Access check (owner or shared)
+            has_access, share_object, permission_level = check_project_access(user_id, project_id)
+            if not has_access:
+                return Response({'error': 'Access denied'}, status=403)
+
+            try:
+                if project.user.id == int(user_id):
+                    pivot = SavedPivot.objects.get(id=pivot_id, project=project, user=user)
+                else:
+                    pivot = SavedPivot.objects.get(id=pivot_id, project=project)
+            except SavedPivot.DoesNotExist:
+                return Response({'error': 'Pivot table not found'}, status=404)
+
+            # Build a map for quick lookup
+            order_map = {}
+            for item in order:
+                pid = item.get('plot_id')
+                oid = item.get('order_id')
+                if pid is None or oid is None:
+                    return Response({'error': 'Each order item must have plot_id and order_id'}, status=400)
+                order_map[int(pid)] = int(oid)
+
+            # Update in bulk
+            plots_qs = SavedPivotPlot.objects.filter(project=project, pivot=pivot, id__in=list(order_map.keys()))
+            updated = 0
+            for plot in plots_qs:
+                new_order = order_map.get(plot.id)
+                if new_order is not None and plot.order_id != new_order:
+                    plot.order_id = new_order
+                    plot.save(update_fields=['order_id', 'updated_at'])
+                    updated += 1
+
+            return Response({'message': 'Order updated', 'updated': updated}, status=200)
+        except Exception as e:
+            return Response({'error': f'Error updating order: {str(e)}'}, status=500)
 
 class ConcatenateProjectSheets(APIView):
     """
