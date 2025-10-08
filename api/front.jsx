@@ -320,7 +320,7 @@ const CustomScriptModal = ({ isOpen, onClose, sheetData, setSheetData }) => {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch(" http://localhost:8000/api//custom-script/", {
+      const response = await fetch(" https://sanitifi.skewb.ai:8000/api//custom-script/", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -480,7 +480,7 @@ const CustomScriptModal = ({ isOpen, onClose, sheetData, setSheetData }) => {
 
     try {
       console.log('Fetching scripts for user:', userId); // Debug log
-      const response = await fetch(" http://localhost:8000/api//fetch_scripts/", {
+      const response = await fetch(" https://sanitifi.skewb.ai:8000/api//fetch_scripts/", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

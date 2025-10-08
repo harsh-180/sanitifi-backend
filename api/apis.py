@@ -2291,6 +2291,8 @@ class PivotTableAPI(APIView):
             layout_options = request.data.get('layout_options', {})
             grand_totals = layout_options.get('grand_totals', False)
             row_totals = layout_options.get('row_totals', False)
+            column_totals = layout_options.get('column_totals', False)
+            show_values_as = layout_options.get('show_values_as', 'none')
             show_empty_items = layout_options.get('show_empty_items', False)
             compact_layout = layout_options.get('compact_layout', False)
 
@@ -2420,6 +2422,8 @@ class PivotTableAPI(APIView):
             pivot_result = self._create_pivot_table(df, rows, columns, values, aggregation, {
                 'grand_totals': grand_totals,
                 'row_totals': row_totals,
+                'column_totals': column_totals,
+                'show_values_as': show_values_as,
                 'show_empty_items': show_empty_items,
                 'compact_layout': compact_layout
             }, value_aggregations)
@@ -2614,6 +2618,8 @@ class PivotTableAPI(APIView):
                     'layout_options': {
                         'grand_totals': grand_totals,
                         'row_totals': row_totals,
+                        'column_totals': column_totals,
+                        'show_values_as': show_values_as,
                         'show_empty_items': show_empty_items,
                         'compact_layout': compact_layout
                     }
@@ -2809,10 +2815,12 @@ class PivotTableAPI(APIView):
                 layout_options = {}
             grand_totals = layout_options.get('grand_totals', False)
             row_totals = layout_options.get('row_totals', False)
+            column_totals = layout_options.get('column_totals', False)
+            show_values_as = layout_options.get('show_values_as', 'none')
             show_empty_items = layout_options.get('show_empty_items', False)
             compact_layout = layout_options.get('compact_layout', False)
             
-            print(f"PivotTableAPI: Layout options - Grand Totals: {grand_totals}, Row Totals: {row_totals}, Show Empty Items: {show_empty_items}, Compact Layout: {compact_layout}")
+            print(f"PivotTableAPI: Layout options - Grand Totals: {grand_totals}, Row Totals: {row_totals}, Column Totals: {column_totals}, Show Values As: {show_values_as}, Show Empty Items: {show_empty_items}, Compact Layout: {compact_layout}")
             
             # Map aggregation methods to pandas functions
             agg_mapping = {
@@ -2992,9 +3000,9 @@ class PivotTableAPI(APIView):
                 print(f"PivotTableAPI: Pivot table data types:")
                 print(pivot_table.dtypes)
             
-            # Add Grand Totals and Row Totals if requested
-            if grand_totals or row_totals:
-                print(f"PivotTableAPI: Adding totals - Grand: {grand_totals}, Row: {row_totals}")
+            # Add Grand Totals, Row Totals, and Column Totals if requested
+            if grand_totals or row_totals or column_totals:
+                print(f"PivotTableAPI: Adding totals - Grand: {grand_totals}, Row: {row_totals}, Column: {column_totals}")
                 
                 # Add row totals if requested
                 if row_totals and len(pivot_table) > 0:
@@ -3013,6 +3021,7 @@ class PivotTableAPI(APIView):
                                 pivot_table['Row_Total'] = pivot_table[numeric_cols].sum(axis=1)
                             else:
                                 pivot_table['Row_Total'] = pivot_table[numeric_cols].sum(axis=1)
+                
                 
                 # Add grand totals if requested
                 if grand_totals and len(pivot_table) > 0:
@@ -3069,6 +3078,36 @@ class PivotTableAPI(APIView):
             # Convert to list of dictionaries
             pivot_data = pivot_table_reset.to_dict('records')
             
+            # Add column totals if requested (BEFORE applying percentage calculations)
+            if column_totals and len(pivot_data) > 0:
+                # Calculate column totals for each column
+                column_total_row = {}
+                
+                # Get all numeric columns from the first row to calculate totals
+                if pivot_data:
+                    first_row = pivot_data[0]
+                    for key, value in first_row.items():
+                        # Skip index column and row fields
+                        if key == 'index' or key in rows:
+                            column_total_row[key] = 'Column Total'
+                        else:
+                            # Calculate sum for numeric columns
+                            try:
+                                total = sum(row.get(key, 0) for row in pivot_data 
+                                          if isinstance(row.get(key), (int, float)) and not pd.isna(row.get(key)))
+                                column_total_row[key] = total
+                            except:
+                                column_total_row[key] = 'Column Total'
+                    
+                    # Add the column total row to the end
+                    pivot_data.append(column_total_row)
+                    print(f"PivotTableAPI: Added column total row")
+            
+            # Apply percentage calculations if requested (AFTER adding column totals)
+            if show_values_as != 'none' and len(pivot_data) > 0:
+                pivot_data = self._apply_percentage_calculations(pivot_data, show_values_as, rows, values)
+                print(f"PivotTableAPI: Applied percentage calculations: {show_values_as}")
+            
             print(f"PivotTableAPI: Converted to records - {len(pivot_data)} rows")
             if len(pivot_data) > 0:
                 print(f"PivotTableAPI: Sample record keys: {list(pivot_data[0].keys())}")
@@ -3105,6 +3144,258 @@ class PivotTableAPI(APIView):
         except Exception as e:
             print(f"Error creating pivot table: {e}")
             raise
+
+    def _apply_percentage_calculations(self, pivot_data, show_values_as, rows, values):
+        """Apply percentage calculations to pivot table data"""
+        try:
+            if not pivot_data:
+                return pivot_data
+            
+            # Identify numeric columns (exclude row fields, index, and calculated columns like Row_Total)
+            first_row = pivot_data[0]
+            numeric_columns = []
+            for key, value in first_row.items():
+                if (key != 'index' and 
+                    key not in rows and 
+                    not key.startswith('Row_Total') and 
+                    not key.startswith('Column_Total') and
+                    not key.endswith('_Total') and
+                    isinstance(value, (int, float))):
+                    numeric_columns.append(key)
+            
+            if not numeric_columns:
+                return pivot_data
+            
+            # Separate data rows from total rows (exclude totals from percentage calculations)
+            data_rows = []
+            total_rows = []
+            
+            for row in pivot_data:
+                is_total_row = False
+                for field in rows:
+                    if isinstance(row.get(field), str) and ('Total' in row[field] or 'Column Total' in row[field] or 'Grand Total' in row[field]):
+                        is_total_row = True
+                        break
+                
+                if is_total_row:
+                    total_rows.append(row)
+                else:
+                    data_rows.append(row)
+            
+            print(f"PivotTableAPI: Separated {len(data_rows)} data rows and {len(total_rows)} total rows")
+            
+            # Process data rows with percentage calculations
+            processed_data_rows = []
+            
+            if show_values_as == 'grand_total':
+                # Calculate grand total across ALL numeric values in data rows only
+                grand_total = 0
+                for row in data_rows:
+                    for col in numeric_columns:
+                        if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)):
+                            grand_total += row[col]
+                
+                print(f"PivotTableAPI: Grand total across data rows only: {grand_total}")
+                
+                # Convert data rows to percentages
+                for row in data_rows:
+                    new_row = row.copy()
+                    for col in numeric_columns:
+                        if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)):
+                            if grand_total != 0:
+                                new_row[col] = (row[col] / grand_total) * 100
+                            else:
+                                new_row[col] = 0
+                    
+                    # Handle calculated columns like Row_Total
+                    for key, value in row.items():
+                        if key.startswith('Row_Total') and isinstance(value, (int, float)):
+                            # Row_Total should be the sum of the percentage values for this row
+                            row_sum = sum(new_row[col] for col in numeric_columns if col in new_row)
+                            new_row[key] = row_sum
+                    
+                    processed_data_rows.append(new_row)
+                    
+            elif show_values_as == 'column_total':
+                # Calculate column totals for data rows only (exclude total rows)
+                column_totals = {}
+                for col in numeric_columns:
+                    total = sum(row.get(col, 0) for row in data_rows 
+                               if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)))
+                    column_totals[col] = total
+                
+                # Calculate grand total from data rows only
+                grand_total = 0
+                for row in data_rows:
+                    for col in numeric_columns:
+                        if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)):
+                            grand_total += row[col]
+                
+                print(f"PivotTableAPI: Column totals from data rows: {column_totals}")
+                print(f"PivotTableAPI: Grand total from data rows: {grand_total}")
+                
+                # Convert data rows to percentages of column totals
+                for row in data_rows:
+                    new_row = row.copy()
+                    for col in numeric_columns:
+                        if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)):
+                            if column_totals[col] != 0:
+                                new_row[col] = (row[col] / column_totals[col]) * 100
+                            else:
+                                new_row[col] = 0
+
+                    # Handle calculated columns like Row_Total
+                    for key, value in row.items():
+                        if key.startswith('Row_Total') and isinstance(value, (int, float)):
+                            # IMPORTANT: In Excel, the total column in a % of Column Total view
+                            # represents the percentage of the row total over the overall grand total.
+                            # Do not sum across percentages (that can exceed 100%).
+                            row_total_original = sum(
+                                row.get(c, 0) for c in numeric_columns
+                                if isinstance(row.get(c), (int, float)) and not pd.isna(row.get(c))
+                            )
+                            if grand_total != 0:
+                                new_row[key] = (row_total_original / grand_total) * 100
+                            else:
+                                new_row[key] = 0
+
+                    processed_data_rows.append(new_row)
+                    
+            elif show_values_as == 'row_total':
+                # Calculate grand total from data rows only
+                grand_total = 0
+                for row in data_rows:
+                    for col in numeric_columns:
+                        if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)):
+                            grand_total += row[col]
+                
+                print(f"PivotTableAPI: Grand total from data rows: {grand_total}")
+                
+                # Convert each data row to percentages of its row total
+                for row in data_rows:
+                    new_row = row.copy()
+                    row_total = sum(row.get(col, 0) for col in numeric_columns 
+                                   if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)))
+                    
+                    # Convert each numeric column to percentage of row total
+                    for col in numeric_columns:
+                        if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)):
+                            if row_total != 0:
+                                new_row[col] = (row[col] / row_total) * 100
+                            else:
+                                new_row[col] = 0
+                    
+                    # Handle calculated columns like Row_Total
+                    for key, value in row.items():
+                        if key.startswith('Row_Total') and isinstance(value, (int, float)):
+                            # Row_Total should be 100% for each row
+                            new_row[key] = 100.0
+                    
+                    processed_data_rows.append(new_row)
+            
+            # Process total rows independently
+            processed_total_rows = []
+            
+            if total_rows:
+                # Calculate totals from the ORIGINAL data rows (before percentage conversion)
+                original_data_rows = data_rows  # These are still original values
+                
+                # Calculate grand total from original data
+                grand_total_original = 0
+                for row in original_data_rows:
+                    for col in numeric_columns:
+                        if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)):
+                            grand_total_original += row[col]
+                
+                # Calculate column totals from original data
+                column_totals_original = {}
+                for col in numeric_columns:
+                    total = sum(row.get(col, 0) for row in original_data_rows 
+                               if isinstance(row.get(col), (int, float)) and not pd.isna(row.get(col)))
+                    column_totals_original[col] = total
+                
+                # Process each total row
+                for total_row in total_rows:
+                    new_total_row = total_row.copy()
+                    
+                    # Check what type of total row this is
+                    is_grand_total = any('Grand Total' in str(total_row.get(field, '')) for field in rows)
+                    is_column_total = any('Column Total' in str(total_row.get(field, '')) for field in rows)
+                    
+                    # Process value columns (exclude calculated columns like Row_Total)
+                    for col in numeric_columns:
+                        if isinstance(total_row.get(col), (int, float)) and not pd.isna(total_row.get(col)):
+                            if show_values_as == 'grand_total':
+                                # For grand total percentages, each total value as % of grand total
+                                if grand_total_original != 0:
+                                    new_total_row[col] = (total_row[col] / grand_total_original) * 100
+                                else:
+                                    new_total_row[col] = 0
+                            elif show_values_as == 'column_total':
+                                # For column total percentages
+                                if is_grand_total:
+                                    # Grand total row: each column as % of overall grand total
+                                    if grand_total_original != 0:
+                                        new_total_row[col] = (total_row[col] / grand_total_original) * 100
+                                    else:
+                                        new_total_row[col] = 0
+                                elif is_column_total:
+                                    # Column total row: each column should be 100%
+                                    new_total_row[col] = 100.0
+                                else:
+                                    # Other total rows: calculate as percentage of column total
+                                    if column_totals_original.get(col, 0) != 0:
+                                        new_total_row[col] = (total_row[col] / column_totals_original[col]) * 100
+                                    else:
+                                        new_total_row[col] = 0
+                            elif show_values_as == 'row_total':
+                                # For row total percentages, each row should sum to 100%
+                                if is_grand_total:
+                                    # Grand total row: each column as % of overall grand total
+                                    if grand_total_original != 0:
+                                        new_total_row[col] = (total_row[col] / grand_total_original) * 100
+                                    else:
+                                        new_total_row[col] = 0
+                                elif is_column_total:
+                                    # Column total row: each column as % of overall grand total (should sum to 100% for the row)
+                                    if grand_total_original != 0:
+                                        new_total_row[col] = (total_row[col] / grand_total_original) * 100
+                                    else:
+                                        new_total_row[col] = 0
+                                else:
+                                    # Other total rows: calculate as percentage of row total
+                                    row_total_original = sum(total_row.get(c, 0) for c in numeric_columns if isinstance(total_row.get(c), (int, float)))
+                                    if row_total_original != 0:
+                                        new_total_row[col] = (total_row[col] / row_total_original) * 100
+                                    else:
+                                        new_total_row[col] = 0
+                    
+                    # Handle calculated columns like Row_Total
+                    for key, value in total_row.items():
+                        if key.startswith('Row_Total') and isinstance(value, (int, float)):
+                            if show_values_as == 'row_total':
+                                # For row total percentages, Row_Total should be 100% for each row
+                                new_total_row[key] = 100.0
+                            elif show_values_as == 'column_total':
+                                # For column total percentages, Row_Total should be 100% for total rows
+                                new_total_row[key] = 100.0
+                            else:
+                                # For other cases, Row_Total should be the sum of the percentage values for this row
+                                row_sum = sum(new_total_row[col] for col in numeric_columns if col in new_total_row)
+                                new_total_row[key] = row_sum
+                    
+                    processed_total_rows.append(new_total_row)
+            
+            # Combine processed data rows and total rows
+            result_data = processed_data_rows + processed_total_rows
+            
+            print(f"PivotTableAPI: Percentage calculations applied - {show_values_as}")
+            print(f"PivotTableAPI: Processed {len(processed_data_rows)} data rows and {len(processed_total_rows)} total rows")
+            return result_data
+            
+        except Exception as e:
+            print(f"Error applying percentage calculations: {e}")
+            return pivot_data
 
     def _apply_chronological_sorting(self, df, rows, columns):
         """Apply chronological sorting to the pivot table data"""
