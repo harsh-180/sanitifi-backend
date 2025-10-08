@@ -4125,6 +4125,20 @@ class UpdateFromOneDriveExcel(APIView):
                 print(f"Git commit failed: {git_error}")
                 # Continue execution even if git fails
 
+            # Prepare safe data for JSON response
+            def json_safe(val):
+                import numpy as np
+                if pd.isna(val):
+                    return None
+                if isinstance(val, (np.generic, np.ndarray)):
+                    return val.item() if hasattr(val, "item") else str(val)
+                return val
+            
+            # Clean data for JSON response
+            df_clean = df.replace([np.inf, -np.inf], np.nan)
+            df_clean = df_clean.astype(object).where(pd.notnull(df_clean), None)
+            safe_data = [[json_safe(cell) for cell in row] for row in df_clean.values.tolist()]
+
             return Response({
                 'message': 'Sheet updated successfully from OneDrive',
                 'columns': df.columns.tolist(),

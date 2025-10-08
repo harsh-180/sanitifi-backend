@@ -2474,29 +2474,57 @@ class PivotTableAPI(APIView):
                                 except KeyError:
                                     continue
 
+                                # Generate separate columns for absolute and percentage values
+                                field_name_base = self._get_simplified_field_name(agg_type_lower, key)
+                                
+                                # Only create absolute column if absolute is True in config
                                 if config.get('absolute', True):
                                     agg_value_formatted = self._format_indian_number(agg_value)
-                                else:
-                                    agg_value_formatted = None
+                                    absolute_field_name = f"{field_name_base}_absolute"
+                                    record[absolute_field_name] = agg_value_formatted
 
-                                if config.get('percentage', True) and not df_filtered_by_rows.empty and primary_value_col in df_filtered_by_rows.columns:
+                                # Only create percentage column if percentage is True in config
+                                if config.get('percentage', False) and not df_filtered_by_rows.empty and primary_value_col in df_filtered_by_rows.columns:
                                     total = df_filtered_by_rows[primary_value_col].sum()
                                     pct_val = f"{(agg_value / total * 100):.2f}%" if total != 0 else "0.00%"
-                                else:
-                                    pct_val = None
-
-                                field_name = self._get_simplified_field_name(agg_type_lower, key)
-                                record[field_name] = {
-                                    'absolute': agg_value_formatted,
-                                    'percent': pct_val
-                                }
+                                    percentage_field_name = f"{field_name_base}_percentage"
+                                    record[percentage_field_name] = pct_val
                     else:
-                        # No mapping_configurations: aggregate overall values like MMMDummy fallback
+                        # No mapping_configurations: aggregate overall values based on value_aggregations
                         if not df_filtered_by_rows.empty:
                             for val_col in values:
                                 if val_col in df_filtered_by_rows.columns:
-                                    total_val = df_filtered_by_rows[val_col].sum()
-                                    record[val_col] = self._format_indian_number(total_val)
+                                    # Check if this value column has specific aggregations requested
+                                    requested_aggs = normalized_value_aggs.get(val_col, [])
+                                    if requested_aggs:
+                                        # Generate multiple columns for each requested aggregation
+                                        for agg_type in requested_aggs:
+                                            agg_type_lower = agg_type.lower()
+                                            try:
+                                                if agg_type_lower == 'sum':
+                                                    agg_value = df_filtered_by_rows[val_col].sum()
+                                                elif agg_type_lower == 'mean' or agg_type_lower == 'average':
+                                                    agg_value = df_filtered_by_rows[val_col].mean()
+                                                elif agg_type_lower == 'max' or agg_type_lower == 'maximum':
+                                                    agg_value = df_filtered_by_rows[val_col].max()
+                                                elif agg_type_lower == 'min' or agg_type_lower == 'minimum':
+                                                    agg_value = df_filtered_by_rows[val_col].min()
+                                                elif agg_type_lower == 'count':
+                                                    agg_value = df_filtered_by_rows[val_col].count()
+                                                else:
+                                                    agg_value = df_filtered_by_rows[val_col].sum()
+                                                
+                                                # Create column name with aggregation type
+                                                column_name = f"{val_col}_{agg_type_lower}"
+                                                record[column_name] = self._format_indian_number(agg_value)
+                                            except Exception as e:
+                                                print(f"PivotTableAPI: Error calculating {agg_type_lower} for {val_col}: {e}")
+                                                column_name = f"{val_col}_{agg_type_lower}"
+                                                record[column_name] = "0"
+                                    else:
+                                        # Fallback to default aggregation
+                                        total_val = df_filtered_by_rows[val_col].sum()
+                                        record[val_col] = self._format_indian_number(total_val)
 
                     records.append(record)
 
@@ -2922,7 +2950,19 @@ class PivotTableAPI(APIView):
                         # Convert Series to DataFrame
                         pivot_table = pivot_series.to_frame()
                     else:
-                        pivot_table = df.groupby(rows, dropna=not show_empty_items)[values].agg(pandas_agg)
+                        if multi_agg:
+                            # Handle multiple aggregations for each value column
+                            aggfunc = {}
+                            for v in values:
+                                req = normalized_value_aggs.get(v)
+                                if req:
+                                    mapped = [agg_mapping.get(a, 'sum') for a in req]
+                                    aggfunc[v] = mapped
+                                else:
+                                    aggfunc[v] = pandas_agg
+                            pivot_table = df.groupby(rows, dropna=not show_empty_items)[values].agg(aggfunc)
+                        else:
+                            pivot_table = df.groupby(rows, dropna=not show_empty_items)[values].agg(pandas_agg)
                 else:
                     print(f"PivotTableAPI: Creating simple aggregation")
                     # If no rows or columns, just aggregate all values
@@ -2930,7 +2970,19 @@ class PivotTableAPI(APIView):
                         pivot_series = pd.Series([len(df)], index=['Total'], name=f"Count of {values[0]}" if values else "Count")
                         pivot_table = pivot_series.to_frame()
                     else:
-                        pivot_table = df[values].agg(pandas_agg).to_frame().T
+                        if multi_agg:
+                            # Handle multiple aggregations for each value column
+                            aggfunc = {}
+                            for v in values:
+                                req = normalized_value_aggs.get(v)
+                                if req:
+                                    mapped = [agg_mapping.get(a, 'sum') for a in req]
+                                    aggfunc[v] = mapped
+                                else:
+                                    aggfunc[v] = pandas_agg
+                            pivot_table = df[values].agg(aggfunc).to_frame().T
+                        else:
+                            pivot_table = df[values].agg(pandas_agg).to_frame().T
             
             print(f"PivotTableAPI: Pivot table created - shape: {pivot_table.shape}")
             print(f"PivotTableAPI: Pivot table columns: {list(pivot_table.columns)}")
@@ -2995,6 +3047,18 @@ class PivotTableAPI(APIView):
                             parts[-1] = mapping[last]
                     return '_'.join(parts)
                 pivot_table.columns = [_flatten(col) for col in pivot_table.columns.values]
+            else:
+                # Handle single-level columns that might have aggregation suffixes
+                new_columns = []
+                for col in pivot_table.columns:
+                    if isinstance(col, tuple):
+                        # Handle tuple columns (shouldn't happen with single-level, but just in case)
+                        col_str = '_'.join(str(c) for c in col if c is not None and str(c) != '')
+                        new_columns.append(col_str)
+                    else:
+                        # Keep column name as is for single-level columns
+                        new_columns.append(str(col))
+                pivot_table.columns = new_columns
             
             # Reset index to make it JSON serializable
             pivot_table_reset = pivot_table.reset_index()
