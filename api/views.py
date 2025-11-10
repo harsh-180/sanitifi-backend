@@ -32,6 +32,9 @@ import pandas as pd
 import uuid
 import time
 from io import BytesIO
+import io
+import csv
+import subprocess
 from datetime import datetime  # Added datetime import
 from django.utils import timezone
 from rest_framework.response import Response
@@ -80,6 +83,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from rest_framework.parsers import JSONParser
 
 from django.http import HttpResponse
+from django.http import JsonResponse
 import tempfile
 import math
 
@@ -88,6 +92,9 @@ import math
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from .tasks import merge_chunks_task
+
+from celery.result import AsyncResult
 
 GOOGLE_SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -124,6 +131,14 @@ def get_gsheet_service():
 
     except Exception as e:
         raise ValueError(f"Auth failed: {str(e)}")
+
+def get_task_status(request, task_id):
+    result = AsyncResult(task_id)
+    response_data = {
+        'state': result.state,
+        'result': str(result.result) if result.result else {},
+    }
+    return JsonResponse(response_data)
 
 
 def make_json_safe(obj):
@@ -204,7 +219,6 @@ def check_project_access(user_id, project_id, file_type=None, file_name=None, sh
         return False, None, None
 
 @method_decorator(csrf_exempt, name='dispatch')
-
 class MergeFile(APIView):
     def post(self, request):
         # Extract data from request  
@@ -1191,8 +1205,11 @@ class CleaningColumns(APIView):
         user = project.user
         project_folder = os.path.join(settings.MEDIA_ROOT, f"user_{user.id}/project_{project.id}")
         
+        print(f"project_folder: {project_folder}")
+        
         # Handle concatenated file type
         if file_type == 'concatenated':
+            print("concenanted if condition")
             # Search all subfolders for the sheet_name
             concatenated_base = os.path.join(project_folder, "concatenated")
             found = False
@@ -1212,6 +1229,8 @@ class CleaningColumns(APIView):
             csv_folder_path = os.path.join(project_folder, file_type, file_name)
             csv_file_path = os.path.join(csv_folder_path, sheet_name)
             
+            print(f"csv_file_path else condition: {csv_file_path}")
+            
             if not default_storage.exists(csv_file_path):
                 return Response({'error': 'CSV file not found'}, status=404)
 
@@ -1224,6 +1243,7 @@ class CleaningColumns(APIView):
                 from .spark_utils import spark_session_context, validate_spark_session
                 
                 with spark_session_context() as spark:
+                    print("spark session context")
                     # Validate session before use
                     if not validate_spark_session(spark):
                         raise Exception("Invalid Spark session. Please try again.")
@@ -1235,12 +1255,15 @@ class CleaningColumns(APIView):
                         .option("maxRowsInMemory", 50000) \
                         .option("maxColumns", 20000) \
                         .csv(local_path)
+                        
+                    print("spark read for file > 50mb")
                     
                     # Cache the DataFrame for better performance
                     df = df.cache()
                     
                     # Apply cleaning operations
                     if not analysis_only:
+                        print("not analysis_only1")
                         # Lowercase columns
                         for col_name in options.get("lowercase_columns", []):
                             if col_name in df.columns:
@@ -1263,10 +1286,12 @@ class CleaningColumns(APIView):
                         
                         # Save back to CSV with optimized settings
                         df.toPandas().to_csv(local_path, index=False)
+                        
+                        print("not analysis_only 2 end")
                     
                     # Get preview data for response
                     cleaned_data = df.limit(50).toPandas()
-                    
+                    print("cleaned_data")
                     # Uncache to free memory
                     df.unpersist()
                     
@@ -1281,6 +1306,7 @@ class CleaningColumns(APIView):
                             'total_rows': df.count() if not analysis_only else None
                         }, status=200)
             else:
+                print("else condition file < 50mb")
                 with default_storage.open(csv_file_path, 'rb') as f:
                     df = pd.read_csv(f)
                 special_chars_analysis = self.analyze_special_characters(df)
@@ -1625,6 +1651,144 @@ class FileUploadView(APIView):
             return Response({'error': f'Error reading the CSV files: {str(e)}'}, status=500)
         
 
+@method_decorator(csrf_exempt, name='dispatch')
+class ChunkedUploadInit(APIView):
+    def post(self, request):
+        upload_id = request.data.get('uploadId')
+        file_name = request.data.get('fileName')
+        file_size = request.data.get('fileSize')
+        total_chunks = request.data.get('totalChunks')
+        user_id = request.data.get('user_id')
+        project_name = request.data.get('project_name')
+        project_id = request.data.get('project_id')
+        file_type = request.data.get('file_type')
+
+        if not all([upload_id, file_name, total_chunks, user_id, file_type]) or (not project_name and not project_id):
+            return Response({'error': 'Missing required fields'}, status=400)
+
+        temp_root = os.path.join(settings.MEDIA_ROOT, 'temp', upload_id)
+        os.makedirs(temp_root, exist_ok=True)
+
+        meta = {
+            'uploadId': upload_id,
+            'fileName': file_name,
+            'fileSize': file_size,
+            'totalChunks': int(total_chunks),
+            'user_id': user_id,
+            'project_name': project_name,
+            'project_id': project_id,
+            'file_type': file_type,
+        }
+        with open(os.path.join(temp_root, 'meta.json'), 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+
+        uploaded_chunks = []
+        for entry in os.listdir(temp_root):
+            if entry.endswith('.part'):
+                try:
+                    idx = int(entry.split('.')[0])
+                    uploaded_chunks.append(idx)
+                except Exception:
+                    pass
+
+        return Response({'uploadedChunks': uploaded_chunks}, status=200)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class ChunkedUploadChunk(APIView):
+    def post(self, request):
+        upload_id = request.POST.get('uploadId')
+        index = request.POST.get('index')
+        total_chunks = request.POST.get('totalChunks')  
+        chunk = request.FILES.get('chunk')
+
+        if not all([upload_id, index]) or chunk is None:
+            return Response({'error': 'Missing required fields'}, status=400)
+
+        temp_root = os.path.join(settings.MEDIA_ROOT, 'temp', upload_id)
+        os.makedirs(temp_root, exist_ok=True)
+
+        part_path = os.path.join(temp_root, f"{int(index)}.part")
+        if os.path.exists(part_path):
+            return Response({'ok': True}, status=200)
+
+        with open(part_path, 'wb') as f:
+            for c in chunk.chunks():
+                f.write(c)
+
+        return Response({'ok': True}, status=200)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class ChunkedUploadComplete(APIView):
+    def post(self, request):
+        upload_id = request.data.get('uploadId')
+        if not upload_id:
+            return Response({'error': 'Missing uploadId'}, status=400)
+
+        temp_root = os.path.join(settings.MEDIA_ROOT, 'temp', upload_id)
+        meta_path = os.path.join(temp_root, 'meta.json')
+
+        if not os.path.exists(meta_path):
+            return Response({'error': 'Upload session not found'}, status=404)
+
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        total_chunks = int(meta.get('totalChunks'))
+
+        # Check if all chunks exist
+        missing = [i for i in range(total_chunks) if not os.path.exists(os.path.join(temp_root, f"{i}.part"))]
+        if missing:
+            return Response({'error': 'Missing chunks', 'missing': missing}, status=400)
+
+        # celebry task to merge chunks
+        task = merge_chunks_task.delay(upload_id)
+        return Response({'message': 'Merging started', 'task_id': task.id}, status=202)
+    
+    
+
+@method_decorator(csrf_exempt, name='dispatch')
+class ChunkedUploadCancel(APIView):
+    def post(self, request):
+        upload_id = request.data.get('uploadId')
+        if not upload_id:
+            try:
+                payload = json.loads((request.body or b'').decode('utf-8'))
+                upload_id = payload.get('uploadId')
+            except Exception:
+                pass
+        if not upload_id:
+            upload_id = request.POST.get('uploadId')
+        if not upload_id:
+            return Response({'error': 'Missing uploadId'}, status=400)
+
+        temp_root = os.path.join(settings.MEDIA_ROOT, 'temp', upload_id)
+        cancelled_dir = os.path.join(settings.MEDIA_ROOT, 'temp_cancelled')
+        os.makedirs(cancelled_dir, exist_ok=True)
+        marker_path = os.path.join(cancelled_dir, f"{upload_id}.cancelled")
+
+        # Remove any persisted state/chunks
+        if os.path.exists(temp_root):
+            try:
+                for entry in os.listdir(temp_root):
+                    try:
+                        os.remove(os.path.join(temp_root, entry))
+                    except Exception:
+                        pass
+                os.rmdir(temp_root)
+            except Exception:
+                pass
+
+        # Mark as cancelled
+        try:
+            with open(marker_path, 'w', encoding='utf-8') as f:
+                f.write('cancelled')
+        except Exception:
+            pass
+
+        return Response({'success': True}, status=200)
+
+
 
 @method_decorator(csrf_exempt, name='dispatch')
 class SignupView(APIView):
@@ -1928,7 +2092,7 @@ class UploadProject(APIView):
                         xls = pd.ExcelFile(temp_path, engine='openpyxl')
                         sheet_names = xls.sheet_names
                     except Exception as e:
-                        print(f"❌ Failed to extract sheet names: {e}")
+                        print(f" Failed to extract sheet names: {e}")
                         raise
                     
                     def convert_sheet(sheet_name):
@@ -2064,6 +2228,33 @@ class UserProjectsView(APIView):
             return Response({'error': 'User ID is required'}, status=400)
 
         user = get_object_or_404(User, id=user_id)
+        
+        # Check if this is a project name update request
+        project_id = request.data.get('project_id')
+        project_name = request.data.get('project_name')
+        
+        if project_id and project_name:
+            # Strip whitespace from project name
+            project_name = project_name.strip()
+            if not project_name:
+                return Response({'error': 'Project name cannot be empty'}, status=400)
+            
+            try:
+                project = Projects.objects.get(id=project_id, user_id=user_id)
+                # Update project name
+                project.name = project_name
+                project.save()
+                
+                # Log the project name update
+                logging_user = get_logging_user(request, user)
+                if logging_user:
+                    ip = request.META.get('REMOTE_ADDR')
+                    log_user_action(logging_user, "update_project_name", 
+                                   details=f"Updated project name to: {project_name}", 
+                                   ip_address=ip)
+            except Projects.DoesNotExist:
+                return Response({'error': 'Project not found or access denied'}, status=404)
+        
         projects = Projects.objects.filter(user=user)
 
         project_data = []

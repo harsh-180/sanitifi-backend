@@ -2,6 +2,8 @@ from django.urls import path
 from . import views
 from django.conf import settings
 from django.conf.urls.static import static
+from .views import get_task_status
+
 from . import apis  # Import new API module for custom APIs
 
 urlpatterns = [
@@ -11,6 +13,20 @@ urlpatterns = [
     path('merge/',views.MergeFile.as_view(),name='merge_file'),
     path('download/',views.Save.as_view(),name='download_file'),
     path('upload/', views.FileUploadView.as_view(), name='upload_file'),
+    
+    # for chunked upload endpoints
+    path('upload/init', views.ChunkedUploadInit.as_view(), name='upload_init'),
+    path('upload/init/', views.ChunkedUploadInit.as_view()),
+    
+    path('upload/chunk/', views.ChunkedUploadChunk.as_view(), name='upload_chunk'),
+    
+    path('upload/complete/', views.ChunkedUploadComplete.as_view(), name='upload_complete'),
+    
+    path('celery-status/<str:task_id>/', get_task_status, name='celery_task_status'),
+    
+    path('upload/cancel/', views.ChunkedUploadCancel.as_view(), name='upload_cancel'),
+    
+    
     # path('clean/', views.Cleaning.as_view(), name='clean_file'),
     path('cleaning/', views.CleaningColumns.as_view(), name='clean_file'),
     path('melting/', views.Melting.as_view(), name='melt_file'),

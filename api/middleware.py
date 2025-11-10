@@ -20,7 +20,7 @@ class APILoggingMiddleware:
         print(f"Content-Type: {request.META.get('CONTENT_TYPE', 'N/A')}")
         
         # Ensure request body is read (this is important for middleware)
-        if hasattr(request, 'body'):
+        if hasattr(request, 'body'):    
             try:
                 # Force read the body if it hasn't been read yet
                 if hasattr(request, '_body') and request._body is None:

@@ -14,14 +14,55 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Environment Setup
-JAVA_HOME = r"C:\Users\harsh\java\jdk-17"
-HADOOP_HOME = r"C:\hadoop"
+import getpass
+current_user = getpass.getuser()
+
+# Try to detect Java installation paths
+JAVA_HOME = None
+HADOOP_HOME = None
+
+# Common Java installation paths for Windows
+java_paths = [
+    f"C:\\Users\\{current_user}\\java\\jdk-17",
+    f"C:\\Program Files\\Java\\jdk-17",
+    f"C:\\Program Files\\Java\\jdk-11",
+    f"C:\\Program Files\\Java\\jdk-8",
+    "C:\\java\\jdk-17",
+    "C:\\hadoop"  # Sometimes Java is bundled with Hadoop
+]
+
+# Find Java installation
+for java_path in java_paths:
+    if os.path.exists(java_path):
+        JAVA_HOME = java_path
+        break
+
+# If no Java found, try environment variable
+if not JAVA_HOME:
+    JAVA_HOME = os.environ.get("JAVA_HOME", f"C:\\Users\\{current_user}\\java\\jdk-17")
+
+# Hadoop paths
+hadoop_paths = [
+    "C:\\hadoop",
+    f"C:\\Users\\{current_user}\\hadoop",
+    "C:\\opt\\hadoop"
+]
+
+for hadoop_path in hadoop_paths:
+    if os.path.exists(hadoop_path):
+        HADOOP_HOME = hadoop_path
+        break
+
+if not HADOOP_HOME:
+    HADOOP_HOME = os.environ.get("HADOOP_HOME", "C:\\hadoop")
+
 PYSPARK_PYTHON = sys.executable
 
-# # Set environment variables
+# Set environment variables
 os.environ["JAVA_HOME"] = JAVA_HOME
 os.environ["HADOOP_HOME"] = HADOOP_HOME
-os.environ["PATH"] += f";{os.path.join(HADOOP_HOME, 'bin')}"
+if os.path.exists(HADOOP_HOME):
+    os.environ["PATH"] += f";{os.path.join(HADOOP_HOME, 'bin')}"
 os.environ["PYSPARK_PYTHON"] = PYSPARK_PYTHON
 os.environ["SPARK_LOCAL_IP"] = "localhost"
 
@@ -32,13 +73,8 @@ os.environ["SPARK_LOCAL_IP"] = "localhost"
 # os.environ["PATH"] += f":/opt/hadoop/bin:/opt/spark/bin"
 # os.environ["PYSPARK_PYTHON"] = sys.executable
 
-# Create local Spark temp dir if it doesn't exist (Linux)
-# SPARK_LOCAL_DIRS = "/home/prashant/Dashboard-backend/spark-temp"
-# os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
-# os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
-
-# Create local Spark temp dir if it doesn't exist (Linux)
-SPARK_LOCAL_DIRS = "C:/Users/harsh/Documents/skewb/dashboard/Dashboard-backend/spark-temp"
+# Create local Spark temp dir using current user's directory
+SPARK_LOCAL_DIRS = os.path.join(os.path.expanduser("~"), "spark-temp")
 os.makedirs(SPARK_LOCAL_DIRS, exist_ok=True)
 os.environ["SPARK_LOCAL_DIRS"] = SPARK_LOCAL_DIRS
 

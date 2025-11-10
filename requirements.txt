@@ -29,3 +29,6 @@ ydata-profiling>=4.0.0
 django-sslserver-v2
 msal>=1.29.0
 requests>=2.31.0
+celery==5.4.0
+redis==5.0.1
+pandas==2.2.3
